@@ -27,6 +27,7 @@ import base64
 import os
 import queue
 import shutil
+import subprocess
 import threading
 import time
 from concurrent.futures import Future
@@ -165,6 +166,39 @@ class Session:
             self._shutdown_browser()
             time.sleep(0.35)   # 给旧实例内部循环的收尾留出时间（见 _open 重试注释）
 
+    def _kill_stale_chrome(self) -> None:
+        """强杀占着本号 profile 的孤儿 Chrome。
+
+        实例被强杀（重启/崩溃）时，它拉起的 Chrome 浏览器成了孤儿进程，还锁着
+        wxprofiles/<aid> 这个 profile 目录——新实例 launch_persistent_context
+        一启动就 TargetClosedError 退出（2026-11-14 实测：当晚所有重登/扫码
+        全挂在这上面，快捷登录卡只是表象）。
+
+        用 PowerShell 按命令行里的**账号 ID**（纯十六进制，不受中文路径的
+        编码影响）精确匹配击杀，绝不误伤用户自己开的 Chrome；输出强制
+        utf-8/replace，避免 wmic 的 GBK 输出把解码搞崩。
+        """
+        aid = (self.aid or "").lower()
+        if not aid:
+            return
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                 "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30).stdout or ""
+        except Exception:  # noqa: BLE001  PowerShell 不可用就跳过这层保护
+            return
+        for line in out.splitlines():
+            low = line.lower()
+            if f"wxprofiles{os.sep}{aid}" in low or f"wxprofiles/{aid}" in low \
+                    or f"wxprofiles\\{aid}" in low:
+                pid = line.split("\t")[0].strip()
+                if pid.isdigit():
+                    subprocess.run(["cmd", "/c", f"taskkill /F /T /PID {pid}"],
+                                   capture_output=True, timeout=20)
+
     def _open(self):
         """（线程内）确保浏览器开着，返回 page。"""
         if self._ctx is not None:
@@ -184,6 +218,8 @@ class Session:
             self._shutdown_browser()
         from playwright.sync_api import sync_playwright
 
+        # 上一个实例被强杀时拉起的孤儿 Chrome 还锁着本号 profile，先清掉再启动
+        self._kill_stale_chrome()
         prof = profile_of(self.aid)
         os.makedirs(prof, exist_ok=True)
         # 同线程「关旧实例 → 起新实例」偶发撞上旧实例内部循环的收尾：
