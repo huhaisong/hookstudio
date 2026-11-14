@@ -1,0 +1,29 @@
+## 任务
+# 任务{task_head}
+{task_verb}{many}{duration} 秒引流短片，竖屏 {aspect}。
+
+## 规格
+# 规格（程序算好）
+整条 {duration} 秒，拆 {low}-{high} 镜；单镜 {min_shot}-{max_shot} 秒，**一镜不能超过 {max_shot} 秒**（t_start/t_end 都按本条 0-{duration} 秒算）。
+台词全条 {w_min}-{words} 字，平均每镜 {per_lo}-{per_hi} 字，一句最多 {line_max} 字（超过就说不完 {max_shot} 秒）。
+一镜只说一句台词，两句就拆成两镜（同机位续拍），不要靠拉长镜头塞台词。
+
+## 分段
+{seg_req}
+
+## 画风
+# 画风（写入每条镜号的「画风」行）
+{style}
+
+## 人物卡
+# 人物卡
+{cast_rule}
+{cast}
+
+## 素材
+{material}
+
+## 输出格式
+# 输出格式
+严格按下面 JSON 结构输出，只输出 JSON。
+{schema}

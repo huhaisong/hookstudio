@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 钩子工坊</title>
+<script>
+/* 主题预设：与 index.html 同一份逻辑——必须在样式表前设 data-theme 防白闪。
+   默认暗色（2026-11-14 用户定）；hs_theme = dark / light / system。 */
+(function () {
+  var t = "dark";
+  try { t = localStorage.getItem("hs_theme") || "dark"; } catch (e) {}
+  if (t === "system") {
+    t = (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+  }
+  document.documentElement.setAttribute("data-theme", t);
+  if (window.matchMedia) {
+    matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function (e) {
+      var cur = "dark";
+      try { cur = localStorage.getItem("hs_theme") || "dark"; } catch (err) {}
+      if (cur === "system") {
+        document.documentElement.setAttribute("data-theme", e.matches ? "dark" : "light");
+      }
+    });
+  }
+})();
+</script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="au-body">
+
+<div class="au-wrap">
+  <div class="au-card">
+    <div class="au-brand"><span class="dot"></span>钩子工坊</div>
+    <p class="au-sub">登录后继续使用你的项目</p>
+
+    <div class="au-tabs">
+      <button class="au-tab on" data-tab="login">登录</button>
+      <button class="au-tab" data-tab="reg">注册</button>
+    </div>
+
+    <!-- 登录 -->
+    <form id="f-login" class="au-form" autocomplete="on">
+      <label>用户名或邮箱
+        <input id="lg-user" type="text" autocomplete="username" spellcheck="false" required>
+      </label>
+      <label>密码
+        <input id="lg-pwd" type="password" autocomplete="current-password" required>
+      </label>
+      <label class="au-check"><input id="lg-remember" type="checkbox" checked> 记住我（换浏览器都要重新登录）</label>
+      <button class="primary wide" id="btn-login" type="submit">登录</button>
+    </form>
+
+    <!-- 注册 -->
+    <form id="f-reg" class="au-form hidden" autocomplete="on">
+      <label>用户名
+        <input id="rg-user" type="text" autocomplete="username" spellcheck="false"
+               placeholder="3-20 位，中文/字母/数字/下划线" required>
+      </label>
+      <label>昵称（可选）
+        <input id="rg-name" type="text" placeholder="显示在右上角" maxlength="40">
+      </label>
+      <label>密码
+        <input id="rg-pwd" type="password" autocomplete="new-password"
+               placeholder="至少 8 位，不能是纯数字" required>
+      </label>
+      <label>确认密码
+        <input id="rg-pwd2" type="password" autocomplete="new-password" required>
+      </label>
+      <button class="primary wide" id="btn-reg" type="submit">注册并登录</button>
+    </form>
+
+    <p class="au-msg" id="au-msg"></p>
+    <p class="au-tip">第一次用先注册一个账号，以后换电脑用同一个账号登录，次数也跟着账号走。
+      注册要联网；注册过一次之后，断网也能登录剪片。</p>
+
+    <button class="au-contact" id="btn-author" type="button">
+      有新需求 / 新功能想法？<b>联系作者 →</b>
+    </button>
+  </div>
+</div>
+
+<!-- 联系作者二维码（登录页也要能看到） -->
+<div class="modal hidden" id="modal-author">
+  <div class="modal-card author-card">
+    <div class="modal-head">
+      <b>联系作者 · 提需求 / 加功能</b>
+      <button class="ghost sm" id="btn-close-author" type="button">关闭</button>
+    </div>
+    <div class="author-body">
+      <img class="author-qr" src="/static/assets/author-wechat.jpg" alt="作者微信二维码">
+      <div class="author-txt">
+        <p class="author-big">微信扫一扫，加作者好友</p>
+        <p class="hint">想要新功能、觉得哪一步不顺手、还是用出问题了，都可以直接聊。</p>
+        <p class="hint">添加时备注<b>「钩子工坊」</b>，通过得更快。</p>
+      </div>
+    </div>
+    <p class="author-foot">登录后也可以点右上角绿色「联系作者 · 加微信」随时找到。</p>
+  </div>
+</div>
+
+<script src="/static/version.js"></script>
+<script src="/static/session.js"></script>
+<script>
+const $ = (s) => document.querySelector(s);
+const msg = $("#au-msg");
+
+/* 联系作者二维码 */
+$("#btn-author").addEventListener("click", () => $("#modal-author").classList.remove("hidden"));
+$("#btn-close-author").addEventListener("click", () => $("#modal-author").classList.add("hidden"));
+$("#modal-author").addEventListener("click", (e) => {
+  if (e.target.id === "modal-author") $("#modal-author").classList.add("hidden");
+});
+
+function say(text, kind) {
+  msg.textContent = text || "";
+  msg.className = "au-msg" + (kind ? " " + kind : "");
+}
+
+/* Tab 切换：两个表单在同一张卡里，不跳页（跳页会丢掉用户刚填的内容） */
+document.querySelectorAll(".au-tab").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".au-tab").forEach((b) => b.classList.toggle("on", b === btn));
+    $("#f-login").classList.toggle("hidden", btn.dataset.tab !== "login");
+    $("#f-reg").classList.toggle("hidden", btn.dataset.tab !== "reg");
+    say("");
+  });
+});
+
+/* 登录后去哪：?next= 优先，但只允许站内路径（防开放重定向） */
+function nextUrl() {
+  const raw = new URLSearchParams(location.search).get("next") || "/";
+  return raw.startsWith("/") && !raw.startsWith("//") ? raw : "/";
+}
+
+async function afterLogin(data) {
+  Session.state.save(data);
+  const u = data.user || {};
+  if (u.must_change_pwd) {
+    // 后端会拦住除「改密」以外的所有接口，进去第一步就是设置新密码的卡片。
+    // 这里先说一句，免得用户以为页面卡住了。
+    say("已登录。这是初始密码，接下来请先设置新密码", "ok");
+  }
+  location.replace(nextUrl());
+}
+
+$("#f-login").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = $("#btn-login");
+  btn.disabled = true;
+  say("登录中…");
+  try {
+    const r = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: $("#lg-user").value.trim(),
+        password: $("#lg-pwd").value,
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // 429 是「失败太多次被锁」，把后端算好的提示原样给用户
+      say(data.detail || "登录失败", "bad");
+      return;
+    }
+    await afterLogin(data);
+  } catch (err) {
+    say("连不上服务：" + err.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("#f-reg").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const pwd = $("#rg-pwd").value;
+  if (pwd !== $("#rg-pwd2").value) return say("两次输入的密码不一样", "bad");
+  const btn = $("#btn-reg");
+  btn.disabled = true;
+  say("注册中…");
+  try {
+    const r = await fetch("/api/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: $("#rg-user").value.trim(),
+        password: pwd,
+        display_name: $("#rg-name").value.trim(),
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return say(data.detail || "注册失败", "bad");
+    await afterLogin(data);
+  } catch (err) {
+    say("连不上服务：" + err.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* 被踢到这里时先说清楚原因：不然用户只会以为是网络问题，反复重登 */
+const REASON = {
+  banned: ["账号已被管理员封禁，无法继续使用。如有疑问请联系管理员。", "bad"],
+  kicked: ["账号已被要求下线（可能换了设备或管理员操作），请重新登录。", ""],
+  expired: ["登录已过期，请重新登录。", ""],
+};
+const why = new URLSearchParams(location.search).get("reason");
+if (why && REASON[why]) say(REASON[why][0], REASON[why][1]);
+
+/* 已经登录就直接放行，不用再看一次表单 */
+(async () => {
+  if (!Session.state.access) return;
+  try {
+    const me = await Session.ureq("/api/auth/me");
+    if (me.logged_in) location.replace(nextUrl());
+  } catch (e) { /* 令牌失效：留在登录页 */ }
+})();
+</script>
+</body>
+</html>

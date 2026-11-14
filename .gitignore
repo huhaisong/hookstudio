@@ -1,0 +1,22 @@
+# 运行数据与日志：本地状态（含 app.db、config.json、生成产物），不进仓库
+data/
+logs/
+
+# 大体积二进制：模型、Python 运行时、ffmpeg 等工具、打包工具链
+models/
+runtime/
+bin/
+build_tools/
+
+# 密钥与本地工具状态：.env 里是百炼 API Key，绝不入库
+.env
+.slidep/
+
+# 部署凭证：server.json 里是服务器明文口令，绝不入库
+deploy/server.json
+
+# 打包产物与字节码
+dist/
+build/
+__pycache__/
+*.pyc

@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>钩子工坊</title>
+<script>
+/* 主题预设：必须在样式表加载前设好 data-theme，否则暗色用户每次打开都白闪一帧。
+   hs_theme = dark / light / system（跟随系统）；默认暗色（2026-11-14 用户定），
+   选了 system 才监听系统切换实时跟。 */
+(function () {
+  var t = "dark";
+  try { t = localStorage.getItem("hs_theme") || "dark"; } catch (e) {}
+  if (t === "system") {
+    t = (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+  }
+  document.documentElement.setAttribute("data-theme", t);
+  if (window.matchMedia) {
+    matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function (e) {
+      var cur = "dark";
+      try { cur = localStorage.getItem("hs_theme") || "dark"; } catch (err) {}
+      if (cur === "system") {
+        document.documentElement.setAttribute("data-theme", e.matches ? "dark" : "light");
+      }
+    });
+  }
+})();
+</script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="dot"></span>钩子工坊</div>
+  <!-- 一级导航：两件独立的事，不是「项目里的一步」。
+       发布和左边项目没有必然联系（可以选文件夹、选单个文件），所以切过去时
+       项目列表整块消失，页面铺满 —— 不然永远会有人以为「发布属于当前项目」。
+       取名（2026-11-13 用户定）：左「视频制作」= 把素材做成片；右「发布运营」=
+       发出去 + 看数据 + 体检账号。只叫「发布」会窄，后面还挂着监控和诊断。
+       角标只显示「该发了 / 待发」的条数。 -->
+  <nav class="appnav" id="appnav" aria-label="功能">
+    <button class="appnav-item on" data-nav="projects" title="整理台词、重做字幕、剪辑出片、引流分镜">视频制作</button>
+    <button class="appnav-item" data-nav="publish" title="批量定时发布、播放数据、账号诊断">
+      发布运营<span class="pub-badge hidden" id="pub-badge">0</span>
+    </button>
+  </nav>
+  <div class="pills" id="pills"></div>
+  <div class="who" id="who"></div>
+  <button class="wx-top" id="btn-author-top" data-author title="有新需求 / 想加功能？加作者微信">
+    <span class="wx-dot">微</span>联系作者 · 加微信
+  </button>
+  <button class="ghost sm" id="btn-settings">设置</button>
+</header>
+
+<div class="gbar hidden" id="gbar">
+  <div class="gbar-fill" id="gbar-fill"></div>
+  <div class="gbar-text"><span class="spinner"></span><span id="gbar-text">处理中…</span></div>
+  <button class="ghost sm danger gbar-stop" id="btn-task-cancel" title="停掉当前正在跑的这一步，已经做好的部分会保留">中止</button>
+</div>
+
+<div class="shell">
+  <aside class="rail">
+    <button class="primary wide" id="btn-new">＋ 新建项目</button>
+    <input id="proj-search" placeholder="搜项目名" spellcheck="false">
+    <div class="rail-title">项目</div>
+    <div id="plist" class="plist"></div>
+  </aside>
+
+  <main class="main" id="main">
+    <section id="view-new" class="view">
+      <h1>从本地剧集生成钩子视频</h1>
+      <p class="hint">选一个放着剧集的文件夹，选好模式，工具会自动整理台词；之后按模式走各自的流程。<br>
+      只想写引流分镜？模式选「只做引流分镜」，不用选文件夹——粘一段剧情素材就能开工。</p>
+
+      <!-- 2026-11-14 首屏联系作者入口收敛（P2）：顶栏按钮 + 右下角悬浮保留，
+           首屏大横幅撤掉——一个页面三处入口太吵，横幅还把正事往下推一整屏。
+           顶栏按钮永远可见，真有需求的人一定找得到。 -->
+
+      <!-- 2026-11-14 P0-2 顺序修正：模式决定「要不要选目录」（只做分镜不需要），
+           所以模式卡放在最上面，浏览器在它下面——用户先知道要什么，再去做什么。
+           原来浏览器在前、模式在后，用户会先逛半天目录才发现模式不对。 -->
+      <div class="card row">
+        <label>项目模式
+          <select id="in-mode">
+            <option value="batch">批量混剪 · N 套精彩片段</option>
+            <option value="shots">只做引流分镜 · 不导入视频，直接给素材</option>
+          </select>
+        </label>
+        <label>项目名称<input id="in-name" placeholder="留空则用文件夹名"></label>
+        <label id="lines-wrap">台词来源
+          <select id="in-lines">
+            <option value="auto">自动识别台词（第一次会多等一会儿）</option>
+            <option value="reuse">用已有项目的台词（同一批素材，直接搬过来）</option>
+          </select>
+        </label>
+        <label id="reuse-wrap" class="hidden">复用哪个项目<select id="in-reuse"></select></label>
+        <button class="primary" id="btn-create">扫描并创建</button>
+      </div>
+      <p class="hint" id="mode-hint">批量混剪：AI 通读全剧台词，一次排出 N 套不同主线的剪法，你勾选后只给选中的套出片。</p>
+
+      <div class="card" id="pick-card">
+        <div class="drives" id="drives"></div>
+        <div class="browse-head">
+          <div class="crumb" id="crumb">—</div>
+          <button class="ghost" id="btn-up" title="上一层">↑ 上一层</button>
+        </div>
+        <div class="dirs" id="dirs"></div>
+        <div class="browse-foot">
+          <button class="primary" id="btn-use">选用当前目录</button>
+          <span class="hint" id="pick-hint"></span>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-proj" class="view hidden">
+      <div class="proj-head">
+        <div>
+          <h1 id="p-name">—</h1>
+          <div class="meta" id="p-path"></div>
+          <div class="meta" id="p-meta"></div>
+        </div>
+        <button class="ghost danger" id="btn-del">删除</button>
+      </div>
+
+      <!-- 步骤导航：一次只展示一步，状态一眼可见。长卷平铺时用户要一直滚、也分不清
+           自己做到哪了；这里把「现在该做哪一步」放到视线动线上。 -->
+      <nav class="step-nav" id="step-nav" aria-label="制作步骤"></nav>
+
+      <!-- 台词整理之后的一步（可选）：把每集原字幕抹掉，在原位置换成整理好的台词，
+           产出每集一条独立视频；后面剪辑出片直接从这些视频切段。
+           做法、位置、要不要加字幕都已经固定（2026-11-12），面板只留三个观感项。
+           不做也照样能从第 1 步一路走到底（出片就用原始视频）。 -->
+      <div class="step" id="step-nosub" data-step="2">
+        <div class="step-h"><span class="idx">2</span>重做字幕<span class="tag soft">可选 · 台词整理后做</span><em id="s0-state"></em></div>
+        <p class="lead">把每集原来的字幕抹掉，原位置换成第 1 步整理好的台词，产出每集一条处理好的视频。后面剪辑与出片直接从这些视频切段。</p>
+
+        <section class="adv-open">
+          <div class="adv-title">
+            <span class="adv-badge">① 生成设置</span>
+            <b>字幕怎么出现</b>
+            <span class="hint">先设好，再点下面的生成</span>
+          </div>
+          <div class="adv-body">
+            <label class="fld">出场动效
+              <select id="ns-nstyle">
+                <option value="rise">上浮落位 · 推荐</option>
+                <option value="fade">淡入淡出 · 最稳</option>
+                <option value="pop">缩放弹出 · 有劲</option>
+                <option value="float">缓缓漂浮 · 有呼吸感</option>
+                <option value="type">逐字打出 · 口播感</option>
+              </select>
+            </label>
+            <div class="fx-line">
+              <label class="fx-slider">动效幅度 <b id="ns-nmotionv">推荐</b>
+                <input type="range" id="ns-nmotion" min="0" max="100" step="10" value="50">
+                <span class="fx-scale"><i>0 几乎不动</i><i>50 推荐</i><i>100 明显</i></span>
+              </label>
+            </div>
+            <div class="fx-line">
+              <label class="fx-slider">抹除柔和程度 <b id="ns-softv">中等</b>
+                <input type="range" id="ns-soft" min="0" max="100" step="5" value="50">
+                <span class="fx-scale"><i>0 更清晰</i><i>50 平衡</i><i>100 更柔</i></span>
+              </label>
+            </div>
+            <label class="fld">抹掉的地方怎么补
+              <select id="ns-fillmode">
+                <option value="mirror">照旁边画面补 · 快</option>
+                <option value="borrow">照这一段干净画面补 · 更自然，慢一倍</option>
+              </select>
+            </label>
+            <p class="hint">默认用第一个。如果某集字幕正好压在衬衫、腰带这类深浅分明的画面上，补出来能看出被换过，就换第二个（要多花一倍时间）。</p>
+          </div>
+        </section>
+
+        <div class="action-bar">
+          <button class="primary" id="btn-nosub-run">生成处理好的视频</button>
+          <button class="ghost hidden" id="btn-nosub-preview">预览第一集</button>
+          <button class="ghost hidden" id="btn-nosub-open">打开文件夹</button>
+          <span class="hint" id="ns-state"></span>
+        </div>
+
+        <details class="fold">
+          <summary>这一步会做什么？</summary>
+          <div class="fold-body">
+            <p>会把每一集都做成一份「原字幕换成你自己台词」的视频，和原来的视频一起放着，互不影响。做一次就能反复用；出片时在「出片设置 → 用哪份视频」里挑，不想用随时换回原始视频。</p>
+            <p>字幕在画面哪儿、每一句有多宽多高，都不用你填：点生成时程序先逐集扫一遍，量出<b>每一句字幕自己的矩形</b>——长句宽到八成，短句只有两三成，单行和多行的高度也不一样。抹的时候只动这些块，画面其余部分一个像素都不碰，没有字幕的时段完全不处理。</p>
+            <p>块里的内容两种补法。<b>照旁边画面补</b>（默认）是把紧挨着它的画面上下各取一段翻转回来，中间渐变过渡，快，一集十几秒；缺点是字幕正好压在衬衫、腰带这类深浅分明的竖结构上时，翻过来的那块会偏亮。<b>照这一段干净画面补</b>是从同一镜头里这一块没被字挡住的那些帧里抄回来——那句话还没出现时、或者说完之后，这块本来就是干净的，抄来的就是真背景，所以更自然；它要逐帧处理，一集多花一倍时间。镜头切换的瞬间如果正好在说话，会退回第一种补法，不会抄到上一个镜头的画面。</p>
+            <p>新字幕就落在原来那行字幕的位置上，句子跟着台词一句一换。原来整理好的台词不用重做，剪片子的时间点也不变——这一步只动画面，声音原样保留。</p>
+            <p>这份视频里的字幕已经烧进画面了，出片时不能再左右镜像（字会翻反）。</p>
+          </div>
+        </details>
+      </div>
+
+      <div class="step" id="step-transcribe" data-step="1">
+        <div class="step-h"><span class="idx">1</span>台词整理<em id="s1-state"></em></div>
+        <p class="lead">把每集里说的每句话连同出现时间整理出来，后面的剪辑都要靠它定位。</p>
+        <div class="action-bar">
+          <button class="primary" id="btn-transcribe">开始整理台词</button>
+          <button class="ghost" id="btn-reuse" title="同一批素材按文件名直接把台词搬过来">用其他项目的台词</button>
+          <button class="ghost" id="btn-paste" title="粘贴本工具导出的台词文本，或带时间码的字幕">粘贴台词</button>
+          <span id="transcript-links" class="hidden">
+            <button class="primary" id="btn-lines-view">查看 / 修改台词</button>
+            <a class="ghost" id="btn-transcript-dl">下载台词 .txt</a>
+          </span>
+        </div>
+        <details class="fold">
+          <summary>这一步会做什么？</summary>
+          <div class="fold-body">
+            <p>建好项目后会自动开始，中途关掉再进来会接着做，不用重来。同一批素材重建项目时，可以把已整理好的台词直接搬过来；从别处拿到的字幕也能粘贴导入。</p>
+            <p>整理结果可以随时逐集查看、改错字或下载留档；改完只影响这一集。</p>
+          </div>
+        </details>
+      </div>
+
+      <!-- 单片导流模式：剪辑表与出片已合并成一步（2026-11-07） -->
+      <div id="funnel-steps">
+        <div class="step" id="funnel-step2" data-step="2">
+          <div class="step-h"><span class="idx">3</span>剪辑与出片<em id="s2-state"></em></div>
+          <p class="lead">先让 AI 排出要剪的片段，改成你想要的剪辑表，再按表出片——都在这一步。</p>
+          <div class="section-label">① 排剪辑表</div>
+          <button class="prompt-entry" id="btn-fp-edit" hidden title="查看并修改单片导流用的提示词">
+            <span class="pe-ico">✎</span>
+            <span class="pe-txt"><b>修改提示词</b>
+              <i>告诉 AI 怎么按集序排结构；改乱了可以一键恢复默认</i></span>
+            <span class="pe-go">查看 / 编辑 ›</span>
+          </button>
+          <div class="card hidden" id="fp-edit" style="margin:0 0 10px">
+            <div class="row" style="align-items:center">
+              <b id="fp-title">导流指令</b>
+              <span class="hint" id="fp-tag"></span>
+              <span style="flex:1"></span>
+              <button class="ghost sm" id="btn-fp-reset" title="删掉自定义，恢复内置的默认提示词">恢复默认</button>
+            </div>
+            <textarea id="fp-text" rows="14" spellcheck="false"
+              style="width:100%;margin:6px 0;font-family:Consolas,monospace;font-size:12px"></textarea>
+            <p class="hint" id="fp-note" style="margin:2px 0 8px"></p>
+            <div class="row">
+              <button class="primary" id="btn-fp-save">保存提示词</button>
+              <button class="ghost" id="btn-fp-cancel">收起</button>
+            </div>
+          </div>
+          <div class="action-bar"><button class="primary" id="btn-analyze">生成剪辑表</button></div>
+          <div class="edl-wrap" id="edl-wrap">
+            <textarea id="edl" spellcheck="false" placeholder="集|起|止|标签&#10;01|0.00|29.90|前世被害"></textarea>
+            <div class="edl-foot">
+              <span id="edl-stat" class="hint"></span>
+              <button class="ghost" id="btn-save-edl">保存表格</button>
+            </div>
+            <div class="note" id="p-note"></div>
+          </div>
+          <div class="section-label">② 出片</div>
+          <p class="lead">按剪辑表从原片切段拼接，统一成竖屏画面和一致的音量，画面不加字。</p>
+          <div class="action-bar">
+            <button class="primary" id="btn-render">开始出片</button>
+            <span class="hint" id="s3-state"></span>
+          </div>
+          <div id="out-wrap" class="out-wrap hidden">
+            <video id="out-video" controls playsinline></video>
+            <a class="primary" id="btn-download" download>下载成片</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- 批量混剪模式：剪辑结构与出片合并成一步（2026-11-07）。
+           顺序按「先设置 → 再生成 / 出片 → 看结果」排，避免按钮排在设置前面。 -->
+      <div id="batch-steps" class="hidden">
+        <div class="step" id="batch-step2" data-step="2">
+          <div class="step-h"><span class="idx">3</span>剪辑与出片<em id="b2-state"></em></div>
+          <!-- 编排方式：同一个项目、同一份转写结果，换一种产物形态。
+               不做成新建项目时的第三种模式——那得把同一批剧再转写一遍。 -->
+          <div class="cut-mode" id="cut-mode">
+            <button class="cm-btn on" data-mode="mix">
+              <b>多套混剪</b><span>AI 排 N 套不同主线，一套一条成片</span></button>
+            <button class="cm-btn" data-mode="hook">
+              <b>单集钩子前置</b><span>每集挑一个爆点提到片头，接整集正片</span></button>
+          </div>
+
+          <div id="mix-pane">
+            <p class="lead">一次排出几套不同主线的剪法，展开挑一挑，只给勾选中的套出片。</p>
+            <section class="adv-open">
+              <div class="adv-title">
+                <span class="adv-badge">① 生成设置</span>
+                <b>模型 · 套数 · 每套时长</b>
+                <span class="hint">先设好，再点下面的生成</span>
+              </div>
+              <div class="adv-body">
+                <button class="prompt-entry" id="btn-prompt-edit" hidden title="查看并修改 AI 编排用的提示词">
+                  <span class="pe-ico">✎</span>
+                  <span class="pe-txt"><b>修改提示词</b>
+                    <i>告诉 AI 怎么排结构；改乱了可以一键恢复默认</i></span>
+                  <span class="pe-go">查看 / 编辑 ›</span>
+                </button>
+                <div class="card hidden" id="prompt-edit" style="margin:0 0 10px">
+                  <div class="row" style="align-items:center">
+                    <b id="prompt-edit-title">编排指令</b>
+                    <span class="hint" id="prompt-edit-tag"></span>
+                    <span style="flex:1"></span>
+                    <button class="ghost sm" id="btn-prompt-reset" title="删掉自定义，恢复内置的默认提示词">恢复默认</button>
+                  </div>
+                  <div class="seg prompt-tabs" id="prompt-tabs">
+                    <button class="ghost sm on" data-key="plans">编排指令</button>
+                    <button class="ghost sm" data-key="plans_schema">输出格式</button>
+                  </div>
+                  <textarea id="prompt-edit-text" rows="14" spellcheck="false"
+                    style="width:100%;margin:6px 0;font-family:Consolas,monospace;font-size:12px"></textarea>
+                  <p class="hint" id="prompt-edit-note" style="margin:2px 0 8px"></p>
+                  <div class="row">
+                    <button class="primary" id="btn-prompt-save">保存提示词</button>
+                    <button class="ghost" id="btn-prompt-cancel">收起</button>
+                  </div>
+                </div>
+                <div id="plan-models">
+                  <div class="pm-thead">
+                    <span class="pm-grp-h">组</span>
+                    <span>生成方式</span>
+                    <span>套数</span>
+                    <span>最短（分钟）</span>
+                    <span>最长（分钟）</span>
+                    <span class="pm-del-h">×</span>
+                  </div>
+                </div>
+                <div class="row batch-row">
+                  <button class="ghost sm" id="btn-plan-add" title="再加一组参数，各出几套做对比">＋ 加一组</button>
+                  <button class="ghost sm" id="btn-plan-scan" title="检测当前哪些生成方式可用">检测可用项</button>
+                </div>
+                <p class="hint" id="pm-scan-note"></p>
+              </div>
+            </section>
+            <div class="action-bar">
+              <button class="primary" id="btn-plan">生成 3 套结构</button>
+              <button class="ghost" id="btn-plan-auto" title="按素材总时长自动填好套数和每套时长">按素材推荐</button>
+            </div>
+            <p class="hint" id="plan-feasible"></p>
+            <details class="fold">
+              <summary>这一步会做什么？</summary>
+              <div class="fold-body">
+                <p>AI 通读全剧台词，排出几套不同主线（这套讲讨债、那套讲反击），每套是一张「集 | 起 | 止 | 标签」的剪辑表，展开能看到每段在第几集什么位置。</p>
+                <p>每套都按剧情先后推进，不把后面的戏提到开头当钩子——开场抓人靠选材，不靠打乱时序。</p>
+              </div>
+            </details>
+          </div><!-- /mix-pane -->
+
+          <!-- 单集钩子前置：一集一条成片 = 本集一个爆点 + 这一集完整正片。
+               勾选出片、单集失败隔离、参数变了自动重渲，都走同一套出片管线。 -->
+          <div id="hook-pane" class="hidden">
+            <p class="lead">每集挑一个爆点提到片头，后面接这一集的完整正片，一集出一条片。</p>
+            <section class="adv-open">
+              <div class="adv-title">
+                <span class="adv-badge">① 生成设置</span>
+                <b>钩子长度 · 要出哪几集 · 生成偏好</b>
+                <span class="hint">先设好，再点下面的生成</span>
+              </div>
+              <div class="adv-body">
+                <button class="prompt-entry" id="btn-hook-prompt" hidden title="查看并修改挑钩子用的提示词，和混剪那份互不影响">
+                  <span class="pe-ico">✎</span>
+                  <span class="pe-txt"><b>修改提示词</b>
+                    <i>告诉 AI 怎么挑爆点；和混剪那份互不影响</i></span>
+                  <span class="pe-go">查看 / 编辑 ›</span>
+                </button>
+                <div class="card hidden" id="hook-prompt-edit" style="margin:0 0 10px">
+                  <div class="row" style="align-items:center">
+                    <b id="hook-prompt-title">挑钩子指令</b>
+                    <span class="hint" id="hook-prompt-tag"></span>
+                    <span style="flex:1"></span>
+                    <button class="ghost sm" id="btn-hook-prompt-reset" title="删掉自定义，恢复内置的默认提示词">恢复默认</button>
+                  </div>
+                  <div class="seg prompt-tabs" id="hook-prompt-tabs">
+                    <button class="ghost sm on" data-key="hooks">挑钩子指令</button>
+                    <button class="ghost sm" data-key="hooks_schema">输出格式</button>
+                  </div>
+                  <textarea id="hook-prompt-text" rows="14" spellcheck="false"
+                    style="width:100%;margin:6px 0;font-family:Consolas,monospace;font-size:12px"></textarea>
+                  <p class="hint" id="hook-prompt-note" style="margin:2px 0 8px"></p>
+                  <div class="row">
+                    <button class="primary" id="btn-hook-prompt-save">保存提示词</button>
+                    <button class="ghost" id="btn-hook-prompt-cancel">收起</button>
+                  </div>
+                </div>
+                <div class="row hook-row">
+                  <label class="hook-f">生成偏好<select id="hook-model"></select></label>
+                  <label class="hook-f">钩子长度
+                    <span class="seg" id="hook-sec">
+                      <button class="ghost sm" data-sec="10">10 秒</button>
+                      <button class="ghost sm on" data-sec="15">15 秒</button>
+                      <button class="ghost sm" data-sec="20">20 秒</button>
+                    </span>
+                  </label>
+                </div>
+                <div class="card" id="hook-eps-card" style="margin:0">
+                  <div class="row" style="align-items:center">
+                    <b>要出哪几集</b>
+                    <span class="hint" id="hook-ep-stat"></span>
+                    <span style="flex:1"></span>
+                    <input id="hook-range" placeholder="例如 3-12 或 1,3,5" style="width:150px" spellcheck="false">
+                    <button class="ghost sm" id="btn-hook-range">按范围选</button>
+                    <button class="ghost sm" id="btn-hook-all">全选</button>
+                    <button class="ghost sm" id="btn-hook-none">全不选</button>
+                  </div>
+                  <div class="ep-chips" id="hook-ep-chips"></div>
+                  <p class="hint" id="hook-calc" style="margin:8px 0 0"></p>
+                </div>
+              </div>
+            </section>
+            <div class="action-bar">
+              <button class="primary" id="btn-hookcut">生成 0 集钩子</button>
+            </div>
+            <details class="fold">
+              <summary>这一步会做什么？</summary>
+              <div class="fold-body">
+                <p>钩子那段在正片里会再出现一次（预告感，不剔除）。挑得不好的集，程序会自己补一段，不会让整批失败。</p>
+              </div>
+            </details>
+          </div>
+
+          <div class="section-label">② 挑选要出片的套</div>
+          <div id="plan-list" class="plan-list"></div>
+          <div class="note" id="plan-note"></div>
+
+          <section class="adv-open">
+            <div class="adv-title">
+              <span class="adv-badge">③ 出片设置</span>
+              <b>保存位置 · 画面效果</b>
+              <span class="hint">先设好，再点下面的出片</span>
+            </div>
+            <div class="adv-body">
+              <div class="card" id="save-dir-row" style="margin:0 0 10px">
+                <div class="row">
+                  <label style="flex:1">成片保存到
+                    <input id="save-dir" type="text" spellcheck="false" placeholder="例如 F:/钩子工坊_成片" />
+                  </label>
+                  <button class="ghost" id="btn-save-dir-pick">选择文件夹…</button>
+                </div>
+                <p class="hint" id="save-dir-note" style="margin:6px 0 0"></p>
+              </div>
+              <div class="card fx-card" id="fx-card" style="margin:0">
+                <div class="fx-head">
+                  <b>出片与画面</b>
+                  <span class="hint" id="fx-pic-sum">这批套的默认设置 · 每套标题里的「✎ 设置」可单独改</span>
+                  <button class="ghost" id="btn-fx-pic">展开设置 ▾</button>
+                </div>
+                <div class="fx-pic hidden" id="fx-pic-panel"></div>
+              </div>
+            </div>
+          </section>
+          <div class="action-bar out-bar">
+            <span id="plan-stat" class="hint"></span>
+            <button class="ghost sm" id="btn-plan-all">全选</button>
+            <button class="ghost sm" id="btn-plan-none">全不选</button>
+            <button class="primary" id="btn-render-plans">出片（已选 0 套）</button>
+          </div>
+
+          <!-- 出片进度原本单独占一步，现在并到同一步末尾：点完出片就地看进度 -->
+          <div class="section-label">④ 出片进度</div>
+          <div class="hint" id="b3-state"></div>
+          <p class="lead">按勾选的结构逐条出片；中断后重新打开会接着做没完成的部分。</p>
+          <div class="row" id="sets-actions" style="display:none">
+            <button class="ghost" id="btn-open-folder">📂 打开成片文件夹</button>
+            <span class="hint" id="sets-folder-note"></span>
+          </div>
+          <div id="sets-list" class="sets-list"></div>
+        </div>
+
+      </div>
+
+      <div class="step" id="step-shots" data-step="3">
+        <div class="step-h"><span class="idx" id="shots-idx">4</span>引流分镜
+          <span class="tag soft">可单独使用</span><em id="b4-state"></em></div>
+        <p class="lead">不用导入视频也能用：给一段剧情，生成可以逐段复制去用的分镜提示词。</p>
+        <section class="adv-open">
+          <div class="adv-title">
+            <span class="adv-badge">① 生成设置</span>
+            <b>条数 · 时长 · 剧情来源 · 画风人物</b>
+            <span class="hint">先设好，再点下面的生成</span>
+          </div>
+          <div class="adv-body">
+            <div class="row batch-row main-params">
+              <label>条数<input id="in-shot-count" type="number" value="3" min="1" max="10"></label>
+              <label>单条时长
+                <select id="in-shot-dur">
+                  <option value="60">60 秒</option>
+                  <option value="30">30 秒</option>
+                  <option value="15">15 秒</option>
+                </select>
+              </label>
+              <label>每段长度
+                <select id="in-shot-seg" title="按你用的生成工具一次能出多长来选；选 30 秒时段数减半">
+                  <option value="15">15 秒 · 通用</option>
+                  <option value="30">30 秒 · 段数减半</option>
+                </select>
+              </label>
+              <label>剧情来源
+                <select id="in-shot-src">
+                  <option value="script">用本剧台词</option>
+                  <option value="custom">自己粘剧情素材</option>
+                </select>
+              </label>
+            </div>
+            <div id="shot-script-wrap" class="hidden" style="margin:6px 0 2px">
+              <label class="hint" style="display:block">剧情素材（大纲、小说片段、口述稿都行；AI <b>只读这段</b>）
+                <textarea id="in-shot-script" rows="8" style="width:100%;margin-top:4px"
+                  placeholder="例：林晚被继母逼着替嫁，婚礼当天才发现新郎是当年救她一命的男人……&#10;（写清谁是谁、谁害了谁、关键转折即可，台词不用写，AI 会自己写）"></textarea>
+              </label>
+              <div class="hint" id="shot-script-note" style="margin-top:2px"></div>
+            </div>
+            <button class="prompt-entry" id="btn-sprompt-edit" hidden title="查看并修改 AI 写分镜用的提示词，也有「恢复默认」一键回退">
+              <span class="pe-ico">✎</span>
+              <span class="pe-txt"><b>修改提示词</b>
+                <i>告诉 AI 怎么写分镜；改乱了可以一键恢复默认</i></span>
+              <span class="pe-go">查看 / 编辑 ›</span>
+            </button>
+            <div class="card hidden" id="sprompt-edit" style="margin:0 0 10px">
+              <div class="row" style="align-items:center">
+                <b id="sprompt-edit-title">分镜通则</b>
+                <span class="hint" id="sprompt-edit-tag"></span>
+                <span style="flex:1"></span>
+                <button class="ghost sm" id="btn-sprompt-reset" title="删掉自定义，恢复内置的默认提示词">恢复默认</button>
+              </div>
+              <div class="seg prompt-tabs" id="sprompt-tabs">
+                <button class="ghost sm on" data-key="shots">分镜通则</button>
+                <button class="ghost sm" data-key="shots_user">分镜要求</button>
+                <button class="ghost sm" data-key="shots_schema">输出格式</button>
+                <button class="ghost sm" data-key="shots_rules">固定短句</button>
+              </div>
+              <textarea id="sprompt-edit-text" rows="14" spellcheck="false"
+                style="width:100%;margin:6px 0;font-family:Consolas,monospace;font-size:12px"></textarea>
+              <p class="hint" id="sprompt-edit-note" style="margin:2px 0 8px"></p>
+              <div class="row">
+                <button class="primary" id="btn-sprompt-save">保存提示词</button>
+                <button class="ghost" id="btn-sprompt-cancel">收起</button>
+              </div>
+            </div>
+            <details class="fold adv">
+              <summary>更多设置（画风 · 人物 · 对话式生成器）</summary>
+              <div class="fold-body">
+                <label class="fld" style="display:block;margin:0 0 10px">画风（留空用默认）
+                  <input id="in-shot-style" type="text" placeholder="真人写实风格，4K 高清……"></label>
+                <label class="hint" style="display:flex;align-items:center;gap:6px;white-space:nowrap;margin:0 0 10px"
+                       title="默认勾选：每段开头加几句说明，适合粘进会反问你的对话框式生成器，让它别反问、一次生成；纯 API / 工作流不需要时可关掉">
+                  <input id="in-shot-ctl" type="checkbox" checked> 给对话式生成器加说明句
+                </label>
+                <label class="hint" style="display:block;margin:4px 0">人物卡（每行一个：名字，外观描述；没有参考图的写「无图」）— 留空则由 AI 按素材自己设定
+                  <textarea id="in-shot-cast" rows="3" style="width:100%" placeholder="例：林晚，28岁，黑色长直发，白色真丝衬衫，冷感妆"></textarea>
+                </label>
+                <div class="hint" style="margin:2px 0 6px">同一条片里同一个人只定一份音色，A/B/C/D 各段原样共用（只有情绪和重音按段变）——各段要拼成一条片，换音色等于换了演员。不同条各自独立，可以各用各的音色。</div>
+              </div>
+            </details>
+          </div>
+        </section>
+        <div class="action-bar"><button class="primary" id="btn-shots">生成引流分镜</button></div>
+        <details class="fold">
+          <summary>这一步会做什么？</summary>
+          <div class="fold-body">
+            <p>可以接着本剧台词用，也可以自己粘一段剧情。AI 会自己构思几条短片，再按你选的段长切开：每段都是一份完整的提示词，能单独复制去生成，拼起来就是整条片。</p>
+            <p>每段长度按你用的生成工具一次能出多长来选：能出 15 秒就选 15 秒，能出 30 秒就选 30 秒（段数减半）。</p>
+          </div>
+        </details>
+        <div id="shots-warn" class="note hidden"></div>
+        <div id="shots-list"></div>
+      </div>
+
+      <!-- 第 5 步：两两合并（相对独立，不依赖前面任何一步） -->
+      <div class="step" id="step-vmerge" data-step="4">
+        <div class="step-h"><span class="idx" id="vm-idx">5</span>两两合并<span class="tag soft">可单独使用</span><em id="b5-state"></em></div>
+        <p class="lead">选两个文件夹，把 A 里和 B 里的视频按顺序两两拼成一条，不用先做前面几步。</p>
+        <details class="fold">
+          <summary>这一步会做什么？</summary>
+          <div class="fold-body">
+            <p>A1+B1、A1+B2、A1+B3、A2+B1…… 按顺序全组合一遍，自动统一成竖屏画面和一致的音量，任意来源的视频都能拼。</p>
+            <p>已经拼过的会自动跳过，中断了再点一次只补没做的。</p>
+          </div>
+        </details>
+        <div class="row batch-row">
+          <label style="flex:1">文件夹 A<input id="in-vm-a" placeholder="例如 F:\\口播素材" spellcheck="false"></label>
+          <button class="ghost" id="btn-vm-a">选择…</button>
+          <label style="flex:1">文件夹 B<input id="in-vm-b" placeholder="例如 F:\\剧情素材" spellcheck="false"></label>
+          <button class="ghost" id="btn-vm-b">选择…</button>
+        </div>
+        <div class="row batch-row">
+          <label style="flex:1">保存到（与源文件夹无关，建议单独选一个目录）<input id="in-vm-out" placeholder="留空 = 设置里「成片保存位置」下的「两两合并」文件夹" spellcheck="false"></label>
+          <button class="ghost" id="btn-vm-out">选择…</button>
+          <button class="ghost" id="btn-vm-preview" title="列出两边各有哪些视频、会组合出多少条，先确认再开跑">预览组合</button>
+          <button class="primary" id="btn-vm-start">开始合并</button>
+          <button class="ghost danger hidden" id="btn-vm-cancel">取消</button>
+        </div>
+        <div class="hint" id="vm-preview" style="margin:4px 0 2px"></div>
+        <div class="gbar hidden" id="vm-prog" style="margin:6px 0">
+          <div class="gbar-fill" id="vm-prog-fill"></div>
+          <div class="gbar-text"><span class="spinner"></span><span id="vm-prog-text">处理中…</span></div>
+        </div>
+        <button class="ghost hidden" id="btn-vm-open">打开输出文件夹 ↗</button>
+      </div>
+    </section>
+    <!-- 发布运营：一级页面，和左边的项目列表没有必然联系。
+         视频可以来自任何文件夹（选文件夹 / 选文件），也可以是项目出的片。
+         三个 Tab 分开是刻意的（2026-11-13）：数据 / 诊断都要开浏览器去号里拉，
+         一次 8-15 秒。混在发布页里会让「打开这一页」直接卡住，所以按需切过去才拉。
+         内容全部由 publish.js 渲染，这里只留骨架。 -->
+    <section id="view-publish" class="view hidden">
+      <div class="pub-head2">
+        <div>
+          <h1>发布运营</h1>
+        </div>
+        <div class="pub-head2-ops">
+          <div class="pub-head2-row">
+            <!-- 常驻入口：和 Tab 同一排，切页不消失。放在骨架里而不是某个 Tab
+                 里，就是因为「想进视频号助手看一眼」跟当前在哪一页无关。
+                 默认禁用，选好号才由 publish.js 放开。 -->
+            <button class="ghost sm" id="btn-open-platform" disabled
+              title="先在「发布」页选一个号">进入视频号助手 ↗</button>
+            <div class="pub-tabs" id="pub-tabs">
+              <button class="pub-tab on" data-ptab="pub">发布</button>
+              <button class="pub-tab" data-ptab="stat">数据</button>
+              <button class="pub-tab" data-ptab="diag">诊断</button>
+            </div>
+          </div>
+          <span class="hint" id="pub-gate-hint"></span>
+        </div>
+      </div>
+      <!-- 三个 Tab 共用的账号条：不确认账号，发布/数据/诊断都不给操作。
+           放在骨架里而不是某个 Tab 里，切 Tab 时整块不会消失。 -->
+      <div id="pub-global-acc"></div>
+      <div id="pub-body">
+        <div class="pub-loading">正在读取…</div>
+      </div>
+      <div id="pub-stat" class="hidden"></div>
+      <div id="pub-diag" class="hidden"></div>
+    </section>
+
+  </main>
+</div>
+
+<div class="modal hidden" id="modal-settings">
+  <div class="modal-card">
+    <div class="modal-head">
+      <b>设置</b>
+      <span class="hint" id="ver-hint"></span>
+      <button class="ghost sm" id="btn-close-settings">关闭</button>
+    </div>
+    <div class="modal-body">
+      <!-- 常用设置：终端用户只看这一层。实现细节（生成方式、凭证、机器信息、
+           日志上报、目录）统一收进下面的「高级设置」，且只对管理员开放。 -->
+      <div class="set-group">
+        <div class="set-title">常用</div>
+        <div class="fld-note" id="trial-hint"></div>
+        <label class="fld">成片保存位置
+          <input id="in-outdir" placeholder="例如 D:\\钩子工坊成片（留空则用默认目录）" spellcheck="false">
+          <span class="hint" id="outdir-hint"></span>
+        </label>
+        <label class="fld">出片速度
+          <select id="in-hwenc">
+            <option value="auto">自动（推荐）</option>
+            <option value="off">稳定优先</option>
+          </select>
+          <span class="hint">出片出问题时改成「稳定优先」再试。</span>
+        </label>
+        <label class="fld">外观
+          <div class="seg" id="seg-theme">
+            <button type="button" data-theme-set="system">跟随系统</button>
+            <button type="button" data-theme-set="dark">暗色</button>
+            <button type="button" data-theme-set="light">亮色</button>
+          </div>
+          <span class="hint">选「跟随系统」时，系统切深浅色界面会跟着切。</span>
+        </label>
+        <label class="fld">同时生成几条
+          <select id="in-conc">
+            <option value="1">1 条（最稳）</option>
+            <option value="2">2 条</option>
+            <option value="3">3 条（推荐）</option>
+            <option value="4">4 条</option>
+            <option value="5">5 条</option>
+            <option value="6">6 条</option>
+            <option value="7">7 条</option>
+            <option value="8">8 条（最快）</option>
+          </select>
+          <span class="hint">一次要出很多条时调高会更快出完；如果提示服务忙、失败变多，调回来即可。</span>
+        </label>
+      </div>
+
+      <details class="fold adv" id="adv-settings">
+        <summary>高级设置（管理员 / 排障用）</summary>
+        <div class="fold-body">
+          <div class="fld-note" id="ai-owner-hint"></div>
+          <label class="fld" id="fld-model">生成方式
+            <input id="in-model" list="model-list" placeholder="留空则用默认" autocomplete="off" spellcheck="false">
+            <datalist id="model-list">
+              <option value="qwen3.5-plus">默认（稳定）</option>
+              <option value="ZHIPU/GLM-5.2">快速（需开通）</option>
+              <option value="ZHIPU/GLM-5.3">快速 · 长剧本（需开通）</option>
+              <option value="deepseek-v4-pro">精细（较慢）</option>
+              <option value="deepseek-flash">轻快</option>
+              <option value="qwen-max">备用</option>
+            </datalist>
+            <span class="hint" id="model-hint"></span>
+          </label>
+          <label class="fld" id="fld-shotsmodel">分镜生成方式（第 4 步，可留空跟上面一样）
+            <input id="in-shotsmodel" list="model-list" placeholder="留空 = 用上面的方式" autocomplete="off" spellcheck="false">
+            <span class="hint" id="shotsmodel-hint">排结构和写分镜可以各用一种方式。</span>
+          </label>
+          <label class="fld" id="fld-llmkey">服务端凭证 · 百炼
+            <input id="in-key" placeholder="留空则不修改" autocomplete="off" spellcheck="false">
+            <span class="hint" id="key-hint"></span>
+          </label>
+          <label class="fld" id="fld-dskey">服务端凭证 · DeepSeek
+            <input id="in-dskey" placeholder="留空则不修改" autocomplete="off" spellcheck="false">
+            <span class="hint" id="dskey-hint"></span>
+          </label>
+          <div class="fld-note" id="llm-test-hint"></div>
+
+          <div class="set-title" style="margin-top:14px">提示词</div>
+          <button class="prompt-entry" id="btn-sysprompt-edit" hidden title="第 1 步 / 第 3 步共用的输出要求">
+            <span class="pe-ico">✎</span>
+            <span class="pe-txt"><b>通用输出要求</b>
+              <i>排结构时附加的那句收尾要求；第 4 步分镜不用这份</i></span>
+            <span class="pe-go">查看 / 编辑 ›</span>
+          </button>
+          <div class="card hidden" id="sysprompt-edit" style="margin:0 0 10px">
+            <div class="row" style="align-items:center">
+              <b id="sysprompt-title">通用输出要求</b>
+              <span class="hint" id="sysprompt-tag"></span>
+              <span style="flex:1"></span>
+              <button class="ghost sm" id="btn-sysprompt-reset" title="删掉自定义，恢复内置的默认提示词">恢复默认</button>
+            </div>
+            <textarea id="sysprompt-text" rows="5" spellcheck="false"
+              style="width:100%;margin:6px 0;font-family:Consolas,monospace;font-size:12px"></textarea>
+            <p class="hint" id="sysprompt-note" style="margin:2px 0 8px"></p>
+            <div class="row">
+              <button class="primary" id="btn-sysprompt-save">保存</button>
+              <button class="ghost" id="btn-sysprompt-cancel">收起</button>
+            </div>
+          </div>
+          <div class="fld">
+            <span>台词识别</span>
+            <div class="fld-note" id="tier-hint"></div>
+          </div>
+          <label class="fld" id="fld-report">
+            <span><input type="checkbox" id="in-report" style="width:auto;height:auto;margin:0 7px 0 0;vertical-align:-2px">把本机操作日志上报到后台</span>
+            <span class="hint" id="report-hint"></span>
+          </label>
+          <div class="fld-note" id="sys-hint"></div>
+          <div class="fld-note" id="path-hint"></div>
+        </div>
+      </details>
+    </div>
+    <div class="modal-foot">
+      <button class="ghost" data-author>联系作者</button>
+      <button class="ghost" id="btn-test-llm">测试连通</button>
+      <button class="primary" id="btn-save-settings">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 联系作者：右下角常驻悬浮按钮，点开微信二维码。
+     需求收集走人肉渠道——用户提得越多，产品越对路，所以入口要做醒目。 -->
+<button class="fab-author" id="btn-author" data-author title="有新需求 / 新功能想法？联系作者">
+  <span class="fab-ava">微</span>
+  <span class="fab-txt"><b>联系作者</b><i>新需求 · 加微信</i></span>
+</button>
+
+<div class="modal hidden" id="modal-author">
+  <div class="modal-card author-card">
+    <div class="modal-head">
+      <b>联系作者 · 提需求 / 加功能</b>
+      <button class="ghost sm" id="btn-close-author">关闭</button>
+    </div>
+    <div class="author-body">
+      <img class="author-qr" src="/static/assets/author-wechat.jpg" alt="作者微信二维码">
+      <div class="author-txt">
+        <p class="author-big">微信扫一扫，加作者好友</p>
+        <p class="hint">想要新功能、觉得哪一步不顺手、还是用出问题了，都可以直接聊。</p>
+        <p class="hint">添加时备注<b>「钩子工坊」</b>，通过得更快。</p>
+      </div>
+    </div>
+    <p class="author-foot">以后想找作者：点右上角绿色「联系作者 · 加微信」，或点右下角按钮。</p>
+  </div>
+</div>
+
+<!-- 台词复用 / 粘贴：第 1 步的两个入口共用一个弹窗 -->
+<div class="modal hidden" id="modal-lines">
+  <div class="modal-card lines-card">
+    <div class="modal-head">
+      <b>导入台词</b>
+      <span class="hint">不用再整理一遍台词</span>
+      <button class="ghost sm" id="btn-close-lines">关闭</button>
+    </div>
+    <div class="modal-body">
+      <label class="fld">① 从其他项目复制
+        <select id="ln-from"><option value="">选一个整理好台词的项目</option></select>
+        <span class="hint">按<b>文件名</b>对齐集，只补还没有台词的集；对不上的集会照常自动整理。适合同一批素材重建项目。</span>
+      </label>
+      <div class="row" style="justify-content:flex-end">
+        <button class="ghost" id="btn-do-reuse">复制过来</button>
+      </div>
+      <label class="fld">② 粘贴台词（每句要带出现时间）
+        <select id="ln-ep"><option value="0">自动按「【第03集】」分段</option></select>
+        <textarea id="ln-text" rows="9" spellcheck="false"
+          placeholder="可以粘这两种：&#10;· 本工具「下载台词 .txt」里的原样内容（1. (2.7-4.9) 台词…）&#10;· 带时间轴的字幕（00:00:02,700 --> 00:00:04,940 下一行是台词）&#10;多集请保留【第01集】这样的分段行"></textarea>
+        <span class="hint">每句台词要带出现时间，剪辑靠它定位；只有文字没有时间就不能用来剪。</span>
+      </label>
+      <div class="row" style="justify-content:flex-end">
+        <button class="primary" id="btn-do-paste">导入粘贴内容</button>
+      </div>
+      <p class="hint" id="ln-stat"></p>
+    </div>
+  </div>
+</div>
+
+<!-- 第 1 步：台词查看 / 修改。一次取回全部集，逐集编辑，保存只覆盖这一集 -->
+<div class="modal hidden" id="modal-view-lines">
+  <div class="modal-card lines-card" style="width:min(860px,94vw)">
+    <div class="modal-head">
+      <b>查看 / 修改台词</b>
+      <span class="hint" id="vl-name"></span>
+      <button class="ghost sm" id="btn-close-vl">关闭</button>
+    </div>
+    <div class="modal-body">
+      <div class="row" style="align-items:center">
+        <b>选一集</b>
+        <span class="hint" id="vl-stat"></span>
+        <span style="flex:1"></span>
+        <a class="ghost" id="vl-open-all" target="_blank" rel="noopener">新窗口看全文 ↗</a>
+        <a class="ghost" id="vl-download">下载这一集 .txt</a>
+      </div>
+      <div class="ep-chips" id="vl-eps"></div>
+      <textarea id="vl-text" rows="17" spellcheck="false"
+        style="width:100%;font-family:Consolas,monospace;font-size:12.5px;line-height:1.7"></textarea>
+      <p class="hint">每行一句，格式 <code>1. (2.7-4.9) 台词</code>：括号里是这句在本集里的起止秒数。
+        可以直接改错字、删掉整行、改时间码；保存只影响这一集。<b>改完，之前生成的结构和分镜不会自动更新，需要重新生成。</b></p>
+      <p class="hint" id="vl-msg"></p>
+    </div>
+    <div class="modal-foot">
+      <button class="ghost" id="btn-vl-reset">放弃修改</button>
+      <button class="primary" id="btn-vl-save">保存这一集</button>
+    </div>
+  </div>
+</div>
+
+<!-- 每套单独的出片与画面设置：默认跟随上面的「出片与画面」，改了只影响这一套 -->
+<div class="modal hidden" id="modal-planfx">
+  <div class="modal-card">
+    <div class="modal-head">
+      <b id="pfx-title">出片与画面</b>
+      <span class="hint" id="pfx-mode"></span>
+      <button class="ghost" id="pfx-close" title="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="sx-panel"></div>
+      <p class="hint">这里改的<b>只影响这一套</b>（出片增强、画面、用哪份视频、加回自己的字幕都算），其他套仍按默认来；全部保持和默认一样就等于「跟随默认」。改完点保存，出片时这套会自动重渲。</p>
+    </div>
+    <div class="modal-foot">
+      <button class="ghost" id="pfx-reset">恢复成默认</button>
+      <button class="primary" id="pfx-save">保存这套的设置</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+
+
+<script src="/static/version.js"></script>
+<script src="/static/session.js"></script>
+<script src="/static/app.js"></script>
+<script src="/static/publish.js"></script>
+</body>
+</html>

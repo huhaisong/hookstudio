@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>钩子工坊</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="dot"></span>钩子工坊</div>
+  <div class="pills" id="pills"></div>
+  <button class="ghost sm" id="btn-settings">设置</button>
+</header>
+
+<div class="gbar hidden" id="gbar">
+  <div class="gbar-fill" id="gbar-fill"></div>
+  <div class="gbar-text"><span class="spinner"></span><span id="gbar-text">处理中…</span></div>
+</div>
+
+<div class="shell">
+  <aside class="rail">
+    <button class="primary wide" id="btn-new">＋ 新建项目</button>
+    <div class="rail-title">项目</div>
+    <div id="plist" class="plist"></div>
+  </aside>
+
+  <main class="main" id="main">
+    <section id="view-new" class="view">
+      <h1>从本地剧集生成钩子视频</h1>
+      <p class="hint">选一个放着剧集的文件夹，选好模式，工具会自动转写；之后按模式走各自的流程。</p>
+
+      <div class="card">
+        <div class="drives" id="drives"></div>
+        <div class="browse-head">
+          <div class="crumb" id="crumb">—</div>
+          <button class="ghost" id="btn-up" title="上一层">↑ 上一层</button>
+        </div>
+        <div class="dirs" id="dirs"></div>
+        <div class="browse-foot">
+          <button class="primary" id="btn-use">选用当前目录</button>
+          <span class="hint" id="pick-hint"></span>
+        </div>
+      </div>
+
+      <div class="card row">
+        <label>项目模式
+          <select id="in-mode">
+            <option value="funnel">单片导流 · 一条结构化导流片</option>
+            <option value="batch">批量混剪 · N 套精彩片段</option>
+          </select>
+        </label>
+        <label>项目名称<input id="in-name" placeholder="留空则用文件夹名"></label>
+        <label id="target-wrap">导流片目标时长（分钟）<input id="in-target" type="number" value="10" min="1" max="60"></label>
+        <label id="gear-wrap-new" class="hidden">挖片挡位<select id="in-gear-new"></select></label>
+        <button class="primary" id="btn-create">扫描并创建</button>
+      </div>
+      <p class="hint" id="mode-hint">单片导流：AI 排「钩子→按剧情推进→悬念收尾」的结构表，你确认后出一条片。</p>
+    </section>
+
+    <section id="view-proj" class="view hidden">
+      <div class="proj-head">
+        <div>
+          <h1 id="p-name">—</h1>
+          <div class="meta" id="p-path"></div>
+          <div class="meta" id="p-meta"></div>
+        </div>
+        <button class="ghost danger" id="btn-del">删除</button>
+      </div>
+
+      <div class="step">
+        <div class="step-h"><span class="idx">1</span>转写<em id="s1-state"></em></div>
+        <p class="hint">本机 Whisper 把每集台词转成带时间码的文本，不花钱，只占 CPU。<b>建完项目会自动开始</b>，中途断了再进来也会自动接着转。</p>
+        <button class="primary" id="btn-transcribe">开始转写</button>
+        <span id="transcript-links" class="hidden">
+          <a class="ghost" id="btn-transcript" target="_blank" rel="noopener">查看台词全文 ↗</a>
+          <a class="ghost" id="btn-transcript-dl">下载台词 .txt</a>
+        </span>
+      </div>
+
+      <!-- 单片导流模式 -->
+      <div id="funnel-steps">
+        <div class="step">
+          <div class="step-h"><span class="idx">2</span>剪辑结构<em id="s2-state"></em></div>
+          <p class="hint">AI 读台词排出结构，按「集 | 起 | 止 | 标签」给你一张表，可直接改。</p>
+          <button class="primary" id="btn-analyze">让 AI 出表</button>
+          <div class="edl-wrap" id="edl-wrap">
+            <textarea id="edl" spellcheck="false" placeholder="集|起|止|标签&#10;01|0.00|29.90|前世被害"></textarea>
+            <div class="edl-foot">
+              <span id="edl-stat" class="hint"></span>
+              <button class="ghost" id="btn-save-edl">保存表格</button>
+            </div>
+            <div class="note" id="p-note"></div>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-h"><span class="idx">3</span>出片<em id="s3-state"></em></div>
+          <p class="hint">从原片直接切段，720×1280 / 30fps / CRF18，统一音量，不加任何文字。</p>
+          <button class="primary" id="btn-render">开始渲染</button>
+          <div id="out-wrap" class="out-wrap hidden">
+            <video id="out-video" controls playsinline></video>
+            <a class="primary" id="btn-download" download>下载成片</a>
+          </div>
+        </div>
+      </div>
+
+      <!-- 批量混剪模式 -->
+      <div id="batch-steps" class="hidden">
+        <div class="step">
+          <div class="step-h"><span class="idx">2</span>精彩片段池<em id="b2-state"></em></div>
+          <p class="hint">AI 只调一次 API，把全剧当成一条连续时间轴，圈出能连着看的<b>剧情块</b>（可以跨集）并打分。<b>AI 圈出什么就全部用上，不用你挑</b>。同一场戏里隔得很近的两处爆点会自动缝成一块，不会切开留空洞。</p>
+          <div class="row batch-row">
+            <label>挖片挡位<select id="in-gear"></select></label>
+            <button class="primary" id="btn-pool">AI 挖片段池</button>
+          </div>
+          <p class="hint" id="gear-hint"></p>
+          <div class="edl-wrap" id="pool-wrap">
+            <div id="pool-list" class="pool-list"></div>
+            <textarea id="pool" class="hidden" spellcheck="false" placeholder="集|起|止|时长|评分|标签&#10;01|0.20|35.10|34.9|9|【爆点】女主当众撞破背叛"></textarea>
+            <div class="edl-foot">
+              <span id="pool-stat" class="hint"></span>
+              <button class="ghost" id="btn-pool-toggle">文本编辑</button>
+              <button class="ghost hidden" id="btn-save-pool">保存片段池</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-h"><span class="idx">3</span>剪辑结构（先出 N 套供你挑）<em id="b3-state"></em></div>
+          <p class="hint">两种做法，随你挑：<b>本机组装</b>不花钱、秒出、可无限重试，重合度精确可控；<b>AI 编排</b>把全剧台词交给 AI 通读一遍，走 1 次调用，它看得见完整剧情，能把六套排成不同的主线（这套讲讨债、那套讲反击），代价是时长和重合度只能事后校验。每套都是一份「集 | 起 | 止 | 标签」的剪辑表，<b>只给你勾选中的套出片</b>。</p>
+          <div class="row batch-row">
+            <label>套数<input id="in-count" type="number" value="3" min="1" max="200"></label>
+            <label>最短（分钟）<input id="in-min" type="number" value="3" min="0.5" max="60" step="0.5"></label>
+            <label>最长（分钟）<input id="in-max" type="number" value="7" min="0.5" max="60" step="0.5"></label>
+            <label>播放顺序
+              <select id="in-order">
+                <option value="auto">自动轮换（各套结构不同，推荐）</option>
+                <option value="chrono">全部严格集序</option>
+                <option value="varied">全部变序开场</option>
+              </select>
+            </label>
+            <button class="primary" id="btn-plan">生成 3 套结构</button>
+            <button class="ghost" id="btn-ai-plan" title="把全剧台词交给 AI 通读，一次排出多套。走 1 次 AI 调用，约几分钱">AI 编排</button>
+          </div>
+          <p class="hint" id="plan-feasible"></p>
+          <p class="hint" id="order-hint">自动轮换：每套用不同的叙事结构（纯集序 / 最炸开场 / 最炸收尾 / 首尾双爆点 / 后段冷开场再回溯 / 两幕爆发），可以改时序但都有逻辑，不会乱跳。套间重合度控制在 70% 以内，素材池撑不起会提示。</p>
+          <div id="plan-list" class="plan-list"></div>
+          <div class="note" id="plan-note"></div>
+          <div class="card" id="save-dir-row" style="margin:10px 0">
+            <div class="row">
+              <label style="flex:1">成片保存到
+                <input id="save-dir" type="text" spellcheck="false" placeholder="例如 F:/钩子工坊_成片" />
+              </label>
+              <button class="ghost" id="btn-save-dir-pick">选择文件夹…</button>
+            </div>
+            <p class="hint" id="save-dir-note" style="margin:6px 0 0"></p>
+          </div>
+          <div class="edl-foot">
+            <span id="plan-stat" class="hint"></span>
+            <button class="ghost" id="btn-plan-all">全选</button>
+            <button class="ghost" id="btn-plan-none">全不选</button>
+            <button class="primary" id="btn-render-plans">出片（已选 0 套）</button>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-h"><span class="idx">4</span>出片<em id="b4-state"></em></div>
+          <p class="hint">按勾选的结构逐套渲染，每套约 2 分钟；中断重启会自动续跑没做完的套。</p>
+          <div class="row" id="sets-actions" style="display:none">
+            <button class="ghost" id="btn-open-folder">📂 打开成片文件夹</button>
+            <span class="hint" id="sets-folder-note"></span>
+          </div>
+          <div id="sets-list" class="sets-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="modal hidden" id="modal-settings">
+  <div class="modal-card">
+    <div class="modal-head">
+      <b>设置</b>
+      <span class="hint" id="ver-hint"></span>
+      <button class="ghost sm" id="btn-close-settings">关闭</button>
+    </div>
+    <div class="modal-body">
+      <label class="fld">百炼（DashScope）API Key
+        <input id="in-key" placeholder="sk-…（留空则不修改）" autocomplete="off" spellcheck="false">
+        <span class="hint" id="key-hint"></span>
+      </label>
+      <div class="fld-note" id="trial-hint"></div>
+      <div class="fld">
+        <span>转写模型</span>
+        <div class="fld-note" id="tier-hint"></div>
+      </div>
+      <label class="fld">成片保存位置
+        <input id="in-outdir" placeholder="例如 D:\\钩子工坊成片（留空则用默认目录）" spellcheck="false">
+        <span class="hint" id="outdir-hint"></span>
+      </label>
+      <div class="fld-note" id="sys-hint"></div>
+      <div class="fld-note" id="path-hint"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="primary" id="btn-save-settings">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

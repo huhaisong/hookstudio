@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>管理后台 · 钩子工坊</title>
+<script>
+/* 主题预设：与 index.html 同一份逻辑——必须在样式表前设 data-theme 防白闪。
+   默认暗色（2026-11-14 用户定）；hs_theme = dark / light / system。 */
+(function () {
+  var t = "dark";
+  try { t = localStorage.getItem("hs_theme") || "dark"; } catch (e) {}
+  if (t === "system") {
+    t = (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+  }
+  document.documentElement.setAttribute("data-theme", t);
+})();
+</script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="ad-body">
+
+<header class="top">
+  <div class="brand"><span class="dot"></span>管理后台</div>
+  <div class="ad-spacer"></div>
+  <span class="ad-who" id="ad-who"></span>
+  <a class="ghost sm" href="/">← 回到工作台</a>
+  <button class="ghost sm" id="btn-logout">退出</button>
+</header>
+
+<div class="ad-shell">
+  <nav class="ad-tabs">
+    <button class="ad-tab on" data-p="users">用户管理</button>
+    <button class="ad-tab" data-p="logs">操作日志</button>
+    <button class="ad-tab" data-p="settings">系统设置</button>
+  </nav>
+
+  <!-- ── 用户管理 ───────────────────────────────────────────── -->
+  <section class="ad-panel" id="p-users">
+    <div class="ad-bar">
+      <input id="u-q" type="search" placeholder="搜索用户名 / 昵称 / 邮箱" spellcheck="false">
+      <select id="u-role">
+        <option value="">全部角色</option>
+        <option value="admin">管理员</option>
+        <option value="user">普通用户</option>
+      </select>
+      <select id="u-status">
+        <option value="">全部状态</option>
+        <option value="active">正常</option>
+        <option value="banned">已封禁</option>
+      </select>
+      <button class="ghost" id="u-search">查询</button>
+      <span class="ad-stat" id="u-stat"></span>
+    </div>
+
+    <div class="ad-table-wrap">
+      <table class="ad-table" id="u-table">
+        <thead>
+          <tr>
+            <th style="width:52px">ID</th>
+            <th>用户</th>
+            <th style="width:150px">邮箱</th>
+            <th style="width:78px">角色</th>
+            <th style="width:88px">状态</th>
+            <th style="width:120px">最后登录</th>
+            <th style="width:120px">最后活跃</th>
+            <th style="width:250px">操作</th>
+          </tr>
+        </thead>
+        <tbody id="u-rows"></tbody>
+      </table>
+    </div>
+    <div class="ad-page" id="u-page"></div>
+  </section>
+
+  <!-- ── 操作日志 ───────────────────────────────────────────── -->
+  <section class="ad-panel hidden" id="p-logs">
+    <div class="ad-stat-row" id="lg-cards"></div>
+
+    <div class="ad-bar ad-bar-wrap">
+      <input id="lg-q" type="search" placeholder="关键字（路径/参数/说明）" spellcheck="false">
+      <select id="lg-action"><option value="">全部动作</option></select>
+      <select id="lg-method">
+        <option value="">全部方法</option>
+        <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option>
+      </select>
+      <select id="lg-user"><option value="">全部用户</option></select>
+      <input id="lg-status" type="number" placeholder="状态码" style="width:88px">
+      <label class="ad-check"><input id="lg-fail" type="checkbox"> 只看失败</label>
+      <input id="lg-from" type="date" title="起始日期">
+      <input id="lg-to" type="date" title="结束日期">
+      <button class="ghost" id="lg-search">查询</button>
+      <button class="ghost" id="lg-export">导出 CSV</button>
+    </div>
+
+    <div class="ad-table-wrap">
+      <table class="ad-table" id="lg-table">
+        <thead>
+          <tr>
+            <th style="width:118px">时间</th>
+            <th style="width:88px">用户</th>
+            <th style="width:150px">动作</th>
+            <th style="width:58px">方法</th>
+            <th>路由</th>
+            <th style="width:58px">状态</th>
+            <th style="width:58px">耗时</th>
+            <th style="width:110px">IP</th>
+            <th style="width:120px">说明</th>
+          </tr>
+        </thead>
+        <tbody id="lg-rows"></tbody>
+      </table>
+    </div>
+    <div class="ad-page" id="lg-page"></div>
+    <p class="hint">点任意一行展开参数（已脱敏：密码、Key、令牌显示为 ***）。状态轮询类请求不入库，日志只留操作。</p>
+  </section>
+
+  <!-- ── 系统设置 ───────────────────────────────────────────── -->
+  <section class="ad-panel hidden" id="p-settings">
+    <div class="card" style="max-width:640px">
+      <h1>访问控制</h1>
+      <p class="hint">本版本<b>固定为登录模式</b>：除登录页外，任何页面和接口都要先登录，
+        没有「免登录」开关。原因很简单——免登录模式下「封禁 / 踢下线」对匿名访问无效
+        （清掉本地凭证就绕过去了），日志里也全是记不出用户的空行。</p>
+      <div class="ad-lock">
+        <span class="pill ok">强制登录 · 已启用（不可关闭）</span>
+      </div>
+      <p class="hint">要让某人停止使用：用户管理 → 封禁。封禁后他的所有令牌立即失效，
+        再登录会被拒绝并看到封禁理由。</p>
+
+      <h1 style="margin-top:22px">令牌有效期</h1>
+      <div class="ad-grid">
+        <label>access 有效（分钟）
+          <input id="st-access" type="number" min="1" max="1440">
+        </label>
+        <label>refresh 有效（天）
+          <input id="st-refresh" type="number" min="1" max="90">
+        </label>
+      </div>
+
+      <h1 style="margin-top:22px">初始管理员密码</h1>
+      <p class="hint">只影响「空库首次启动」时创建的那个 admin。已经创建过的账号不受影响，
+        改这里的密码不会改 admin 的现密码——要改现密码请用下方「重置密码」。</p>
+      <div class="row">
+        <input id="st-initpwd" type="password" placeholder="留空 = 不修改" autocomplete="new-password">
+        <button class="ghost" id="st-save">保存设置</button>
+      </div>
+      <p class="hint" id="st-note" style="margin-top:10px"></p>
+    </div>
+  </section>
+</div>
+
+<div class="ad-modal hidden" id="ad-modal">
+  <div class="ad-modal-card">
+    <h1 id="mo-title">—</h1>
+    <p class="hint" id="mo-desc"></p>
+    <input id="mo-input" type="text" style="display:none">
+    <div class="row" style="justify-content:flex-end;margin-top:14px">
+      <button class="ghost" id="mo-cancel">取消</button>
+      <button class="primary" id="mo-ok">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/version.js"></script>
+<script src="/static/session.js"></script>
+<script src="/static/admin.js"></script>
+</body>
+</html>

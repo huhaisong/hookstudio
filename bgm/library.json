@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "note": "内置曲库。audio/ 里的音频是程序合成的占位氛围音，不含任何第三方录音、无版权负担，仅用于跑通链路；正式商用请把它们替换为你已获授权的音乐，并同步维护每首的 mood / tags。程序只按情绪标签匹配：模型不写歌名，也不提供下载地址。",
+  "allow_hosts": [],
+  "tracks": [
+    {
+      "id": "tense_01",
+      "name": "暗涌",
+      "mood": "tense",
+      "tags": ["紧张", "悬疑", "弦乐", "鼓点", "冲突", "压迫", "反转", "低音", "对峙", "危机"],
+      "file": "audio/tense_01.m4a",
+      "url": "",
+      "license": "程序合成·无第三方版权",
+      "source": "ffmpeg 合成（占位示例）"
+    },
+    {
+      "id": "emotional_01",
+      "name": "余温",
+      "mood": "emotional",
+      "tags": ["抒情", "钢琴", "压抑", "伤感", "落泪", "渐强", "亲情", "温柔", "治愈", "独白"],
+      "file": "audio/emotional_01.m4a",
+      "url": "",
+      "license": "程序合成·无第三方版权",
+      "source": "ffmpeg 合成（占位示例）"
+    },
+    {
+      "id": "upbeat_01",
+      "name": "轻步",
+      "mood": "upbeat",
+      "tags": ["轻快", "明快", "欢快", "节奏感", "律动", "活泼", "轻松", "喜剧", "热血", "甜"],
+      "file": "audio/upbeat_01.m4a",
+      "url": "",
+      "license": "程序合成·无第三方版权",
+      "source": "ffmpeg 合成（占位示例）"
+    },
+    {
+      "id": "neutral_01",
+      "name": "留白",
+      "mood": "neutral",
+      "tags": ["铺底", "安静", "氛围", "平缓", "低调", "叙事", "日常", "过渡", "留白", "清淡"],
+      "file": "audio/neutral_01.m4a",
+      "url": "",
+      "license": "程序合成·无第三方版权",
+      "source": "ffmpeg 合成（占位示例）"
+    }
+  ]
+}

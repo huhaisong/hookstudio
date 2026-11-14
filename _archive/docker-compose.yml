@@ -1,0 +1,31 @@
+# 注意：这是 Docker 运行方式，已不再是主路径。
+# 现在推荐直接双击 dev.bat（开发）或使用打包后的 钩子工坊.exe（分发）。
+# 保留此文件仅用于应急回退。
+services:
+  hookstudio:
+    image: autoclip:local
+    container_name: hookstudio
+    working_dir: /srv
+    entrypoint: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8100", "--no-access-log"]
+    ports:
+      - "8100:8100"
+    healthcheck:
+      disable: true
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - LLM_MODEL=${LLM_MODEL:-qwen-plus}
+      - DATA_DIR=/data
+      - MEDIA_ROOT=/media
+      - WHISPER_RUNTIME=/whisper/whisper-runtime
+      - WHISPER_MODEL=/whisper/whisper-models/hub/models--Systran--faster-whisper-base/snapshots/ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./:/srv
+      - ./data:/data
+      - ../autoclip/data:/whisper:ro
+      - "C:/:/media/c:ro"
+      - "D:/:/media/d:ro"
+      - "E:/:/media/e:ro"
+      - "F:/:/media/f:ro"
+    restart: unless-stopped
