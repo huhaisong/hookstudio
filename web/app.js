@@ -65,6 +65,66 @@ let toastTimer = null;function toast(msg) {
   toastTimer = setTimeout(() => el.classList.remove("on"), 3200);
 }
 
+/* 应用内确认框：原生 confirm 在用户多次取消后会被浏览器静默拦截（点了
+   没反应），且同步阻塞轮询、进度条僵死。高风险操作一律走这里。
+   askConfirm(opts) 返回 Promise<boolean>：true=确认，false=取消。 */
+const cfmModal = $("#modal-confirm");
+const cfmTitle = $("#cfm-title");
+const cfmBody = $("#cfm-body");
+const cfmOk = $("#cfm-ok");
+const cfmCancel = $("#cfm-cancel");
+let cfmDone = null;                       // 非 null 表示有一个确认框还开着
+let cfmBack = null;                       // 打开时的焦点，关闭后还回去
+let cfmKeydown = null;
+function cfmClose(ok) {
+  if (!cfmDone) return;
+  const done = cfmDone;
+  cfmDone = null;
+  document.removeEventListener("keydown", cfmKeydown);
+  cfmModal.classList.add("hidden");
+  // 还焦点：原焦点可能已被轮询置灰或随界面刷新移除，还不了就算了
+  try { if (cfmBack && document.contains(cfmBack)) cfmBack.focus(); } catch (e) { /* 忽略 */ }
+  // 复位到默认态：下次打开不残留红色主按钮和上一次的文案
+  cfmBody.textContent = "";
+  cfmTitle.textContent = "确认";
+  cfmOk.textContent = "确定";
+  cfmOk.classList.remove("danger-solid");
+  cfmCancel.textContent = "取消";
+  done(ok);
+}
+window.askConfirm = function (opts) {
+  return new Promise((resolve) => {
+    // 同一时间只允许一个确认框：叠着弹会把用户绕晕，后来的直接算取消
+    if (cfmDone) { resolve(false); return; }
+    cfmDone = resolve;
+    cfmTitle.textContent = opts.title || "确认";
+    const segs = Array.isArray(opts.body) ? opts.body : String(opts.body || "").split("\n");
+    segs.forEach((s) => {
+      if (!String(s).trim()) return;      // 空段不排，别留半截空白
+      const p = document.createElement("p");
+      p.textContent = String(s);          // 纯文本，不拼 HTML
+      cfmBody.appendChild(p);
+    });
+    cfmOk.textContent = opts.okText || "确定";
+    cfmCancel.textContent = opts.cancelText || "取消";
+    cfmOk.classList.toggle("danger-solid", !!opts.danger);
+    cfmBack = document.activeElement;
+    cfmModal.classList.remove("hidden");
+    (opts.danger ? cfmCancel : cfmOk).focus();   // 危险动作焦点落在「取消」
+    cfmKeydown = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); cfmClose(false); }
+      else if (e.key === "Tab") {         // 只有取消/确定两个焦点，手动互换，别走出弹窗
+        e.preventDefault();
+        (document.activeElement === cfmOk ? cfmCancel : cfmOk).focus();
+      }
+    };
+    document.addEventListener("keydown", cfmKeydown);
+  });
+};
+cfmOk.addEventListener("click", () => cfmClose(true));
+cfmCancel.addEventListener("click", () => cfmClose(false));
+cfmModal.addEventListener("click", (e) => { if (e.target === cfmModal) cfmClose(false); });
+
 function fmt(sec) {
   const m = Math.floor(sec / 60), s = Math.round(sec % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
@@ -459,7 +519,17 @@ $("#btn-task-cancel").addEventListener("click", async () => {
   if (!p || btn.disabled) return;
   const group = btn.dataset.group || "";
   const key = group || "cuts";
-  if (!confirm("确定中止当前这一步吗？\n\n已经做好的部分会保留；没跑完的不会继续，想接着做重新点一次就行。正在处理的一段会立刻停下。")) return;
+  const ok = await askConfirm({
+    title: "中止这一步？",
+    body: [
+      "已经做好的部分都会保留，没跑完的不会继续。",
+      "想接着做，重新点一次就行；正在处理的那一段会立刻停下。",
+    ],
+    okText: "中止这一步",
+    cancelText: "继续跑",
+    danger: true,
+  });
+  if (!ok) return;
   _cancelSent[key] = true;
   btn.disabled = true;
   btn.textContent = "中止中…";
@@ -3214,10 +3284,18 @@ $("#btn-save-edl").addEventListener("click", async () => {
 
 $("#btn-del").addEventListener("click", async () => {
   // 把「会丢什么」一样样列清楚（2026-11-14 用户反馈：「全部记录」太含糊）
-  if (!confirm(`删除项目「${ST.proj.name}」？\n\n`
-    + "会一起删掉：台词整理、AI 结构、分镜提示词、成片记录；\n"
-    + "发布队列里这个项目还没发完的条目也会一并移除（已经交到平台定时的不受影响）。\n"
-    + "你硬盘里的原始视频文件不会动，但删了就找不回来。确定吗？")) return;
+  const ok = await askConfirm({
+    title: `删除项目「${ST.proj.name}」？`,
+    body: [
+      "会一起删掉：台词整理、AI 结构、分镜提示词、成片记录。",
+      "发布队列里这个项目还没发完的条目也会一并移除（已经交到平台定时的不受影响）。",
+      "你硬盘里的原始视频文件不会动，但删了就找不回来。",
+    ],
+    okText: "删除项目",
+    cancelText: "不删了",
+    danger: true,
+  });
+  if (!ok) return;
   await api("/api/projects/" + ST.proj.id, { method: "DELETE" });
   ST.proj = null;
   $("#view-proj").classList.add("hidden");

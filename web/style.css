@@ -2012,3 +2012,15 @@ select:focus, input:focus, textarea:focus {
 .mon-bar.on { border-color: var(--accent); background: var(--accent-soft); }
 .mon-bar.on b { color: var(--accent); }
 .mon-bar.on .mon-dot { background: var(--accent); opacity: 1; }
+
+/* 确认弹层：比一般弹窗窄，正文按段落排（modal-body 默认 14px 间隙对
+   四段风险说明太散），危险动作主按钮用实心红 */
+.cfm-card { width: min(520px, 94vw); }
+.cfm-body { gap: 9px; }
+.cfm-body p { margin: 0; font-size: 13px; line-height: 1.75; color: var(--muted); }
+.cfm-body p b { color: var(--text); font-weight: 600; }
+.cfm-foot .danger-solid {
+  background: #b42318; border-color: #b42318; color: #fff;
+}
+.cfm-foot .danger-solid:hover { background: #971a11; border-color: #971a11; }
+[data-theme="dark"] .cfm-foot .danger-solid { background: #d9534a; border-color: #d9534a; color: #1a1210; }

@@ -773,6 +773,18 @@
   </div>
 </div>
 
+<!-- 应用内确认框：替代 window.confirm，避免被浏览器静默拦截、也不阻塞轮询 -->
+<div class="modal hidden" id="modal-confirm" role="dialog" aria-modal="true" aria-labelledby="cfm-title">
+  <div class="modal-card cfm-card">
+    <div class="modal-head"><b id="cfm-title">确认</b></div>
+    <div class="modal-body cfm-body" id="cfm-body"></div>
+    <div class="modal-foot cfm-foot">
+      <button class="ghost" id="cfm-cancel">取消</button>
+      <button class="primary" id="cfm-ok">确定</button>
+    </div>
+  </div>
+</div>
+
 <!-- 台词复用 / 粘贴：第 1 步的两个入口共用一个弹窗 -->
 <div class="modal hidden" id="modal-lines">
   <div class="modal-card lines-card">

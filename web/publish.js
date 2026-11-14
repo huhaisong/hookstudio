@@ -1784,12 +1784,23 @@
             + `${n} 条逐条上传多半来不及，建议把第一条往后调。\n` : "";
         // 不可逆之前把「发到哪个号」写全：备注名 + 视频号名 + ID，
         // 不是一句「确定吗」能替代的（2026-11-13 用户要求）。
-        if (!confirm(`这 ${n} 条会发给：\n【${who}】\n`
-          + `首条 ${showTime(S.first)} · 间隔 ${Number(S.gap) || 30} 分钟\n`
-          + `${warn}\n`
-          + "确认后立刻开始逐条上传，并按上面的时间在平台定时；发出去就收不回来了。\n"
-          + "提交后队列清空、设置恢复默认，这批到「已提交」里跟踪；切号随时可以。\n"
-          + "还在排队的条目可以在「已提交」里批量取消。确定吗？")) return;
+        const body = [
+          `发给：【${who}】 · ${n} 条`,
+          `首条 ${showTime(S.first)} · 间隔 ${Number(S.gap) || 30} 分钟`,
+        ];
+        if (warn) body.push(warn.replace(/^\n+/, "").trim());
+        body.push(
+          "确认后立刻逐条上传，并按上面的时间在平台定时；发出去就收不回来了。",
+          "提交后队列清空、设置恢复默认，这批到「已提交」里跟踪；切号随时可以，还在排队的条目可以在「已提交」里批量取消。",
+        );
+        const ok = await askConfirm({
+          title: `确认这 ${n} 条发给「${who}」？`,
+          body,
+          okText: "提交并开始上传",
+          cancelText: "再看看",
+          danger: true,
+        });
+        if (!ok) return;
         const r = await api("/api/publish/start", {
           method: "POST",
           body: JSON.stringify({ first_at: S.first, interval_min: Number(S.gap) || 30, account_id: acc }),
@@ -1846,8 +1857,17 @@
         return;
       }
       if (name === "clear") {
-        if (!confirm("把「还没安排」的条目从队列里删掉？\n"
-          + "已经排好、已经发出去的都不动。删了以后想发要重新勾一次。继续吗？")) return;
+        const ok = await askConfirm({
+          title: "删掉还没安排的条目？",
+          body: [
+            "只删「还没安排」的；已经排好、已经发出去的都不动。",
+            "删了以后想发，要重新勾一次。",
+          ],
+          okText: "删掉这些条目",
+          cancelText: "先留着",
+          danger: true,
+        });
+        if (!ok) return;
         const r = await api("/api/publish/clear-draft", { method: "POST" });
         toast(`删掉了 ${r.removed} 条`);
         await load();
