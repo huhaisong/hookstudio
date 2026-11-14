@@ -63,7 +63,7 @@
 | 31 | 控制台中文横幅乱码 | Windows 控制台默认 GBK | `SetConsoleOutputCP(65001)` + 流 reconfigure | ✅ |
 | 32 | 本机请求 `127.0.0.1` 被系统代理劫持 | `requests` 默认 `trust_env=True` | `Session.trust_env = False` | ✅ |
 
-## 六、服务端 / 部署（阿里云香港 43.103.5.93）
+## 六、服务端 / 部署（阿里云香港服务器）
 
 | # | 现象 | 根因 | 修法 | 状态 |
 |---|---|---|---|---|
