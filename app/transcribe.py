@@ -6,11 +6,10 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import threading
 import time
 
-from . import core
+from . import core, names, zh
 
 _MODEL = None
 _MODEL_KEY: tuple | None = None
@@ -76,10 +75,20 @@ def transcribe_episode(path: str, on_progress=None) -> list[dict]:
     model = _model()
     audio = _decode(path)
     total_sec = len(audio) / SR if SR else 0.0
+    use_zh = zh.enabled()
+    # 两层提示合并成**一条** initial_prompt：faster-whisper 只认 prefix，
+    # hotwords 参数在 prefix 非空时会被直接忽略（见 app/names.py hint 注释）。
+    # 关掉简体开关就只留人名提示；两个都没内容时传 None，等于完全不提示。
+    parts = [zh.prompt()] if use_zh else []
+    hint = names.hint()
+    if hint:
+        parts.append(hint)
+    prompt = "".join(parts) if parts else None
     with _INFER_LOCK:  # 见 _INFER_LOCK 注释：推理必须全局串行
         segments, _info = model.transcribe(
             audio, language="zh", beam_size=5, vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 400},
+            initial_prompt=prompt,
         )
         lines = []
         for seg in segments:
@@ -93,6 +102,16 @@ def transcribe_episode(path: str, on_progress=None) -> list[dict]:
             })
             if on_progress and total_sec > 0:
                 on_progress(min(1.0, float(seg.end) / total_sec), len(lines))
+    # 先繁转简、再套人名表，顺序不能反：人名表里可能存着繁体错写法（顧清唐），
+    # 只有先转成简体，才跟表里的写法对得上；反过来会漏掉那几句。
+    n_zh = zh.apply_lines(lines) if use_zh else 0
+    if n_zh:
+        print(f"[transcribe] 繁体转简体 {n_zh} 字：{os.path.basename(path)}", flush=True)
+    # 人名写法统一（app/names.py）：同音错字按对照表换掉。只动文字，start/end 不动。
+    # 放在这里而不是 run() 里，是因为「重转写单集」走的是另一个入口，两边都要生效。
+    fixed = names.apply_lines(lines)
+    if fixed:
+        print(f"[transcribe] 人名写法统一 {fixed} 处：{os.path.basename(path)}", flush=True)
     return lines
 
 

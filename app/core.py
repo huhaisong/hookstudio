@@ -203,6 +203,12 @@ DEFAULT_CONFIG = {
     # 静默丢掉——和上面 device_token 是同一个坑（2026-11-13 深夜实测：开关
     # 连点 8 次全部弹回去，config.json 里这个键从来没出现过）。
     "publish_auto": False,
+    # ── 台词繁转简（2026-11-16 用户定 A+B 都做）──────────────────────────
+    # 开 = 转写时提示模型用简体（initial_prompt），并在转写后按字表把繁体换成简体。
+    # 默认**开**：whisper 偶尔整段输出繁体，一集简一集繁看着像换了个人写的，
+    # 「默认就对」比「让用户自己发现再勾一个框」合理。关掉后新转写不转、事后按钮也不转。
+    # 必须在这里声明：save_config 只认 DEFAULT_CONFIG 里已有的键（同 publish_auto 那个坑）。
+    "zh_t2s": True,
 }
 
 CONCURRENT_MIN = 1
@@ -545,6 +551,8 @@ _TASK_LOCK = threading.Lock()
 _TASK_GROUP = {
     "transcribe": "cuts", "analyze": "cuts", "plan": "cuts",
     "batch": "cuts", "render": "cuts", "hookcut": "cuts",
+    # 校正字幕时间也要用 whisper 模型，跟转写同一组排队，免得两个推理撞在一起
+    "retime": "cuts",
     "nosub": "nosub",         # 独立组：与第 3 步可并行
     "shots": "shots",
 }
@@ -925,6 +933,9 @@ def start_task(pid: str, kind: str, fn) -> bool:
 
     def runner():
         _CUR.pid, _CUR.group, _CUR.kind = pid, group, kind
+        # AI 长请求的中止要认得「自己属于哪个任务」；主线程在这里绑一次，
+        # 线程池里的子线程由各池子入口自己绑（见 batch.ai_plan_multi / shots）。
+        bind_call_ctx(pid, group)
         try:
             fn()
         except TaskCancelled:
@@ -934,13 +945,19 @@ def start_task(pid: str, kind: str, fn) -> bool:
         except Exception as exc:  # noqa: BLE001
             set_task(pid, kind, 0, "失败", _friendly_error(exc))
         finally:
+            # _RUNNING 与 _CANCEL 必须同时清掉：以前分两把锁先后 pop，中间
+            # 有一个「_RUNNING 还在、_CANCEL 已没」的窗口，cancel_task 读到
+            # 这个窗口会拿到 found 非空但 ev=None，从而跳过 ev.set()，中止
+            # 标记打不上、任务停不下来（2026-11-16）。合并到 _TASK_LOCK 下
+            # 一次性清，取消时读的也是这把锁，就不再有竞态。
             with _TASK_LOCK:
                 _RUNNING.pop(key, None)
-            with _CANCEL_LOCK:
-                _CANCEL.pop(key, None)
-                _PROCS.pop(key, None)
+                with _CANCEL_LOCK:
+                    _CANCEL.pop(key, None)
+                    _PROCS.pop(key, None)
             _run_cleanups(key)
             _CUR.pid = _CUR.group = _CUR.kind = None
+            bind_call_ctx(None, None)
 
     threading.Thread(target=runner, daemon=True).start()
     return True
@@ -998,15 +1015,35 @@ def cancel_task(pid: str, group: str | None = None) -> list[dict]:
                  for k in _RUNNING if k[0] == pid and (group is None or k[1] == group)]
     for k, _ in found:
         with _CANCEL_LOCK:
-            ev = _CANCEL.get(k)   # 任务刚收尾时可能已经清掉，别造一个没人认的标记
-            if ev:
-                ev.set()
+            # 中止标记必须无条件打上：任务收尾的 finally 是先 pop _RUNNING 再
+            # pop _CANCEL（两把锁、两个字典），中间有一小段 _RUNNING 还在、
+            # _CANCEL 已被清掉的竞态窗口。以前这里 ev 为 None 就直接跳过
+            # ev.set()，is_cancelled 恒为 False，任务永远走不到退出检查点；
+            # 而且 batch 出片杀掉的 ffmpeg 会被 except 吞掉后 continue 渲下一套，
+            # 于是「点中止 → task.json 还在继续写 → 停不下来」（2026-11-16）。
+            # 所以：已登记的就 set，没登记的就补一个已 set 的 Event，兜底保证
+            # 正在跑的任务一定能读到中止标记。
+            ev = _CANCEL.get(k)
+            if ev is None:
+                _CANCEL[k] = ev = threading.Event()
+            ev.set()
         _kill_procs(k)
-        # 卡在一条长命令里时也要立刻给反馈，别让进度条看着像卡死了
+        # 立刻让「查项目状态」不再返回 busy 的旧进度。以前只把 msg 改成
+        # 「正在中止…」，pct 还是旧值，前端 taskBusy() 仍判「在跑」：点完中止
+        # 就算前端马上重拉，状态条也还是那副卡住的样子（2026-11-16 用户反馈）。
+        # 任务线程这时还在收尾（杀子进程、清临时目录），但 _RUNNING 仍在，
+        # 用户立刻再点「生成」会照常收到「已有任务在跑」，不会撞车。
         with _TASKS_LOCK:
-            t = (_TASKS.get(pid) or {}).get(k[1])
-            if t:
-                t["msg"] = "正在中止…"
+            slots = _TASKS.get(pid)
+            if slots:
+                slots.pop(k[1], None)
+                if not slots:
+                    _TASKS.pop(pid, None)
+        if k[1] == "cuts":
+            # get_task 在槽位空了之后会读 task.json 补一条「上次中断，正在
+            # 自动续跑…」的假 busy 状态；必须一起清，否则界面还是卡着，
+            # 而且下次启动会把用户主动中止的任务又拉起来。
+            clear_task_flag(pid)
     return [{"group": k[1], "kind": kind} for k, kind in found]
 
 
@@ -1031,6 +1068,61 @@ def _run_cleanups(key) -> None:
             fn()
         except Exception:  # noqa: BLE001 —— 清不掉只占点磁盘，不能盖住真正的错误
             pass
+
+
+# ── AI 长请求的中止（2026-11-16）───────────────────────────────────────────
+# requests.post 一次能阻塞 600 秒，中间一次 set_task 都不报：用户点「中止」
+# 之后要等整趟模型生成结束，界面就一直停在旧进度（用户反馈「点了没反应」）。
+# Python 不能强杀线程，所以把请求挪到 daemon 子线程，调用线程每 0.2 秒查一次
+# 中止标记；一旦被中止立刻抛 TaskCancelled，主流程马上收尾、状态马上清空。
+# 如实说明局限：请求已经发出，服务端仍会算完并计费，这里只保证「本机立刻停、
+# 结果丢弃」。想连服务端一起停得改成流式请求再断流，别在这里假装做到了。
+_CALL_CTX = threading.local()
+
+
+def bind_call_ctx(pid: str | None, group: str | None) -> None:
+    """给当前线程标记「这里的 AI 请求属于哪个任务」。
+
+    线程池子线程没有 _CUR，所以 start_task 的主线程和每个池子入口都要显式
+    绑一次；绑完必须在 finally 里解绑——池线程是复用的，残留会串到下一个任务。
+    """
+    _CALL_CTX.key = (pid, group) if pid and group else None
+
+
+def ai_post_cancelable(fn, *, poll: float = 0.2):
+    """发一趟 AI 请求，返回值和异常都跟 fn() 完全一致，但能被「中止」立刻打断。
+
+    不在后台任务里（设置页的连通性探针等）直接同步调用，行为一字不变。
+    """
+    key = getattr(_CALL_CTX, "key", None)
+    if not key:
+        return fn()
+    box: dict = {}
+
+    def _work() -> None:
+        try:
+            box["ok"] = fn()
+        except BaseException as exc:  # noqa: BLE001 —— 原样带回去给调用方翻译
+            box["exc"] = exc
+
+    th = threading.Thread(target=_work, daemon=True)
+    th.start()
+    while th.is_alive():
+        th.join(poll)
+        if is_cancelled(*key):
+            resp = box.get("ok")
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            _abort(*key)
+    # 循环刚退出到把结果交回去之间也可能刚好被点中止，补一次检查
+    if is_cancelled(*key):
+        _abort(*key)
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("ok")
 
 
 def register_proc(proc, pid: str | None = None, group: str | None = None) -> None:

@@ -38,7 +38,7 @@
        发出去 + 看数据 + 体检账号。只叫「发布」会窄，后面还挂着监控和诊断。
        角标只显示「该发了 / 待发」的条数。 -->
   <nav class="appnav" id="appnav" aria-label="功能">
-    <button class="appnav-item on" data-nav="projects" title="整理台词、重做字幕、剪辑出片、引流分镜">视频制作</button>
+    <button class="appnav-item on" data-nav="projects" title="整理台词、抹掉原字幕、剪辑出片、引流分镜">视频制作</button>
     <button class="appnav-item" data-nav="publish" title="批量定时发布、播放数据、账号诊断">
       发布运营<span class="pub-badge hidden" id="pub-badge">0</span>
     </button>
@@ -125,54 +125,62 @@
            自己做到哪了；这里把「现在该做哪一步」放到视线动线上。 -->
       <nav class="step-nav" id="step-nav" aria-label="制作步骤"></nav>
 
-      <!-- 台词整理之后的一步（可选）：把每集原字幕抹掉，在原位置换成整理好的台词，
-           产出每集一条独立视频；后面剪辑出片直接从这些视频切段。
-           做法、位置、要不要加字幕都已经固定（2026-11-12），面板只留三个观感项。
-           不做也照样能从第 1 步一路走到底（出片就用原始视频）。 -->
+      <!-- 台词整理之后的一步：把每集画面上的原字幕抹掉，产出「没有字幕的底片」。
+           2026-11-16 改成只抹不烧：台词在出片时才烧上去（那样才能和左右镜像共存），
+           所以底片一份多套共用，面板只留「抹得干不干净」和「时间对齐」两块，
+           字幕样式（动效/幅度）已经搬到出片第 5 组。
+           不做也能出片（选「原始视频」），只是没法镜像、也换不掉原字幕。 -->
       <div class="step" id="step-nosub" data-step="2">
-        <div class="step-h"><span class="idx">2</span>重做字幕<span class="tag soft">可选 · 台词整理后做</span><em id="s0-state"></em></div>
-        <p class="lead">把每集原来的字幕抹掉，原位置换成第 1 步整理好的台词，产出每集一条处理好的视频。后面剪辑与出片直接从这些视频切段。</p>
+        <div class="step-h"><span class="idx">2</span>抹掉原字幕<span class="tag soft">做一次 · 所有套共用</span><em id="s0-state"></em></div>
+        <p class="lead">把每集画面上的原字幕抹干净，产出每集一条<b>没有字幕的底片</b>。剪辑出片时再从底片切段、按第 1 步整理好的台词把字幕加回去——所以底片只做一次，后面十几套都用它，镜像也不受影响。</p>
 
         <section class="adv-open">
           <div class="adv-title">
             <span class="adv-badge">① 生成设置</span>
-            <b>字幕怎么出现</b>
+            <b>原字幕怎么抹</b>
             <span class="hint">先设好，再点下面的生成</span>
           </div>
           <div class="adv-body">
-            <label class="fld">出场动效
-              <select id="ns-nstyle">
-                <option value="rise">上浮落位 · 推荐</option>
-                <option value="fade">淡入淡出 · 最稳</option>
-                <option value="pop">缩放弹出 · 有劲</option>
-                <option value="float">缓缓漂浮 · 有呼吸感</option>
-                <option value="type">逐字打出 · 口播感</option>
-              </select>
-            </label>
-            <div class="fx-line">
-              <label class="fx-slider">动效幅度 <b id="ns-nmotionv">推荐</b>
-                <input type="range" id="ns-nmotion" min="0" max="100" step="10" value="50">
-                <span class="fx-scale"><i>0 几乎不动</i><i>50 推荐</i><i>100 明显</i></span>
-              </label>
+            <!-- 2026-11-16 重组：字幕样式（动效/幅度）搬到出片第 5 组。
+                 原因：这一步的产物只抹不烧，改动效连一个像素都不会变，
+                 留在面板上等于骗人（调完等 40 分钟发现没生效）。 -->
+            <div class="fx-group fx-g1">
+              <div class="fx-group-h"><i class="fx-gno">1</i>原字幕怎么抹掉
+                <span class="hint">决定抹掉的块补得像不像</span></div>
+              <div class="fx-grid2">
+                <label class="fx-slider"><span>抹除柔和程度 <b id="ns-softv">中等</b></span>
+                  <input type="range" id="ns-soft" min="0" max="100" step="5" value="50">
+                  <span class="fx-scale"><i>0 更清晰</i><i>50 平衡</i><i>100 更柔</i></span>
+                </label>
+                <label class="fx-f">抹掉的地方怎么补
+                  <select id="ns-fillmode">
+                    <option value="mirror">照旁边画面补 · 快</option>
+                    <option value="borrow">照这一段干净画面补 · 衬衫腰带那类画面更自然，慢一倍</option>
+                  </select>
+                </label>
+              </div>
+              <p class="hint" style="margin:8px 0 0">默认用第一个。如果某集字幕正好压在衬衫、腰带这类深浅分明的画面上，补出来能看出被换过，就换第二个（要多花一倍时间）。</p>
             </div>
-            <div class="fx-line">
-              <label class="fx-slider">抹除柔和程度 <b id="ns-softv">中等</b>
-                <input type="range" id="ns-soft" min="0" max="100" step="5" value="50">
-                <span class="fx-scale"><i>0 更清晰</i><i>50 平衡</i><i>100 更柔</i></span>
-              </label>
+            <!-- 3 时间也和画面一样会自动对齐，不需要单独点按钮（2026-11-16 用户定）。
+                 以前这块是两个按钮，还得「先校正、再回来点生成」两步才生效；
+                 现在并进生成流程：量字幕位置时顺手就能量出真实出现时刻。 -->
+            <div class="fx-group fx-g2">
+              <div class="fx-group-h"><i class="fx-gno">2</i>字幕时间自动对齐
+                <span class="hint">只改时间，不动字</span></div>
+              <div class="fx-checks">
+                <label class="chk"><input type="checkbox" id="ns-retime" checked>生成时按原片字幕重排时间</label>
+              </div>
+              <p class="hint" style="margin:8px 0 0">原片带字幕才有效：拿每句字幕真实出现、消失的时刻当尺子，把台词挪到该出现的位置，<b>越到后面越串位</b>的片子靠这个。原片没字幕的（AI 生成那种）自动跳过；第一次每集多花半分钟左右，之后走缓存。</p>
+              <div class="fx-line">
+                <span class="hint" id="retime-state">生成时自动对齐一次，不用管</span>
+                <button class="ghost hidden" id="btn-retime-undo">撤销，回到识别出来的时间</button>
+              </div>
             </div>
-            <label class="fld">抹掉的地方怎么补
-              <select id="ns-fillmode">
-                <option value="mirror">照旁边画面补 · 快</option>
-                <option value="borrow">照这一段干净画面补 · 更自然，慢一倍</option>
-              </select>
-            </label>
-            <p class="hint">默认用第一个。如果某集字幕正好压在衬衫、腰带这类深浅分明的画面上，补出来能看出被换过，就换第二个（要多花一倍时间）。</p>
           </div>
         </section>
 
         <div class="action-bar">
-          <button class="primary" id="btn-nosub-run">生成处理好的视频</button>
+          <button class="primary" id="btn-nosub-run">生成干净底片</button>
           <button class="ghost hidden" id="btn-nosub-preview">预览第一集</button>
           <button class="ghost hidden" id="btn-nosub-open">打开文件夹</button>
           <span class="hint" id="ns-state"></span>
@@ -183,8 +191,8 @@
           <div class="fold-body">
             <p>会把每一集都做成一份「原字幕换成你自己台词」的视频，和原来的视频一起放着，互不影响。做一次就能反复用；出片时在「出片设置 → 用哪份视频」里挑，不想用随时换回原始视频。</p>
             <p>字幕在画面哪儿、每一句有多宽多高，都不用你填：点生成时程序先逐集扫一遍，量出<b>每一句字幕自己的矩形</b>——长句宽到八成，短句只有两三成，单行和多行的高度也不一样。抹的时候只动这些块，画面其余部分一个像素都不碰，没有字幕的时段完全不处理。</p>
-            <p>块里的内容两种补法。<b>照旁边画面补</b>（默认）是把紧挨着它的画面上下各取一段翻转回来，中间渐变过渡，快，一集十几秒；缺点是字幕正好压在衬衫、腰带这类深浅分明的竖结构上时，翻过来的那块会偏亮。<b>照这一段干净画面补</b>是从同一镜头里这一块没被字挡住的那些帧里抄回来——那句话还没出现时、或者说完之后，这块本来就是干净的，抄来的就是真背景，所以更自然；它要逐帧处理，一集多花一倍时间。镜头切换的瞬间如果正好在说话，会退回第一种补法，不会抄到上一个镜头的画面。</p>
-            <p>新字幕就落在原来那行字幕的位置上，句子跟着台词一句一换。原来整理好的台词不用重做，剪片子的时间点也不变——这一步只动画面，声音原样保留。</p>
+            <p>块里的内容两种补法。<b>照旁边画面补</b>（默认）是把紧挨着它的画面上下各取一段翻转回来，中间渐变过渡，快，一集十几秒；缺点是字幕正好压在衬衫、腰带这类深浅分明的竖结构上时，翻过来的那块会偏亮。<b>照这一段干净画面补</b>是从同一镜头里这一块没被字挡住的那些帧里抄回来——同一部剧里字幕长短不一，短句时这块是露出来的，抄来的就是真背景；它要逐帧处理，一集多花一倍时间。普通画面下两种看起来差不多，默认那档更快；只有字幕正好压在衬衫、腰带这类深浅分明的地方，才值得换第二档。镜头切换的瞬间如果正好在说话，会退回第一种补法，不会抄到上一个镜头的画面。</p>
+            <p>字幕什么时候出现也不是把识别出来的时间直接拿来用：点生成时先按原片每条字幕真实出现、消失的时刻把每句台词排准（原片本来没字幕的片子跳过），再开始烧，所以不会出现「越到后面越比说话早」。这一步只改时间、不改一个字。新字幕就落在原来那行字幕的位置上，句子跟着台词一句一换。烧到画面上的字不带标点——一行就那么几个字，标点占位置还挺扎眼；台词原文（上面「查看 / 修改台词」、下载的 .txt）标点都还在，只是不上画面。原来整理好的台词不用重做，剪片子的时间点也不变——这一步只动画面，声音原样保留。</p>
             <p>这份视频里的字幕已经烧进画面了，出片时不能再左右镜像（字会翻反）。</p>
           </div>
         </details>
@@ -209,6 +217,60 @@
             <p>整理结果可以随时逐集查看、改错字或下载留档；改完只影响这一集。</p>
           </div>
         </details>
+
+        <!-- 人名写法统一（2026-11-16）：转写会把同一个人名写成好几种同音字，
+             换模型也治不了，所以用一张对照表在转写后统一。只改字，时间码不动。 -->
+        <section class="adv-open">
+          <div class="adv-title">
+            <span class="adv-badge">① 人名写法不统一时用</span>
+            <b>统一人名写法</b>
+            <span class="hint">比如把「清唐」统一成「清棠」</span>
+          </div>
+          <div class="adv-body">
+            <p class="hint">识别台词时人名常被写成同音字，同一部剧里可能同时出现好几种写法。这里放一张对照表，程序按表把错写法统一成你定的名字；之后每次整理台词都会自动套用。只改字，说话时间一点不动。</p>
+            <div class="action-bar">
+              <button class="ghost" id="btn-names-apply">现在统一一次</button>
+              <span class="hint" id="names-state"></span>
+            </div>
+            <details class="fold">
+              <summary>改对照表</summary>
+              <div class="fold-body">
+                <p>一行一个名字：左边写正确写法，右边写识别出来的各种错写法，用逗号分开。<code>#</code> 开头是注释。</p>
+                <textarea id="names-text" rows="9" spellcheck="false"
+                  style="width:100%;font-family:Consolas,monospace;font-size:12px"></textarea>
+                <div class="action-bar">
+                  <button class="primary" id="btn-names-save">保存对照表</button>
+                  <span class="hint" id="names-save-state"></span>
+                </div>
+              </div>
+            </details>
+          </div>
+        </section>
+
+        <!-- 繁转简（2026-11-16）：whisper 偶尔整段输出繁体，一集简一集繁。
+             开关开 = 转写时提示模型用简体 + 转完按字表兜底；关掉只影响以后新转的。 -->
+        <section class="adv-open">
+          <div class="adv-title">
+            <span class="adv-badge">② 字幕一会儿简一会儿繁时用</span>
+            <b>繁体转简体</b>
+            <span class="hint">比如把「會員」换成「会员」</span>
+          </div>
+          <div class="adv-body">
+            <p class="hint">识别台词偶尔会整段出繁体，同一部剧有的集是简体、有的集是繁体。开着这一项，整理台词时会先让模型用简体，转完再按字表兜一遍；已经在项目里的台词，点「现在转一次」立刻换。只换字，说话时间一点不动。</p>
+            <div class="action-bar">
+              <span><input type="checkbox" id="zh-on" style="width:auto;height:auto;margin:0 7px 0 0;vertical-align:-2px">以后整理台词时自动转</span>
+              <button class="ghost" id="btn-zh-apply">现在转一次</button>
+              <span class="hint" id="zh-state"></span>
+            </div>
+            <details class="fold">
+              <summary>会不会把对的字改错？</summary>
+              <div class="fold-body">
+                <p>按字表逐字换，只换繁简、不改句子。像「乾隆」「著名」「慰藉」这种——一个繁体对应好几个简体、写在词里本来就对的字，字表里已经排除了，不会被改成「干隆」「着名」「慰借」。</p>
+                <p>改完第 2 步的成品要重新生成一次，字幕才会跟着变。</p>
+              </div>
+            </details>
+          </div>
+        </section>
       </div>
 
       <!-- 单片导流模式：剪辑表与出片已合并成一步（2026-11-07） -->
@@ -412,6 +474,7 @@
           </div>
 
           <div class="section-label">② 挑选要出片的套</div>
+          <div id="plan-shortfall" class="shortfall hidden" aria-live="polite"></div>
           <div id="plan-list" class="plan-list"></div>
           <div class="note" id="plan-note"></div>
 
@@ -430,6 +493,7 @@
                   <button class="ghost" id="btn-save-dir-pick">选择文件夹…</button>
                 </div>
                 <p class="hint" id="save-dir-note" style="margin:6px 0 0"></p>
+                <div class="hist-chips" id="hist-proj-out"></div>
               </div>
               <div class="card fx-card" id="fx-card" style="margin:0">
                 <div class="fx-head">

@@ -20,6 +20,10 @@ import time
 
 from . import core, render
 
+# 进度条上留给「对齐字幕时间」的那一段（其余按集数走）。开着自动对齐时
+# 这段时间可能是一集分钟级，全压在 0% 会让人以为卡住。
+RETIME_PCT = 8.0
+
 
 def out_dir(pid: str) -> str:
     """产物目录：项目自己的数据目录里，删项目时会一起清掉，不污染素材文件夹。"""
@@ -27,14 +31,23 @@ def out_dir(pid: str) -> str:
 
 
 def default_cfg() -> dict:
-    # 界面只剩「柔和程度」和「出场动效」两个可调项（2026-11-12 用户定）：
+    # 界面上的可调项：出场动效、动效幅度、抹除柔和程度、抹掉的地方怎么补，
+    # 外加「生成时自动对齐原片字幕时间」开关。
     #   处理方式固定「柔和抹掉」、位置固定自动识别、字幕固定加回去（不能关）。
     # pos/size/fill 由 subdetect 现算；newsub_pos 也跟着识别的字幕带中心走，
     # 这里只是识别失败时的兜底值。
     return {"mode": "soft", "auto": True, "pos": 0.75, "size": 0.10, "soft": 0.5,
             "fill": "above", "fill_mode": "mirror",
             "newsub": True, "newsub_pos": 0.80, "newsub_motion": 0.5,
-            "newsub_style": "rise"}
+            "newsub_style": "rise", "retime": True}
+
+
+def _flag(raw: dict, key: str, dflt: bool) -> bool:
+    """勾选框的宽松读取：前端传 true/false，老配置里可能是 "0"/"false"/空。"""
+    v = raw.get(key, dflt)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off")
+    return dflt if v is None else bool(v)
 
 
 def clean_cfg(raw: dict) -> dict:
@@ -74,15 +87,22 @@ def clean_cfg(raw: dict) -> dict:
             "newsub": True,
             "newsub_pos": num("newsub_pos", 0.50, 0.92),
             "newsub_motion": num("newsub_motion", 0.0, 1.0),
-            "newsub_style": style}
+            "newsub_style": style,
+            # 生成前自动按原片字幕重排时间（默认开，2026-11-16 用户定：不再单独点按钮）
+            "retime": _flag(raw, "retime", True)}
 
 
-def sig_of(cfg: dict, episodes: list[dict] | None = None) -> str:
+def sig_of(cfg: dict, episodes: list[dict] | None = None,
+           style: bool = True) -> str:
     """参数指纹。episodes=None 只算「设置指纹」（给前端比对面板用）；
     传了 episodes 时把每集台词内容也并进去（给后台判断要不要重做副本）。
 
     第 1 步改错字走的是 PUT /lines，不会动任何代次，光靠设置指纹会拿回带旧字
     的副本——所以跳过的判断必须用带台词的完整指纹。
+
+    style=False（2026-11-16）：**副本指纹不算字幕样式**。第 2 步的副本现在只
+    负责「把原字幕抹干净」，台词是出片时才烧上去的（`src_ver=nosub` 走现场烧字）。
+    样式/动效/位置改了跟副本像素无关，算进去只会让改个字幕样式就白重编 31 集。
     """
     s = render.subtitle_spec(cfg)
     m = s.get("mode") or ""
@@ -106,12 +126,19 @@ def sig_of(cfg: dict, episodes: list[dict] | None = None) -> str:
                 f"{int(round(s['soft'] * 100))}{fill}")
     # 填充方式换了出来的画面完全不同，必须进指纹，否则切了开关点生成会被跳过
     base += "B" if cfg.get("fill_mode") == "borrow" else "M"
+    if not style:
+        # 只抹不烧：副本的像素与字幕样式无关，台词也由出片时现算
+        return base
     if not cfg.get("newsub"):
         return base
     # 用 newsub_spec 折算后的结果算指纹：style 由它统一判定（老配置按 motion 折算），
-    # 这里再自己判一次就会出现「两处口径不一致、指纹永远对不上」
+    # 这里再自己判一次就会出现「两处口径不一致、指纹永远对不上」。
+    # 前缀 N5 = 第五版出场参数（N2 放大动效幅度，N3 加「字幕比声音晚」，
+    # N4 又把它删了，N5 烧字去标点）。
+    # 参数算法改了但滑杆值没变，不加这个位老项目会被判成「参数没变」直接跳过，
+    # 用户点了生成却还是旧观感。N5 与 web/app.js 的 nsSig 必须同步。
     ns = render.newsub_spec(cfg)
-    base += (f"|N{int(round(float(ns.get('pos') or 0.80) * 1000))}"
+    base += (f"|N5{int(round(float(ns.get('pos') or 0.80) * 1000))}"
              f"{int(round(float(ns.get('motion') or 0.0) * 100))}"
              f"{str(ns.get('style') or 'rise')[0]}")
     if episodes is None:
@@ -465,7 +492,34 @@ def run(pid: str) -> None:
         spans_by_ep = _spans(p, episodes, band,
                              on_msg=lambda m: core.set_task(pid, "nosub", 0.5, m))
 
-    sig = sig_of(cfg, episodes)
+    # 字幕时间按原片对齐（2026-11-16 用户定：不再单独点一次按钮）。
+    # 放在这里是因为「尺子」——每集每条字幕的真实出现时刻——刚量完，正好能用；
+    # 台词时间当场排准，同一趟编码直接烧上去，不用先跑一遍拿位置、再校正、再跑。
+    # 前面的 _spans 本来就要扫，所以这一步只多花「词级对齐」的时间（有缓存时几秒）。
+    if cfg.get("retime") and spans_by_ep:
+        from . import retime
+        stat = retime.apply_to(
+            p, spans_by_ep,
+            on_msg=lambda i, n, ep: core.set_task(
+                pid, "nosub", i / max(1, n) * RETIME_PCT,
+                f"对齐第 {ep['index']} 集字幕时间（{i + 1}/{n}）"))
+        if stat["fixed"] or stat["skipped"]:
+            # skipped 也要落盘：老项目只有「原始时间备份」、没有尺子指纹，
+            # 补上指纹才不会每次都判成「没对过」。
+            core.save_merge(p, ["episodes"])
+            print(f"[nosub] 字幕时间已按原片对齐 {stat['fixed']} 集"
+                  f"（本来就对过的 {stat['skipped']} 集跳过）", flush=True)
+        if stat["errors"]:
+            print(f"[nosub] 这几集台词对不上原片字幕，时间没动：{stat['errors']}",
+                  flush=True)
+
+    # 副本只负责「把原字幕抹干净」（2026-11-16 用户定，见 REFERENCE「抹一次多套复用」）。
+    # 指纹因此只算填充/位置/柔和度，**不算字幕样式和台词**——改了字幕动效或台词，
+    # 副本的像素一模一样，没必要重编 31 集；出片时才按 burn_sig 现烧字幕。
+    # 「|CV1」是副本格式版本：老副本是「抹+烧」一次成型的，前缀不同即判不匹配，
+    # 整批强制重做，绝不会拿带字的旧副本去叠新字幕。
+    sig = sig_of(cfg, episodes, style=False) + "|CV1"
+    burn_sig = sig_of(cfg, episodes)
     dest = out_dir(pid)
     os.makedirs(dest, exist_ok=True)
     # 空间提前看一眼：整批副本约等于原片大小之和，编到一半写满最亏
@@ -482,27 +536,33 @@ def run(pid: str) -> None:
     files = dict(prev.get("files") or {}) if same else {}
     errors = {} if same else {}
     total = len(episodes)
-    state = {"sig": sig, "cfg_sig": sig_of(cfg), "cfg": cfg, "detect": detect,
+    # burned：这一批副本里是不是已经烧了字幕。**必须保守**——
+    # 一开始就写 False 的话，跑到一半崩了/被中止，项目里就记着「底片是干净的」，
+    # 而磁盘上还有一堆旧的带字副本，出片不会拦，结果叠出两层字。
+    # 所以先沿用上一次的结论（第一次做 → 当作带字），全部做完才改成 False。
+    state = {"sig": sig, "burn_sig": burn_sig,
+             "burned": bool(prev["burned"]) if "burned" in prev else True,
+             "cfg_sig": sig_of(cfg), "cfg": cfg, "detect": detect,
              "spans": {"key": _detect_key(p, episodes), "by_ep": spans_by_ep},
              "files": files, "errors": errors,
+             "retime": bool(cfg.get("retime")),
              "total": total, "updated": ""}
     p["nosub"] = state
     core.save_merge(p, ["nosub"])
 
-    # 每集的字幕 ASS / drawtext txt 都放这个临时目录，收尾一次性清。
-    # 绝不逐文件 os.remove：本机删除守卫按「一次会话删除总数」记账，
-    # 逐删到第 50 个会抛 SAFE_DELETE_BULK_CONFIRM_REQUIRED，整批当场死。
-    assdir = os.path.join(dest, "_ass")
-    core.rmtree(assdir)
-    os.makedirs(assdir, exist_ok=True)
-    sub_spec = render.newsub_spec(cfg)
+    def _pct(i: int, inner: float = 0.0) -> float:
+        """第 i 集内部走到 inner%（0~100）时整批的百分比；前段留给对时间。"""
+        return RETIME_PCT + (i + inner / 100.0) / max(1, total) * (100.0 - RETIME_PCT)
 
-    try:
-        for i, ep in enumerate(episodes):
+    # 旧版本会在 _ass 里攒逐集 ASS（那时副本要把台词烧进去）。现在副本不烧字了，
+    # 顺手清掉这个残留目录；本机删除守卫按会话记账，所以一次性整目录删，不逐文件删。
+    core.rmtree(os.path.join(dest, "_ass"))
+
+    for i, ep in enumerate(episodes):
             fname = str(ep.get("file") or "")
             src = os.path.join(p["src_dir"], fname)
             dst = os.path.join(dest, _out_name(ep))
-            core.set_task(pid, "nosub", i / total * 100,
+            core.set_task(pid, "nosub", _pct(i),
                           f"第 {i + 1}/{total} 集：{fname}")
             # 参数没变且文件还在 = 上次已经做完，直接跳过（中断续跑就靠这个）
             if same and files.get(fname) and os.path.isfile(dst):
@@ -518,50 +578,14 @@ def run(pid: str) -> None:
                 dur = float(ep.get("duration") or 0)
             try:
                 sd_ep = spans_by_ep.get(fname)
-                # 新字幕烧在哪一行：**按这一集自己量出来的字幕带中心**，不能套全局值。
-                # 一个项目里常混着不同来源/分辨率的片子（真人剧 1080×1920 字幕在 78%，
-                # AI 生成片 720×1280 字幕在 72%）。全局 newsub_pos 取自第一集，
-                # 套到别的集就是「原字幕在 72%、新字幕烧到 78%」——1280 高差 75px，
-                # 一眼看出字幕跳了位（2026-11-12 实测项目 2934765f8925 第 3 集）。
-                spec_ep = sub_spec
-                if sub_spec.get("on") and sd_ep:
-                    # 用**各句中心的中位数**，不用 union 的上下沿中点：
-                    # 一句误检就能把 min/max 拉偏（实测三句里一句把范围拉到 81%，
-                    # 中心从 72.8% 被拽到 75.7%，新字幕整体压低 40px）。
-                    cs = sorted(
-                        (float(x["t"]) + float(x["b"])) / 2.0
-                        for x in (sd_ep.get("spans") or [])
-                        if x.get("t") is not None and x.get("b") is not None)
-                    if cs:
-                        c = cs[len(cs) // 2]
-                        spec_ep = dict(sub_spec, pos=round(min(0.92, max(0.50, c)), 4))
-                    # 新字幕的字号也要跟这一集走：用本集识别出的**字高**反算
-                    # （render._cap_layout）。旧版写死 fs≤44，实测成品比原字幕
-                    # 小 16%、窄 19%，放大看就是「这字不是原来的」。
-                    # 注意 band["size"] 是**搜索窗高度**不是字高（ep1 实测
-                    # 窗 0.0506 / 字 0.0281），直接用会把字号放大一倍。
-                    ch = _cap_h(sd_ep)
-                    if ch > 0:
-                        spec_ep = dict(spec_ep, cap_h=round(ch, 5))
-                # 这一集的台词 → 新字幕。个别集没有台词就只去字幕，不整批失败
+                # 2026-11-16：副本只抹、不烧字（用户要求「抹完的产物多套复用」）。
+                # 台词字幕改在出片时现场烧（render._live_cap），所以这里不再生成
+                # ASS / drawtext；「每集按自己字幕带中心居中 + 按本集字高定字号」
+                # 那套跟集走的逻辑一并搬进 _live_cap，多来源项目仍然每集各自对位。
                 sub_tail = ""
-                if sub_spec.get("on"):
-                    rows = render.cap_rows(ep.get("lines") or [], 0.0, dur, 1.0)
-                    if rows:
-                        idx = int(ep.get("index") or (i + 1))
-                        if render._has_libass():
-                            ass = os.path.join(assdir, f"{idx:03d}.ass")
-                            render._cap_ass_file(rows, spec_ep, dur, ass)
-                            sub_tail = render._subs_filter(ass)
-                        else:
-                            font = render._title_font()
-                            if font:
-                                pre = os.path.join(assdir, f"{idx:03d}")
-                                sub_tail = ",".join(render._cap_drawtext_filters(
-                                    rows, spec_ep, dur, pre, font))
                 # 整集一句字幕都没量到 = 原片本来就没有字幕（AI 生成片很常见）。
                 # 这时退回「整条替换」会在干净画面上凭空抹掉一条、补进镜像内容；
-                # 宁可一个像素都不动，只把台词烧上去。
+                # 宁可一个像素都不动。
                 done = False
                 if (cfg.get("fill_mode") == "borrow" and cfg["mode"] == "soft"
                         and sd_ep and sd_ep.get("spans")):
@@ -570,7 +594,7 @@ def run(pid: str) -> None:
                         nosubfill.encode(
                             src, dst, cfg, sd_ep["spans"], sub_tail, dur,
                             lambda pct, i=i: core.set_task(
-                                pid, "nosub", (i + pct / 100.0) / total * 100,
+                                pid, "nosub", _pct(i, pct),
                                 f"第 {i + 1}/{total} 集：借干净背景 {int(pct)}%"))
                         done = True
                     except Exception as exc:  # noqa: BLE001
@@ -580,13 +604,12 @@ def run(pid: str) -> None:
                               flush=True)
                 if not done:
                     if cfg["mode"] == "soft" and spans_by_ep and not sd_ep:
-                        graph = (f"[0:v]{sub_tail},format=yuv420p[vout]" if sub_tail
-                                 else "[0:v]format=yuv420p[vout]")
+                        graph = "[0:v]format=yuv420p[vout]"
                     else:
-                        graph = _graph(cfg, sub_tail, *_patch_span(cfg, sd_ep))
+                        graph = _graph(cfg, "", *_patch_span(cfg, sd_ep))
                     _encode(src, dst, graph, dur,
                             lambda pct, i=i, total=total: core.set_task(
-                                pid, "nosub", (i + pct / 100.0) / total * 100,
+                                pid, "nosub", _pct(i, pct),
                                 f"第 {i + 1}/{total} 集：正在处理 {int(pct)}%"))
                 files[fname] = os.path.basename(dst)
                 errors.pop(fname, None)
@@ -594,10 +617,13 @@ def run(pid: str) -> None:
                 errors[fname] = (str(exc) or type(exc).__name__).strip()[:200]
             state["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
             core.save_merge(p, ["nosub"])
-    finally:
-        core.rmtree(assdir)
 
     ok = len(files)
+    # 全部集都做好了才宣布「底片已无字」；有失败/被中止就保持上一版结论，
+    # 出片那边会继续按「带字」处理并提示重做，绝不会拿半新半旧的副本叠字。
+    if ok >= total and not errors:
+        state["burned"] = False
+        core.save_merge(p, ["nosub"])
     core.set_task(pid, "nosub", 100,
                   f"完成 {ok}/{total} 集" + (f"，{len(errors)} 集失败" if errors else ""))
     # 显式收尾：清掉 task.json 的「中断续跑」标记。只靠 pct=100 不够——

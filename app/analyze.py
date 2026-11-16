@@ -414,7 +414,12 @@ def _call(prompt: str, system: str | None = None, json_mode: bool = True,
 
     def _post(payload: dict):
         try:
-            return requests.post(url, headers=headers, json=payload, timeout=budget)
+            # 可中止版：这趟请求可能等 600 秒，中间没有进度上报。包一层之后，
+            # 用户点「中止」最多 0.2 秒就能让本步立刻退出；请求格式、超时、
+            # 错误翻译、参数回退全都不变。TaskCancelled 继承 BaseException，
+            # 下面两个 except 不会把它吃掉，会直达 start_task 的收尾。
+            return core.ai_post_cancelable(
+                lambda: requests.post(url, headers=headers, json=payload, timeout=budget))
         except requests.Timeout as exc:
             # 「超时」和「连不上」必须分开说：超时的意思是请求发出去了、对面还在算，
             # 换网络、换 Key 都没用，能做的只有换生成方式或缩小任务。

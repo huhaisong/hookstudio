@@ -66,6 +66,14 @@ class PostError(Exception):
     """发表流程失败。文案已经是人话，worker 直接写进队列的失败原因里。"""
 
 
+class IdentityMismatchError(PostError):
+    """浏览器里登的号跟这条排期时锁的号不是同一个。
+
+    单独一类：worker 见到它不自动重试（重试一百次也还是那个号），直接
+    标失败并清掉这个号的候选缓存，让人去重新登录。
+    """
+
+
 # ── 小工具 ────────────────────────────────────────────────────────────────
 def _form_frame(page, timeout: float = 90.0):
     """等发表表单**真正渲染出来**的那一帧。
@@ -900,7 +908,221 @@ def set_schedule(page, form, at: datetime.datetime) -> dict:
     return {"scheduled_at": got}
 
 
-def click_publish(page, form) -> None:
+# ── 点「发表」之后的原创分成提醒 ─────────────────────────────────────────
+# 平台点了发表可能弹「声明原创的视频有机会获得广告分成」，高亮默认常是
+# 「声明原创」。不替用户做这个承诺：按队列里自己选的 original 走；这里
+# **绝不二次点主发表按钮** —— 点过了再点就是第二条。
+_REMINDER_JS = """() => {
+  const norm = s => ((s || '') + '').split('')
+      .filter(c => c.charCodeAt(0) > 32).join('');
+  const vis = e => { const r = e.getBoundingClientRect();
+                     return r.width > 1 && r.height > 1; };
+  const dialogs = root => Array.from(root.querySelectorAll(
+      '.weui-desktop-dialog,[role=dialog]')).filter(vis);
+  let reminder = false, rights = false;
+  for (const d of dialogs(document)) {
+    const txt = norm(d.innerText || d.textContent || '');
+    if (txt.includes('声明原创的视频有机会获得广告分成')) {
+      reminder = true;
+      // 给按钮打自定义属性，后面用真实鼠标按属性点（Vue/weui 不认合成 click）
+      for (const b of Array.from(d.querySelectorAll('button,a')).filter(vis)) {
+        const t = norm(b.innerText || b.textContent || '');
+        if (t === '直接发表') b.setAttribute('data-wbm-direct', '1');
+        else if (t === '声明原创') b.setAttribute('data-wbm-original', '1');
+        else if (t.includes('不再提醒')) b.setAttribute('data-wbm-hide', '1');
+      }
+    }
+    if (txt.includes('原创权益') || txt.includes('原创声明须知')) {
+      rights = true;
+      for (const e of Array.from(d.querySelectorAll('label,input,button,a')).filter(vis)) {
+        const t = norm(e.innerText || e.textContent || '');
+        if (t.includes('我已阅读并同意')) e.setAttribute('data-wbm-agree', '1');
+        if (t === '声明原创' && e.tagName === 'BUTTON' && !e.disabled)
+          e.setAttribute('data-wbm-confirm', '1');
+      }
+    }
+  }
+  return {reminder: reminder, rights: rights};
+}"""
+
+
+def _reminder_state(page, form) -> dict:
+    """弹层可能挂主文档，也可能挂表单 iframe；两边都读，都不许抛。"""
+    out = {"reminder": False, "rights": False}
+    for doc in (page, form):
+        try:
+            r = doc.evaluate(_REMINDER_JS)
+        except Exception:  # noqa: BLE001  页面正在跳转，下一轮再读
+            continue
+        if isinstance(r, dict):
+            out["reminder"] = out["reminder"] or bool(r.get("reminder"))
+            out["rights"] = out["rights"] or bool(r.get("rights"))
+    return out
+
+
+def _click_marked(page, form, name: str) -> bool:
+    sel = f'[data-wbm-{name}="1"]'
+    try:
+        return bool(_mouse_click_main(page, sel) or _mouse_click(page, form, sel))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _confirm_rights(page, form, timeout: float = 5.0) -> bool:
+    """点了「声明原创」之后的权益确认弹层：勾同意 → 点确认。只走一次。"""
+    try:
+        deadline = time.time() + timeout
+        agreed = False
+        while time.time() < deadline:
+            st = _reminder_state(page, form)
+            if st.get("rights"):
+                if not agreed:
+                    agreed = _click_marked(page, form, "agree")
+                if agreed and _click_marked(page, form, "confirm"):
+                    return True
+            page.wait_for_timeout(400)
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def handle_original_reminder(page, form, original: bool = False,
+                             timeout: float = 5.0) -> str:
+    """点完「发表」后处理原创分成提醒，返回 direct / original / ''。
+
+    ⚠️ 这个函数在点发表**之后**调用：任何异常都必须吞掉。抛出去会让
+    worker 以为「没点发表」而重试，那就是再发一条。不碰「不再提醒」，
+    不改账号级偏好，处理完直接交给回读去判定结果。
+    """
+    try:
+        deadline = time.time() + timeout
+        handled = ""
+        while time.time() < deadline:
+            st = _reminder_state(page, form)
+            if not handled and st.get("reminder"):
+                want = "original" if original else "direct"
+                if _click_marked(page, form, want):
+                    handled = want
+                    if original:
+                        _confirm_rights(page, form)
+            if handled and not st.get("reminder"):
+                break
+            page.wait_for_timeout(400)
+        return handled
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# ── 发表前：浏览器里登的是不是排期时那个号 ────────────────────────────────
+_IDENTITY_JS = """() => {
+  const sels = ['.finder-nickname', '.finder-nick-name', '.account-nickname',
+                '.weui-desktop-account__nickname', '.account-name',
+                '[data-account-name]', '[class*=nickname]'];
+  const vis = e => { const r = e.getBoundingClientRect();
+                     return r.width > 1 && r.height > 1; };
+  for (const s of sels) {
+    for (const e of Array.from(document.querySelectorAll(s))) {
+      if (!vis(e)) continue;
+      const t = ((e.innerText || e.textContent || '') + '').trim();
+      if (t && t.length <= 24) return t;
+    }
+  }
+  return '';
+}"""
+
+
+def check_account_identity(page, expected: dict) -> dict:
+    """读当前登录号名，与排期时冻结的身份比对。
+
+    读不到 / 排期时没冻结（老数据、资料没抓全）就**跳过**，不误伤：
+    宁可少一道校验，也不能因为页面改版把整批发不出去。
+    """
+    want = re.sub(r"\s+", "", str((expected or {}).get("name") or ""))
+    if not want:
+        return {"checked": False, "reason": "排期时没记下号名"}
+    got = ""
+    docs = [page] + list(getattr(page, "frames", []) or [])
+    for doc in docs:
+        try:
+            t = str(doc.evaluate(_IDENTITY_JS) or "").strip()
+        except Exception:  # noqa: BLE001
+            continue
+        if t and len(t) <= 24:
+            got = t
+            break
+    if not got:
+        return {"checked": False, "reason": "页面上没读到号名"}
+    if re.sub(r"\s+", "", got) != want:
+        raise IdentityMismatchError(
+            f"浏览器里现在登的是「{got}」，这条排的是「{want}」。"
+            f"已经停手，没上传也没发表，先去重新登录这个号。")
+    return {"checked": True, "name": got}
+
+
+# ── 发表前：填好的字段统一核两遍（2026-11-15 A 档）────────────────────────
+# 平台是 Vue 异步组件，「填了」不等于「生效」：短标题、定时、挂载都可能在
+# 我们填完之后被它自己回填 / 清空。这里只读地把能认出的字段摆成一张清单，
+# 等 1.2 秒再读一遍，两遍对不上就停手。
+_PRECHECK_JS = r"""() => {
+  const g = (s) => { const e = document.querySelector(s);
+                     return e ? ((e.value || e.innerText || '') + '').replace(/\s+/g, ' ').trim() : ''; };
+  const vis = (e) => { const r = e.getBoundingClientRect();
+                       return r.width > 4 && r.height > 4; };
+  const dialogs = Array.from(document.querySelectorAll(
+      '.weui-desktop-dialog, .weui-desktop-dialog__wrp, [role=dialog]'))
+    .filter(vis)
+    .map((d) => ((d.innerText || '') + '').replace(/\s+/g, ' ').trim().slice(0, 80))
+    .filter(Boolean);
+  return {
+    desc: g('.input-editor'),
+    short: g('input[placeholder*="短标题"]'),
+    at: g('input[placeholder="请选择发表时间"]'),
+    pos: g('.post-position-wrap'),
+    link: g('.choosen-link-wrap') || g('.link-input-wrap .content-wrap'),
+    declare: g('.post-tag-wrap'),
+    dialogs: dialogs,
+  };
+}"""
+
+# 只有这三项两遍都读到且不一致才拦：位置 / 挂载 / 标注是异步文本，弹层收起
+# 时字会变，拿它们当硬判据会把整批卡死。其余字段只记进清单供诊断看。
+_PRECHECK_STRICT = ("desc", "short", "at")
+_PRECHECK_ALL = ("desc", "short", "at", "pos", "link", "declare")
+_PRECHECK_CN = {"desc": "描述", "short": "短标题", "at": "定时时间",
+                "pos": "位置", "link": "扩展链接", "declare": "视频标注"}
+
+
+def verify_form_twice(page, form) -> dict:
+    """点「发表」之前核两轮，**只读、绝不改动页面**。
+
+    在这里抛异常是安全的：还没点发表，worker 会把整条重来一遍，不会重复发。
+    读不到的字段一律跳过（跟登录身份核对同一口径）——页面改版换个 class
+    不该让一整批发不出去。
+    """
+    def snap() -> dict:
+        try:
+            return dict(_ev(form, _PRECHECK_JS) or {})
+        except Exception:  # noqa: BLE001
+            return {}
+
+    a = snap()
+    page.wait_for_timeout(1200)
+    b = snap()
+    # 两遍都还挂着弹窗 = 真没关；一闪而过的 toast 不会连续两遍都在
+    if (a.get("dialogs") or []) and (b.get("dialogs") or []):
+        raise PostError("发表页还有没关掉的弹窗，已经停手，没有点发表。稍后重试一次。")
+    changed = [k for k in _PRECHECK_STRICT
+               if (a.get(k) or "") and (b.get(k) or "") and a[k] != b[k]]
+    if changed:
+        raise PostError(
+            "刚填好的「" + "、".join(_PRECHECK_CN.get(k, k) for k in changed)
+            + "」又被页面改掉了，已经停手，没有点发表。稍后重试一次。")
+    return {"checked": True,
+            "fields": [k for k in _PRECHECK_ALL if (a.get(k) or b.get(k))],
+            "dialogs": 0}
+
+
+def click_publish(page, form, original: bool = False) -> None:
     """点「发表」。
 
     这一步是**不可逆**的：点了内容就进平台了。所以只在真正要发的时候才调，
@@ -937,7 +1159,13 @@ def click_publish(page, form) -> None:
     if not _mouse_click(page, form, ".form-btns button.weui-desktop-btn_primary"):
         if not _mouse_click(page, form, "", "发表"):
             raise PostError("点不到「发表」按钮，已经停手。")
-    page.wait_for_timeout(4000)
+    # 从这里起**绝不向外抛异常**：点过了再抛，worker 会重试＝再发一条。
+    # 平台可能弹「原创分成提醒」，在等提交的这几秒里按队列自己的选择处理掉。
+    try:
+        handle_original_reminder(page, form, original=original)
+    except Exception:  # noqa: BLE001
+        pass
+    page.wait_for_timeout(1200)
 
 
 def read_scheduled(page, title: str, plan_at: str = "") -> dict:
@@ -994,7 +1222,8 @@ def read_scheduled(page, title: str, plan_at: str = "") -> dict:
 
 # ── 整条流程 ──────────────────────────────────────────────────────────────
 def publish_one(session, job: dict, tpl: dict, media: dict,
-                dry_run: bool = False, progress=None) -> dict:
+                dry_run: bool = False, progress=None,
+                on_before_publish=None) -> dict:
     """把一条作业发到平台上（定时发表）。
 
     `media` = {"video": 本机地址, "cover": 本机地址（可空）}
@@ -1038,6 +1267,16 @@ def publish_one(session, job: dict, tpl: dict, media: dict,
         if form is None:
             raise PostError("发表页没打开（表单一直没渲染出来）。稍后重试一次。")
         out: dict = {"steps": []}
+
+        # ⓪ 先确认浏览器里登的仍是排期时那个号。读不到就跳过（老数据、
+        # 页面改版都可能读不到），别因为一道校验把整批卡死。
+        try:
+            out["identity"] = check_account_identity(
+                page, job.get("account_identity") or {})
+        except IdentityMismatchError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            out["identity"] = {"checked": False, "reason": str(exc)[:100]}
 
         # ① 视频
         _say("传视频")
@@ -1086,6 +1325,11 @@ def publish_one(session, job: dict, tpl: dict, media: dict,
         out["steps"].append("scheduled")
         out["scheduled_at"] = sched["scheduled_at"]
 
+        # ⑤½ 发表前统一核对两轮：填了 ≠ 生效，平台会异步回填。
+        # 必须在 on_before_publish / click_publish 之前，抛错是安全的。
+        _say("核对填写结果")
+        out["precheck"] = verify_form_twice(page, form)
+
         if dry_run:
             # 干跑：把填好的状态回读出来给界面看，**不点发表**。
             out["ok"] = True
@@ -1093,9 +1337,12 @@ def publish_one(session, job: dict, tpl: dict, media: dict,
             out["form"] = _form_state(form)
             return out
 
-        # ⑥ 发表（不可逆）
+        # ⑥ 发表（不可逆）：先把「已经要点了」落盘，中途断电也知道
+        # 这条可能已经交给平台，重启后绝不自动重来（wxworker 传回调）。
         _say("点发表")
-        click_publish(page, form)
+        if on_before_publish:
+            on_before_publish()
+        click_publish(page, form, original=bool(job.get("original")))
         out["steps"].append("published")
         out["published"] = True
         # 从这里起**任何异常都不能往外抛**：一旦抛出，调度器会重试，

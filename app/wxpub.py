@@ -31,6 +31,11 @@ class WxPubError(Exception):
     """发布页操作失败（文案已经是人话，路由层直接给用户看）。"""
 
 
+class LoginLostError(WxPubError):
+    """「登录失效」单独一个子类：路由层认得出它，就在返回里带上 login=True，
+    前端据此直接弹出登录窗口，不用再让人对着重试按钮干点。"""
+
+
 # 表单里能认出「这就是发表表单」的关键词（与 wxpost.FORM_KEYS 保持一致）。
 FORM_KEYS = ("视频描述", "短标题", "位置", "合集", "链接", "活动",
              "定时发表", "封面")
@@ -56,7 +61,6 @@ def form_frame(page, timeout: float = 90.0):
     """
     import time
     end = time.time() + timeout
-    best = None
     best_score = 0
     while time.time() < end:
         for fr in page.frames:
@@ -79,7 +83,6 @@ def form_frame(page, timeout: float = 90.0):
             nfile = int(info.get("nfile") or 0)
             if score > best_score:
                 best_score = score
-                best = fr
             # 关键词够多、且上传口确实在，才算表单
             if score >= 3 and nfile >= 1:
                 return fr
@@ -309,10 +312,94 @@ def dump(session, url: str = CREATE_URL, wait_ms: int = 6000,
     return session.run(_go, timeout=200, visible=visible)
 
 
+# 诊断文件经常被用户发回来排查。完整 dump 里有响应体、POST 参数、请求头，
+# 这些是定位平台改版必须的，**不能砍**（2026-11-15 A 档结论）；但用户侧打包
+# 时不该连账号标识一起带出去。所以另写一份只含结构与字段名的摘要。
+_SENSITIVE_KEYS = ("cookie", "token", "auth", "secret", "password", "session")
+# 这些键装的是业务内容（请求体 / 响应体），只留字段结构，一个值都不外发
+_VALUE_KEYS = ("post", "body", "data", "resp", "response")
+
+
+def _url_path(v: str) -> str:
+    """URL 只留域名 + 路径：query 里常带流水号 / 票据。"""
+    s = str(v or "").split("?", 1)[0].split("#", 1)[0]
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    return s[:140]
+
+
+def _shape(v, depth: int = 0, hide_values: bool = False):
+    """递归折叠成「有哪些字段、大概什么形状」，不保留任何业务内容。
+
+    `hide_values=True` 用在请求体 / 响应体内部：那里连短字符串（剧集名、
+    关键词）都是内容，不是结构，一律不写进摘要。
+    """
+    if depth >= 6 or v is None:
+        return None
+    if isinstance(v, dict):
+        out = {}
+        for k, vv in list(v.items())[:80]:
+            key, lk = str(k), str(k).lower()
+            if any(s in lk for s in _SENSITIVE_KEYS):
+                out[key] = "<已隐藏>"
+            elif lk in _VALUE_KEYS:
+                parsed = vv
+                if isinstance(vv, str):
+                    try:
+                        parsed = json.loads(vv)
+                    except (ValueError, TypeError):
+                        parsed = {"_raw": f"<{len(vv)} 字符>"}
+                out[key] = _shape(parsed, depth + 1, True)
+            elif lk in ("shot", "screenshot", "image", "png", "base64"):
+                out[key] = "<已隐藏>"
+            elif "url" in lk and isinstance(vv, str):
+                out[key] = _url_path(vv)
+            elif isinstance(vv, (dict, list)):
+                out[key] = _shape(vv, depth + 1, hide_values)
+            elif hide_values:
+                out[key] = "<已隐藏>"
+            elif isinstance(vv, bool):
+                out[key] = vv
+            elif isinstance(vv, int):
+                out[key] = vv if abs(vv) < 100000 else "<数>"
+            elif isinstance(vv, float):
+                out[key] = "<数>"
+            elif isinstance(vv, str):
+                # 短且像枚举/标签的值才留；长文本一律折叠成字符数
+                if len(vv) <= 24 and not any(c in vv for c in "=&/:\n "):
+                    out[key] = vv
+                else:
+                    out[key] = f"<{len(vv)} 字符>"
+            else:
+                out[key] = type(vv).__name__
+        return out
+    if isinstance(v, list):
+        return {"条数": len(v),
+                "首条结构": _shape(v[0], depth + 1, hide_values) if v else None}
+    return "<已隐藏>" if hide_values else f"<{type(v).__name__}>"
+
+
+def redact_dump(data: dict) -> dict:
+    """把完整 dump 转成可外发的脱敏摘要（纯函数，便于回归）。"""
+    out = _shape(data) if isinstance(data, dict) else {}
+    if not isinstance(out, dict):
+        out = {}
+    out["_说明"] = ("脱敏摘要：只含字段名与结构，不含响应内容、请求参数、"
+                    "cookie、账号信息或截图。完整现场仍留在同名 .json 里。")
+    return out
+
+
 def save_dump(data: dict, name: str) -> str:
     p = os.path.join(_diag_dir(), f"{name}.json")
     with open(p, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
+    # 用户侧排查优先发这一份；写摘要失败绝不影响原始 dump
+    try:
+        s = os.path.join(_diag_dir(), f"{name}.summary.json")
+        with open(s, "w", encoding="utf-8") as f:
+            json.dump(redact_dump(data), f, ensure_ascii=False, indent=1)
+    except (OSError, TypeError, ValueError):
+        pass
     return p
 
 
@@ -602,6 +689,12 @@ def open_post_form(page, timeout: float = 120.0):
     """
     import time
     page.goto(CREATE_URL, wait_until="domcontentloaded", timeout=60000)
+    wall = _login_wall(page)
+    if wall:
+        # 会话被平台踢了（2026-11-14 实测）：goto 会直接被弹到登录墙。这时候
+        # 「没打开发表页，点一下重试」是骗人的——重试一百次也开不出来，只能
+        # 重新登录。如实说，让上层把登录窗口弹出来。
+        raise LoginLostError(wall)
 
     end = time.time() + timeout
     clicked = False
@@ -610,6 +703,10 @@ def open_post_form(page, timeout: float = 120.0):
         fr = form_frame(page, timeout=1)
         if fr is not None:
             return fr
+        # 传到一半被踢下线也会落到登录墙：循环里每秒都看一眼
+        wall = _login_wall(page)
+        if wall:
+            raise LoginLostError(wall)
         # 没点过就去点「发表视频」（点一次就够）
         if not clicked:
             clicked = _click_publish_entry(page)
@@ -618,6 +715,23 @@ def open_post_form(page, timeout: float = 120.0):
                 continue
         page.wait_for_timeout(1000)
     return None
+
+
+def _login_wall(page) -> str:
+    """页面是不是被弹回了登录墙。是就返回给人看的一句话，不是就返回空。
+
+    为什么不能只看地址栏带不带 /login：登录墙是 SPA 自己跳的，地址栏可能
+    还没来得及变；二维码 iframe（qrconnect）一定先在，拿它当判据最稳。
+    """
+    try:
+        if "/login" in (page.url or ""):
+            return "这个号的登录失效了，重新登录一次再试（登录窗口会自己弹出来）。"
+        for f in page.frames:
+            if "qrconnect" in (f.url or ""):
+                return "这个号的登录失效了，重新登录一次再试（登录窗口会自己弹出来）。"
+    except Exception:  # noqa: BLE001  页面正在跳转时查会抛，按「不是」处理
+        pass
+    return ""
 
 
 def _wait_tmpl(page, tmpl: dict, key: str, seconds: float = 8.0) -> bool:

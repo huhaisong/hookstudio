@@ -1557,13 +1557,19 @@ def shots_run(pid: str, count: int, duration: int, aspect: str = "9:16",
         results = [None] * count
 
         def _worker(k):
+            # 池子里的子线程没有 start_task 设的上下文，AI 请求认不出自己属于
+            # 哪个任务，中止标记就查不到（2026-11-16）。绑一次，finally 里解绑。
+            core.bind_call_ctx(pid, "shots")
             try:
                 return _gen_one(p, payload, k + 1, count, text)
             except Exception as exc:  # noqa: BLE001
                 return exc
+            finally:
+                core.bind_call_ctx(None, None)
 
         conc = min(conc_cap, count)
-        with ThreadPoolExecutor(max_workers=conc) as pool:
+        pool = ThreadPoolExecutor(max_workers=conc)
+        try:
             futs = {pool.submit(_worker, k): k for k in range(count)}
             done = 0
             for fut in as_completed(futs):
@@ -1572,6 +1578,9 @@ def shots_run(pid: str, count: int, duration: int, aspect: str = "9:16",
                 done += 1
                 core.set_task(pid, "shots", 25 + 40 * done / count,
                               f"AI 已写完 {done}/{count} 条，正在汇总")
+        finally:
+            # 同 batch.ai_plan_multi：with 的 wait=True 会让中止被其它条拖住。
+            pool.shutdown(wait=False, cancel_futures=True)
 
         # 并行阶段失败的，串行重试一次（多半是并发触发的 429 / 排队）。
         # 并发开到 8 时若一批同时被限流，立刻连着重发会再次挤在一起撞墙，

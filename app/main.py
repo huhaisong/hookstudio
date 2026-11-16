@@ -17,8 +17,8 @@ from urllib.parse import quote
 
 from . import admin as admin_api
 from . import (aigate, analyze, audit, auth, batch, bgmlib, buildstamp, core, db,
-               nosub, publishapi, publisher, report, render, shots, shortcut,
-               transcribe, update, vmerge, wxbot, wxmon, wxworker)
+               names, nosub, publishapi, publisher, report, render, retime, shots,
+               shortcut, transcribe, update, vmerge, wxbot, wxmon, wxworker, zh)
 
 # 版本号只在这里定义一次，构建指纹模块也用它（buildstamp.VERSION）
 APP_VERSION = buildstamp.VERSION
@@ -49,6 +49,14 @@ async def _static_no_cache(request, call_next):
     （2026-11-02 实测：位置条画出来了但样式没加载，整列空白）。文件很小，禁用缓存没有代价。
     """
     resp = await call_next(request)
+    # 2026-11-15 A 档：只加这两个「绝不误伤」的头。
+    # 不照抄对方项目的完整 CSP / Host 硬校验：页面里有 wujie iframe，还有
+    # 「页面 fetch 127.0.0.1 签名地址」这条大文件上传通道，frame-src /
+    # connect-src 一加就断；部署又走 Caddy 反代，Host 是公网域名，硬校验
+    # 会把正常请求全挡掉。也不加 X-Frame-Options —— 内置预览面板可能用
+    # 跨域 iframe 打开 8100。鉴权已有 token + 媒体 HMAC 签名两道。
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
     if request.url.path.startswith("/static"):
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
@@ -854,6 +862,12 @@ def project(pid: str):
     slim["task"] = core.get_task(pid)                  # 第 1 步 + 第 3 步（cuts）
     slim["task_shots"] = core.get_task(pid, "shots")   # 第 4 步引流分镜
     slim["task_nosub"] = core.get_task(pid, "nosub")   # 第 2 步去字幕（独立并行）
+    # 老项目没有 plan_result：读的时候按 jobs 与实际产出的差额补一份只读推断，
+    # 让「缺套提示 + 只补跑没出来的套」对改动前生成的项目也能用。不写盘。
+    if not (slim.get("batch") or {}).get("plan_result"):
+        legacy = batch.legacy_plan_result(p)
+        if legacy:
+            slim["batch"] = dict(slim.get("batch") or {}) | {"plan_result": legacy}
     return slim
 
 
@@ -915,6 +929,9 @@ class NoSubCfg(BaseModel):
     # （慢一倍，强纹理背景更自然）。没声明的字段 Pydantic 会直接丢掉，
     # 前端传上来也会被吃——加新可调项时别忘了在这里同步加一行。
     fill_mode: str = "mirror"
+    # 生成前自动按原片字幕的真实出现时刻重排台词时间（只改时间、不动字）。
+    # 2026-11-16 用户定：不再单独点「按原片字幕校正时间」，默认就在生成时做。
+    retime: bool = True
 
 
 @app.put("/api/projects/{pid}/nosub-config")
@@ -948,9 +965,58 @@ def do_nosub(pid: str, body: NoSubCfg | None = None):
     # 改写台词）。第 3 步的编排/出片不写台词，可以并行——这正是拆组的目的。
     if core.running_kind(pid, "cuts") == "transcribe":
         raise HTTPException(409, "正在自动整理台词，等它跑完再生成处理好的视频")
+    if core.running_kind(pid, "cuts") == "retime":
+        raise HTTPException(409, "正在校正字幕时间，等它跑完再生成处理好的视频")
     if not core.start_task(pid, "nosub", lambda: nosub.run(pid)):
         raise HTTPException(409, "这一步已经在生成了，等它跑完再试")
     return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/retime")
+def do_retime(pid: str):
+    """按原片字幕的真实出现时刻校正台词时间码（只改时间，不动文字）。
+
+    正常流程里**不需要调这个**：第 2 步生成时会自动做（见 no_sub.run）。
+    留着是为了排查——可以强制把已经对过的集重算一遍。
+    """
+    p = core.load(pid)
+    if not p:
+        raise HTTPException(404, "项目不存在")
+    if not any((e.get("lines") or []) for e in (p.get("episodes") or [])):
+        raise HTTPException(400, "还没有整理台词，先去第 1 步「台词整理」做完再来")
+    by = ((p.get("nosub") or {}).get("spans") or {}).get("by_ep") or {}
+    if not any((by.get(e.get("file")) or {}).get("spans")
+               for e in (p.get("episodes") or [])):
+        raise HTTPException(400, "还没有量出原片字幕的位置，先在第 2 步生成一次")
+    if core.running_kind(pid, "nosub"):
+        raise HTTPException(409, "正在生成处理好的视频，等它跑完再校正时间")
+    if core.running_kind(pid, "cuts"):
+        raise HTTPException(409, "第 1 步正在跑，等它跑完再校正时间")
+    if not core.start_task(pid, "retime", lambda: retime.run(pid, force=True)):
+        raise HTTPException(409, "已经在校正时间了，等它跑完")
+    return {"ok": True}
+
+
+@app.post("/api/projects/{pid}/retime/revert")
+def do_retime_revert(pid: str):
+    """撤销校正，回到识别出来的原时间码，并**关掉自动对齐**。
+
+    关开关是语义闭环：不关的话下一次生成又会自动排回去，等于没撤销。
+    """
+    p = core.load(pid)
+    if not p:
+        raise HTTPException(404, "项目不存在")
+    if core.running_kind(pid, "cuts") or core.running_kind(pid, "nosub"):
+        raise HTTPException(409, "有任务正在跑，等它跑完再撤销")
+    n = retime.revert(pid)
+    if not n:
+        raise HTTPException(404, "没有可撤销的校正记录")
+    cfg = nosub.clean_cfg(p.get("nosub_cfg") or {})
+    cfg["retime"] = False
+    p = core.load(pid) or p
+    p["nosub_cfg"] = cfg
+    core.save_merge(p, ["nosub_cfg"])
+    return {"ok": True, "episodes": n, "retime": False}
 
 
 def _open_native(path: str) -> None:
@@ -1118,6 +1184,8 @@ class PlanBody(BaseModel):
     order: str = "chrono"
     model: str = ""                    # 单模型（老前端/脚本用）
     jobs: list[PlanJob] | None = None  # 多模型对比：每个模型各自的套数/时长
+    # True = 只把没生成成功的组重跑一遍，产出追加到现有 plans 后面（不覆盖、不清出片进度）
+    append: bool = False
 
 
 class HookcutBody(BaseModel):
@@ -1224,6 +1292,12 @@ def do_plan(pid: str, body: PlanBody, request: Request):
         raise HTTPException(404, "项目不存在")
     if not (p.get("episodes") or []):
         raise HTTPException(400, "还没有转写结果，请先转写")
+    if body.append:
+        old_plans = p.get("plans") or []
+        if not old_plans:
+            raise HTTPException(400, "还没有可以补进去的结构，请直接生成")
+        if any(pl.get("mode") == "hook" for pl in old_plans):
+            raise HTTPException(400, "当前是单集钩子结构，不能往里追加混剪的套")
     # AI 一次输出不了太多套（每套十几块，输出会过长易截断），上限压到 20
     order = body.order if body.order in ("auto", "chrono", "varied") else "chrono"
     if body.jobs:
@@ -1232,7 +1306,7 @@ def do_plan(pid: str, body: PlanBody, request: Request):
                  "min_minutes": max(0.5, float(j.min_minutes)),
                  "max_minutes": max(0.5, float(j.max_minutes))} for j in body.jobs]
         total = sum(j["count"] for j in jobs)
-        runner = lambda: batch.ai_plan_multi(pid, jobs, order)
+        runner = lambda: batch.ai_plan_multi(pid, jobs, order, append=body.append)
     else:
         count = max(1, min(20, int(body.count)))
         mn = max(0.5, float(body.min_minutes))
@@ -1240,14 +1314,14 @@ def do_plan(pid: str, body: PlanBody, request: Request):
         jobs = [{"model": (body.model or "").strip(), "count": count,
                  "min_minutes": mn, "max_minutes": mx}]
         total = count
-        runner = lambda: batch.ai_plan_multi(pid, jobs, order)
+        runner = lambda: batch.ai_plan_multi(pid, jobs, order, append=body.append)
 
     # 任务跑在后台线程里，中间件那条日志只知道「有人点了生成」，不知道跑成功没有。
     # 真正的消耗在下面这条：谁、哪个项目、几个模型、跑了几分钟、成没成。
     t0 = time.perf_counter()
     payload = {"sets": total, "models": [j["model"] or "(默认)" for j in jobs],
                "minutes": [f"{j['min_minutes']}-{j['max_minutes']}" for j in jobs],
-               "order": order}
+               "order": order, "append": body.append}
 
     def job():
         try:
@@ -1266,7 +1340,8 @@ def do_plan(pid: str, body: PlanBody, request: Request):
 
     if not core.start_task(pid, "plan", job):
         raise HTTPException(409, "这个项目已有任务在跑")
-    return {"ok": True, "count": total, "order": order, "models": len(jobs)}
+    return {"ok": True, "count": total, "order": order, "models": len(jobs),
+            "append": body.append}
 
 
 @app.post("/api/projects/{pid}/hookcut-plan")
@@ -1551,7 +1626,12 @@ class RenderFx(BaseModel):
     # ── 用哪份视频（界面上独立一组，不与上面四项混用）──
     # 去字幕 + 加自己的字幕已在「台词整理」之后那一步做成独立视频文件；
     # 出片这一步只挑素材，不再改画面。默认原始视频，老项目不受影响。
-    src_ver: str = ""        # "" 原始视频 / "nosub" 已处理（去字幕+新字幕）的视频
+    src_ver: str = ""        # "" 原始视频 / "nosub" 干净底片（第2步产物）/
+                             # "live" 现场做（不依赖底片，出片这一趟顺手抹）
+    # ── 字幕样式（2026-11-16 从第 2 步搬过来）──
+    # 底片里没有字，字是出片时才画上去的，所以「怎么出现」属于这一步。
+    newsub_style: str = render.NEWSUB_DEFAULTS["style"]
+    newsub_motion: float = render.NEWSUB_DEFAULTS["motion"]
 
 
 def _clean_fx(fx: dict) -> dict:
@@ -1626,9 +1706,22 @@ def _clean_fx(fx: dict) -> dict:
         d = str(fx.get("first_mirror_dir") or "h").strip().lower()
         fx["first_mirror_dir"] = d if d in ("h", "v") else "h"
     # 用哪份视频（独立一组）：同样只夹传进来的字段，绝不顺手补默认值。
+    # 三个合法值都要放行："" 原始视频 / "nosub" 干净底片 / "live" 出片时现场做。
+    # 2026-11-16 修：以前写成 `"nosub" if v == "nosub" else ""`，live 被静默
+    # 降级成「原始视频」——不抹原字幕、不烧新字幕，再叠加镜像就成了反字，
+    # 用户看到的是「设置选了现场做，出片却全是翻转的原字幕」。
     if "src_ver" in fx:
         v = str(fx.get("src_ver") or "").strip()
-        fx["src_ver"] = "nosub" if v == "nosub" else ""
+        fx["src_ver"] = v if v in ("nosub", "live") else ""
+    # 字幕样式：动效只认白名单，幅度夹到 0-1（跟前端滑杆一致）
+    if "newsub_style" in fx:
+        st = str(fx.get("newsub_style") or "").strip().lower()
+        fx["newsub_style"] = st if st in render.NEWSUB_STYLES else render.NEWSUB_DEFAULTS["style"]
+    if "newsub_motion" in fx:
+        try:
+            fx["newsub_motion"] = min(1.0, max(0.0, float(fx.get("newsub_motion"))))
+        except (TypeError, ValueError):
+            fx["newsub_motion"] = render.NEWSUB_DEFAULTS["motion"]
     # 指纹强度：只认三个值，认不出就落回标准档（和老项目行为一致）
     if "fp_level" in fx:
         lv = str(fx.get("fp_level") or "").strip().lower()
@@ -1659,6 +1752,22 @@ def _wants_live(plans: list[dict], fx: dict, sets_fx: dict) -> bool:
         if str(v or "").strip() == "live":
             return True
     return False
+
+
+def _wants_burn(plans: list[dict], fx: dict, sets_fx: dict, p: dict) -> bool:
+    """这次出片有没有套要在**这一趟里烧台词字幕**。
+
+    两条路都算：现场做（live），以及用干净副本（nosub 且副本没烧字）。
+    烧字要读台词、要字幕带位置，所以两者对前置条件的要求是一样的。
+    """
+    if _wants_live(plans, fx, sets_fx):
+        return True
+    if render._copy_burned(p):
+        return False
+    return any(
+        str(((sets_fx or {}).get(str(pl.get("index"))) or {}).get(
+            "src_ver", fx.get("src_ver", "")) or "").strip() == "nosub"
+        for pl in plans)
 
 
 def _missing_nosub(p: dict, plans: list[dict], fx: dict, sets_fx: dict) -> list[str]:
@@ -1707,29 +1816,32 @@ def _nosub_busy_conflict(pid: str, plans: list[dict], fx: dict, sets_fx: dict) -
 
 
 def _prepared_mirror_conflict(p: dict, plans: list[dict], fx: dict, sets_fx: dict) -> str:
-    """用「已处理（去字幕+新字幕）」素材时不能左右镜像（2026-11-11）。
+    """用「已处理」素材时，这几种组合会出废片（2026-11-11 起，2026-11-16 改写）。
 
-    新字幕已经烧进那一份素材的画面里，出片再 hflip 会把字翻成反字。
-    只有副本生成时真的开了「加自己的字幕」（nosub.cfg.newsub）才拦；
-    只去字幕、没加字幕的副本，镜像没问题。
+    现在第 2 步的副本是**干净版**（只抹原字幕、不烧台词），所以：
+      · 干净副本 + 镜像 → 完全没问题，字是出片时才烧的，翻不到；
+      · 干净副本 + 不镜像 → 也没问题；
+      · **旧版副本（字幕已烧进画面）** + 任何设置 → 都不能用：再烧一遍台词会
+        两层字叠在一起，镜像更是把旧字翻反。这种情况只能请用户重做第 2 步。
 
-    2026-11-12 补：「出片时现场做」（src_ver=live）**不受这条限制**——
-    它的顺序是抹字幕 → hflip → 烧新字幕，字是翻转之后才画的，翻不到。
-    所以下面只拦 nosub，live 直接放行。
+    以前这里拦的是「nosub + 镜像」，那是「副本带字」时代的限制；现在带字的副本
+    已经被整条拒掉，镜像反而成了推荐组合，所以判据改成「副本是不是带字的」。
     """
-    ns = (p.get("nosub") or {}).get("cfg") or {}
-    if not bool(ns.get("newsub")):
+    if _wants_live(plans, fx, sets_fx):
+        return ""                     # 现场做：不碰副本，任何镜像都安全
+    if render._copy_burned(p) is False:
+        return ""                     # 干净副本：镜像、烧字都随便用
+    ns = p.get("nosub") or {}
+    if not (ns.get("files") or {}):
+        return ""                     # 还没生成过副本，由「缺素材」那条去提示
+    uses_nosub = any(
+        str(((sets_fx or {}).get(str(pl.get("index"))) or {}).get(
+            "src_ver", fx.get("src_ver", "")) or "").strip() == "nosub"
+        for pl in plans)
+    if not uses_nosub:
         return ""
-    for pl in plans:
-        ov = (sets_fx or {}).get(str(pl.get("index"))) or {}
-        ver = str(ov.get("src_ver", fx.get("src_ver", "")) or "").strip()
-        if ver != "nosub":
-            continue
-        if bool(ov.get("mirror", fx.get("mirror", False))):
-            return (f"第 {pl.get('index')} 套用的是「已处理（去字幕+新字幕）」的素材，"
-                    "自己的字幕已经烧进画面，再左右镜像会把字翻反。"
-                    "这一套关掉镜像，或者改回原始视频。")
-    return ""
+    return ("第 2 步现在的产物是旧版（台词已经烧进画面），再用它出片会叠出两层字。"
+            "回第 2 步点一次「生成处理好的视频」，重做完再出片。")
 
 
 @app.post("/api/projects/{pid}/render-plans")
@@ -1840,11 +1952,11 @@ def do_render_plans(pid: str, body: RenderPlansBody | None = None):
     if miss:
         raise HTTPException(400, f"第 {','.join(miss)} 集还没生成「去掉字幕」的视频，"
                                  "先到「台词整理」后面那一步生成完，再回来出片")
-    # 现场做（src_ver=live）要按台词烧字幕：没整理过台词当场说清楚，
+    # 要烧字幕（现场做 / 干净副本）就得有台词：没整理过当场说清楚，
     # 别等后台任务跑到切第一段才失败
-    if _wants_live(chosen, fx, sets_fx) and not any(
+    if _wants_burn(chosen, fx, sets_fx, p) and not any(
             (e.get("lines") or []) for e in (p.get("episodes") or [])):
-        raise HTTPException(400, "还没有整理台词。「出片时现场做」要按台词重做字幕，"
+        raise HTTPException(400, "还没有整理台词。出片这一步要按台词重做字幕，"
                                  "先去第 1 步「台词整理」做完")
     if not core.start_task(pid, "batch",
                           lambda: batch.render_plans(pid, save_dir or None, fx, run_sets_fx)):
@@ -1955,6 +2067,106 @@ def save_lines(pid: str, body: EditLines, request: Request):
     return {"ok": True, "ep": ep_i, "line_count": len(lines), "line_total": total}
 
 
+# ── 人名写法统一（2026-11-16）───────────────────────────────────────────────
+# 转写出来的人名常是同音错字：原片是「顾清棠」，四个模型分别写成清唐/青棠/清堂，
+# 同一个项目里三种写法混着。换模型治不了（四家只有 Belle 对，而 Belle 分句失效），
+# 所以改成「用户给一张对照表 + 转写后自动替换」，表在 data/names.txt，逻辑在 app/names.py。
+# 改字会让 nosub 指纹失效（sig_of 并进了台词内容），所以界面必须提醒重新生成第 2 步。
+
+class NamesBody(BaseModel):
+    text: str = ""
+
+
+@app.get("/api/names")
+def get_names():
+    """对照表原文 + 已经生效的规则（给第 1 步的编辑框用）。"""
+    raw = names.text()
+    pairs, bad = names.parse(raw)
+    return {"text": raw, "count": len(pairs),
+            "pairs": [{"bad": b, "good": g} for b, g in pairs],
+            "invalid": bad}
+
+
+@app.put("/api/names")
+def put_names(body: NamesBody, request: Request):
+    me = auth.current_user(request)
+    pairs, bad = names.save(body.text if body.text is not None else "")
+    audit.log_event(me, "names.save", payload={"rules": len(pairs), "invalid": len(bad)},
+                    request=request, status_code=200)
+    return {"ok": True, "count": len(pairs), "invalid": bad}
+
+
+@app.post("/api/projects/{pid}/names-apply")
+def do_names_apply(pid: str, request: Request):
+    """把对照表套用到这个项目已有的台词上（转写只作用于新转的集）。
+
+    只改文字，时间码一个字都不动；改完 nosub 指纹自动失效，第 2 步要重新生成。
+    """
+    me = auth.current_user(request)
+    p = core.load(pid)
+    if not p:
+        raise HTTPException(404, "项目不存在")
+    if core.task_running(pid, "cuts"):
+        raise HTTPException(409, "正在整理台词，等这一步跑完再统一")
+    r = names.apply_project(p)
+    if r["changed"]:
+        core.save_merge(p, ["episodes"])
+    audit.log_event(me, "project.names_apply", target=audit.target_of(pid),
+                    payload={"changed": r["changed"], "rules": r["rules"],
+                             "episodes": len(r["episodes"])},
+                    request=request, status_code=200)
+    return {"ok": True, "changed": r["changed"], "rules": r["rules"],
+            "episodes": r["episodes"]}
+
+
+# ── 繁体转简体（2026-11-16）─────────────────────────────────────────────────
+# 和人名统一是两件事：那层管「同音错字」，这层管「整段繁体输出」。
+# 开关存 config.json 的 zh_t2s（见 core.DEFAULT_CONFIG），转写时两条路都读它：
+# B 给模型一句「用简体」的提示（源头），A 转完按字表换字（兜底）。逻辑在 app/zh.py。
+#
+# 开关只管「以后自动转」；下面那个按钮是显式动作，点了就转、不看开关。
+# 这样界面上不会有「开关关着所以按钮点了也没反应」这种说不清的状态。
+
+class ZhBody(BaseModel):
+    on: bool = True
+
+
+@app.get("/api/zh")
+def get_zh():
+    """开关状态 + 字表能转的字数（界面显示用）。"""
+    return {"on": zh.enabled(), "pairs": zh.size()}
+
+
+@app.put("/api/zh")
+def put_zh(body: ZhBody, request: Request):
+    me = auth.current_user(request)
+    on = zh.set_enabled(body.on)
+    audit.log_event(me, "zh.toggle", payload={"on": on}, request=request, status_code=200)
+    return {"ok": True, "on": on}
+
+
+@app.post("/api/projects/{pid}/zh-apply")
+def do_zh_apply(pid: str, request: Request):
+    """把已有台词里的繁体字换成简体（转写只作用于新转的集）。
+
+    只改文字，时间码一个字都不动；改完 nosub 指纹自动失效，第 2 步要重新生成。
+    幂等：转过的再点一次是 0。
+    """
+    me = auth.current_user(request)
+    p = core.load(pid)
+    if not p:
+        raise HTTPException(404, "项目不存在")
+    if core.task_running(pid, "cuts"):
+        raise HTTPException(409, "正在整理台词，等这一步跑完再统一")
+    r = zh.apply_project(p)
+    if r["changed"]:
+        core.save_merge(p, ["episodes"])
+    audit.log_event(me, "project.zh_apply", target=audit.target_of(pid),
+                    payload={"changed": r["changed"], "episodes": len(r["episodes"])},
+                    request=request, status_code=200)
+    return {"ok": True, "changed": r["changed"], "episodes": r["episodes"]}
+
+
 @app.get("/api/projects/{pid}/video")
 def video(pid: str, set: int = 0):
     p = core.load(pid)
@@ -2012,19 +2224,22 @@ def open_video(pid: str, set: int = 0):
 
 
 @app.post("/api/pick-folder")
-def pick_folder(initial: str = ""):
+def pick_folder(initial: str = "", key: str = "proj_out"):
     """弹系统原生的「选择文件夹」对话框（本机工具才有的能力）。
-    浏览器拿不到真实磁盘路径，所以由后端弹框、把选中的路径回给前端。"""
+    浏览器拿不到真实磁盘路径，所以由后端弹框、把选中的路径回给前端。
+
+    起始位置优先级：前端传来的有效路径 → 上次在这个用途下确认的目录 → 系统默认。
+    key 区分用途（成片保存 / 两两合并），互不干扰。"""
     import threading
 
-    from . import nativedlg
+    from . import nativedlg, pickmem
 
     result = {"path": ""}
     err: dict = {}
 
     def _pick():
         try:
-            init = initial if initial and os.path.isdir(initial) else ""
+            init = initial if initial and os.path.isdir(initial) else pickmem.recall_dir(key)
             result["path"] = nativedlg.pick_folder("选择成片保存位置", init)
         except Exception as exc:  # noqa: BLE001
             err["msg"] = str(exc)
@@ -2036,23 +2251,26 @@ def pick_folder(initial: str = ""):
         raise HTTPException(500, f"弹不出选择框（{err['msg']}），可以直接手动输入路径")
     if not result["path"]:
         return {"ok": False, "path": ""}
+    pickmem.remember(key, result["path"], True)
     return {"ok": True, "path": result["path"].replace("\\", "/")}
 
 
 @app.post("/api/pick-file")
-def pick_file(initial: str = ""):
-    """弹系统原生的「选择文件」对话框（选 BGM 音乐文件用），机制同 pick-folder。"""
+def pick_file(initial: str = "", key: str = ""):
+    """弹系统原生的「选择文件」对话框（选 BGM / LUT 用），机制同 pick-folder。"""
     import threading
 
-    from . import nativedlg
+    from . import nativedlg, pickmem
 
     result = {"path": ""}
     err: dict = {}
 
     def _pick():
         try:
-            init = (initial if initial and (os.path.isdir(initial) or os.path.isfile(initial))
-                    else "")
+            if initial and (os.path.isdir(initial) or os.path.isfile(initial)):
+                init = initial
+            else:
+                init = pickmem.recall_dir(key)
             result["path"] = nativedlg.pick_file(
                 "选择 BGM 音乐文件", init,
                 filetypes=[("音频文件", "*.mp3 *.m4a *.aac *.wav *.flac *.ogg *.wma"),
@@ -2067,7 +2285,16 @@ def pick_file(initial: str = ""):
         raise HTTPException(500, f"弹不出选择框（{err['msg']}），可以直接手动输入路径")
     if not result["path"]:
         return {"ok": False, "path": ""}
+    pickmem.remember(key, result["path"], False)
     return {"ok": True, "path": result["path"].replace("\\", "/")}
+
+
+@app.get("/api/pick-history")
+def pick_history(key: str, limit: int = 3):
+    """界面「最近用过」用：返回这个用途下最近确认过、且目录还在的路径。"""
+    from . import pickmem
+
+    return {"key": key, "items": pickmem.recent(key, max(1, min(limit, pickmem.LIMIT)))}
 
 
 class MergeBody(BaseModel):

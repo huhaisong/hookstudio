@@ -453,7 +453,7 @@ tr.trace-row td{background:#F8FAFC;padding:0 10px 14px}
             <select id="lg-action">
               <option value="">全部动作</option>
               <option value="project.create">新建项目</option>
-              <option value="project.transcribe,project.transcribe_ep,project.transcript_reuse,project.transcript_import,project.lines_edit">转写/台词</option>
+              <option value="project.transcribe,project.transcribe_ep,project.transcript_reuse,project.transcript_import,project.lines_edit,names.save,project.names_apply,zh.toggle,project.zh_apply">转写/台词</option>
               <option value="project.analyze">AI 分析</option>
               <option value="plan.generate,plan.done,plan.fail">生成结构</option>
               <option value="hookcut.">单集钩子前置</option>
@@ -1146,6 +1146,8 @@ tr.trace-row td{background:#F8FAFC;padding:0 10px 14px}
     "project.transcribe": "转写", "project.transcribe_ep": "重转写单集",
     "project.transcript_reuse": "沿用已有台词", "project.transcript_import": "导入台词",
     "project.lines_edit": "修改台词",
+    "names.save": "改人名对照表", "project.names_apply": "统一人名写法",
+    "zh.toggle": "繁转简开关", "project.zh_apply": "繁体转简体",
     "project.analyze": "AI 分析",
     "plan.generate": "生成结构", "plan.done": "生成结构·成功", "plan.fail": "生成结构·失败",
     "hookcut.generate": "钩子前置·生成", "hookcut.done": "钩子前置·成功",
@@ -1162,6 +1164,7 @@ tr.trace-row td{background:#F8FAFC;padding:0 10px 14px}
     "plan.select": "勾选套数", "plan.hook": "改片头文案", "plan.fx": "改套内特效",
     "fx.default": "改默认特效", "edl.save": "手改剪辑表",
     "nosub.config": "改去字幕设置", "nosub.generate": "生成去字幕版素材",
+    "nosub.retime": "按原片字幕校正时间", "nosub.retime_revert": "撤销字幕时间校正",
     "nosub.open": "打开去字幕版目录", "nosub.preview": "预览去字幕版",
     "shots.generate": "生成分镜", "shots.done": "生成分镜·成功", "shots.fail": "生成分镜·失败",
     "shots.layout": "重排分镜文档", "task.cancel": "中止任务",

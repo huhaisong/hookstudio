@@ -1,7 +1,7 @@
 """视频号助手自动化底座：浏览器、账号 profile、扫码登录。
 
 三层分工，改版时只动一处：
-  `wxbot.py`  怎么驱动浏览器（本文件）—— 起进程、给页面、截二维码、判登录
+  `wxbot.py`  怎么驱动浏览器（本文件）—— 起进程、给页面、开登录页、判登录
   `wxpub.py`  发布页怎么填（上传/文案/定时）
   `wxsel.py`  所有选择器集中在这里
 
@@ -18,12 +18,12 @@ playwright 的同步对象**绑在创建它的线程上**，换线程用直接�
 ### 登录页的实测结构（2026-11-13 真实页面校准）
 - 打开 `channels.weixin.qq.com/platform` 会跳到 `/login.html`
 - 二维码不在主文档，在 iframe：`open.weixin.qq.com/connect/qrconnect?...`
-- 二维码本身是 `img[src*="/connect/qrcode/"]`，160×160
-- 对 iframe 元素整块截图最干净（208×208，白底无遮挡，实测可扫）
+- 2026-11-14 起不再截码：扫码一律弹**可见窗口**让用户对着平台自己的登录页
+  扫（快捷登录卡/换码/过期刷新平台自己会处理），这边只判登录。
 """
 from __future__ import annotations
 
-import base64
+import asyncio
 import os
 import queue
 import shutil
@@ -149,6 +149,16 @@ class Session:
             except Exception:  # noqa: BLE001
                 pass
         self._ctx = self._pw = self._page = None
+        # **摘掉旧实例留在线程上的「运行中循环」标记**（2026-11-14 扫码卡
+        # 实测的根因）。playwright 的每次同步调用结束后都会把旧实例的事件
+        # 循环标记成本线程的 running loop（_greenlets.py:131）——一个线程
+        # 同时只能有一个活着的 sync 实例。stop() 半路炸掉时这个标记没人清
+        # （__exit__ 的 _exit_was_called 还会挡住二次收尾），下一次
+        # sync_playwright().start() 一查线程里有 running loop 就报
+        # 「Sync API inside the asyncio loop」，重试多少次都穿不过——线程
+        # 等于被毒死。旧实例在这里已经弃用，把标记摘掉对它无影响（它自己
+        # 每次调用还会再标回去），但对新实例是生死攸关。
+        asyncio._set_running_loop(None)
 
     def ensure_mode(self, visible: bool) -> None:
         """切可见/无头。**只在真的要换模式时才重启浏览器**。
@@ -222,44 +232,62 @@ class Session:
         self._kill_stale_chrome()
         prof = profile_of(self.aid)
         os.makedirs(prof, exist_ok=True)
-        # 同线程「关旧实例 → 起新实例」偶发撞上旧实例内部循环的收尾：
-        # 新实例一 start 就报「Sync API inside the asyncio loop」
-        # （2026-11-14 实测：无头预取 → 可见扫码连着切模式就撞）。
-        # 旧循环的退出是毫秒级，小间隔重试三次即可穿过。
+        # 启动失败要**连着清场重试**（2026-11-14 实测）：launch 报
+        # TargetClosedError 时常把 Chrome 留成孤儿——进程活着、profile 的
+        # lockfile 被它握着，下一次启动秒退，这个号就永远起不来了。所以每一轮
+        # 失败都要收尸（杀孤儿）+ 删残留 lockfile 再试，而不是只重试一次。
+        # 同线程「关旧实例 → 起新实例」以前还报「Sync API inside the asyncio
+        # loop」——真凶是旧实例 stop() 半路炸时留在线程上的「运行中循环」标记
+        # （不是时序竞态，重试永远穿不过；标记现在在 _shutdown_browser 里
+        # 每次都摘），这里只剩孤儿 Chrome / lockfile 一类需要清场重试的情况。
         last = None
         for _ in range(3):
             try:
                 self._pw = sync_playwright().start()
+                self._ctx = self._pw.chromium.launch_persistent_context(
+                    user_data_dir=prof,
+                    executable_path=find_browser(),
+                    headless=(True if headless() else (not self._visible)),
+                    viewport={"width": 1280, "height": 900},
+                    locale="zh-CN",
+                    # 让自动化特征弱一点；只影响 navigator.webdriver，不动其它
+                    args=["--disable-blink-features=AutomationControlled",
+                          # 允许页面 fetch 127.0.0.1（2026-11-13 踩过）：
+                          # 发表时页面要从本机取视频文件（几十上百兆），base64 塞不进
+                          # evaluate（8MB 上限），只能让页面自己去本机 fetch。
+                          # 但 Chrome 130+ 的 Local Network Access 会以
+                          # 「Permission was denied for this request to access the
+                          # loopback address space」把公网页面 → 127.0.0.1 全拦掉
+                          # ——网页端拿不到许可，这条路在网页里根本走不通。
+                          # 这个浏览器是我们自己拉起来的自动化实例，只干这一件事，
+                          # 所以把这个检查关掉。实测这一条 flag 就够。
+                          "--disable-features=LocalNetworkAccessChecks"],
+                )
                 last = None
                 break
             except Exception as exc:  # noqa: BLE001
                 last = exc
-                time.sleep(0.4)
+                # 失败的启动可能已经把 Chrome 拉起来了（孤儿），收尸 + 清锁再试
+                self._shutdown_browser()
+                self._kill_stale_chrome()
+                self._drop_lockfile()
+                time.sleep(0.6)
         if last is not None:
             raise last
-        self._ctx = self._pw.chromium.launch_persistent_context(
-            user_data_dir=prof,
-            executable_path=find_browser(),
-            headless=(True if headless() else (not self._visible)),
-            viewport={"width": 1280, "height": 900},
-            locale="zh-CN",
-            # 让自动化特征弱一点；只影响 navigator.webdriver，不动其它
-            args=["--disable-blink-features=AutomationControlled",
-                  # 允许页面 fetch 127.0.0.1（2026-11-13 踩过）：
-                  # 发表时页面要从本机取视频文件（几十上百兆），base64 塞不进
-                  # evaluate（8MB 上限），只能让页面自己去本机 fetch。
-                  # 但 Chrome 130+ 的 Local Network Access 会以
-                  # 「Permission was denied for this request to access the
-                  # loopback address space」把公网页面 → 127.0.0.1 全拦掉
-                  # ——网页端拿不到许可，这条路在网页里根本走不通。
-                  # 这个浏览器是我们自己拉起来的自动化实例，只干这一件事，
-                  # 所以把这个检查关掉。实测这一条 flag 就够。
-                  "--disable-features=LocalNetworkAccessChecks"],
-        )
         self._ctx.set_default_timeout(DEFAULT_MS)
         pages = self._ctx.pages
         self._page = pages[0] if pages else self._ctx.new_page()
         return self._page
+
+    def _drop_lockfile(self) -> None:
+        """删掉 profile 里残留的 lockfile。Chrome 被硬杀时来不及自己删，
+        留着它下一次 launch_persistent_context 就秒退 TargetClosedError
+        （2026-11-14 实测：孤儿进程被杀掉后 lockfile 还在，这个号一直起不来）。
+        删不掉（文件还被握着）就留给下一轮重试再删——上面刚跑过收尸。"""
+        try:
+            os.remove(os.path.join(profile_of(self.aid), "lockfile"))
+        except OSError:
+            pass
 
     # 内部：判登录 --------------------------------------------------------
     @staticmethod
@@ -299,28 +327,13 @@ class Session:
                 return f
         return None
 
-    def _wait_qr(self, page, seconds: float = 25):
-        end = time.time() + seconds
-        while time.time() < end:
-            if self._logged_in(page):
-                return "in"
-            fr = self._qr_frame(page)
-            if fr:
-                try:
-                    if fr.locator('img[src*="/connect/qrcode/"]').count():
-                        return fr
-                except Exception:  # noqa: BLE001  页面正在跳转时查元素会抛，正常
-                    pass
-            page.wait_for_timeout(400)
-        return None
-
     # ── 对外：扫码 ───────────────────────────────────────────────────────
     def _logout(self) -> None:
         """把这个号的登录态清掉（下次打开要重新扫码）。
 
         为什么需要：用户点「重登」是想**换一个微信重新登录**。如果浏览器里
-        还留着上一次的登录态，`_get_qr` 会直接回「已登录 + 空码」，前端拿不到
-        二维码，界面看上去就是「点了没反应」（2026-11-13 踩过）。
+        还留着上一次的登录态，平台会弹快捷登录卡，一键就把旧微信又登回来了，
+        界面看上去就是「点了重登没反应」（2026-11-13 踩过）。
         """
         try:
             self._ctx.clear_cookies()
@@ -333,113 +346,44 @@ class Session:
         except Exception:  # noqa: BLE001  没有这个页面也不影响，cookie 已经清了
             pass
 
-    def _get_qr(self, refresh: bool = False, force: bool = False) -> dict:
-        """取一张二维码。
+    def open_login(self, force: bool = False) -> dict:
+        """把这个号的登录页在**可见浏览器窗口**里弹出来（2026-11-14 用户定：
+        登录一律直接弹窗口手动做，界面里不再显示二维码）。
+        平台自己的登录页自带快捷登录卡、自动换码、过期刷新，用户对着真窗口
+        操作最直接；登没登上由前端轮询 login-state 判断，这个方法只负责开窗口。
+        force=True（重登）＝先把旧登录态清掉再开登录页，保证换一个微信登录。
 
-        两种模式，区别是**会不会重新导航**：
-        - `refresh=False`：页面上已经有二维码就原地截一张。用户可能刚扫完、iframe
-          正在轮询确认，这时导航一下这次登录就作废了（现象：手机上显示已登录，
-          这边永远没反应）。
-        - `refresh=True`：明确要换一张（手动点「换一张」，或前端发现这张超过
-          4 分钟快过期了）才 reload 重新出码。
-        - `force=True`：「重登」= 一定要重新扫码。先清掉登录态再出码。
+        换可见模式必须**在账号线程里**做：这个方法是 API 线程直接调进来的，原来
+        在外面跨线程 `_shutdown_browser()`，而 sync Playwright 不是线程安全的
+        ——跨线程 stop 炸一半被吞，旧实例的事件循环残留在账号线程上，紧接着
+        起浏览器就报「Sync API inside the asyncio loop」（2026-11-14 实测）。
+        排进账号线程还顺带消掉另一层竞争：无头验号/预取还在跑时
+        不会再被当场拆浏览器。
         """
-        page = self._pick_page()
-        if self._logged_in(page):
-            if not force:
-                return {"logged_in": True, "qr": ""}
-            # 用户明确要换一个微信重新登录：先登出，再要一张新码。
-            self._logout()
-            page = self._open()
-        try:
-            url = page.url or ""
-        except Exception:  # noqa: BLE001
-            url = ""
-        on_site = "channels.weixin.qq.com" in url
-        if force:
-            # 刚登出过，重新走一遍登录入口
-            try:
-                page.goto(PLATFORM, wait_until="domcontentloaded", timeout=45000)
-            except Exception:  # noqa: BLE001
-                pass
-        elif refresh and on_site:
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=45000)
-            except Exception:  # noqa: BLE001
-                pass
-        elif not on_site:
-            try:
-                page.goto(PLATFORM, wait_until="domcontentloaded", timeout=45000)
-            except Exception:  # noqa: BLE001  导航超时不致命，下面照样等二维码
-                pass
-        got = self._wait_qr(page, 25.0)
-        fr = self._qr_frame(page) if got != "in" else None
-        # 平台记住这个微信时，码框里先弹「快捷登录」卡（头像 + 一键确认，
-        # 二维码收在后面）——点卡里的「使用其他头像、昵称或账号」把码换出来
-        # （2026-11-14 用户反馈：要的是二维码，不是快捷登录）。
-        end = time.time() + 12.0
-        while not got and fr is not None and time.time() < end:
-            try:
-                if self._qr_img_visible(fr):
-                    got = fr
-                    break
-                self._quick_login_switch(fr)
-            except Exception:  # noqa: BLE001  跳转中查元素会抛，正常
-                pass
-            page.wait_for_timeout(400)
-        if got == "in":
-            self._page = page
-            return {"logged_in": True, "qr": ""}
-        if not got:
-            raise WxError("二维码没出来。多半是网络卡了，点「重新获取」再来一次；"
-                          "一直不行就检查这台电脑能不能打开视频号助手。")
-        fr = got
-        png = fr.frame_element().screenshot()
-        return {"logged_in": False,
-                "qr": "data:image/png;base64," + base64.b64encode(png).decode()}
-
-    def qr(self, refresh: bool = False, force: bool = False,
-           visible: bool = True) -> dict:
-        # 扫码那一步必须看得见：用户要亲眼看到程序在操作哪个浏览器，
-        # 而且微信的扫码页在无头模式下偶发不刷新二维码。
-        # 「登录失效就地出码」（2026-11-14）想不弹窗：先无头截一张，截不到
-        # （无头下偶发不出码）再回退可见窗口重试一次。
-        if visible:
+        def _go(_s):
             self.ensure_mode(True)
-            return self.call(lambda _s: self._get_qr(refresh, force), timeout=150)
-
-        def _fallback(_s):
-            self.ensure_mode(True)   # 会重启浏览器弹窗；截不到码才走到这
-            return self._get_qr(refresh, force)
-        try:
-            out = self.call(lambda _s: self._get_qr(refresh, force), timeout=120)
-            out["headless"] = True
-            return out
-        except WxError:
-            out = self.call(_fallback, timeout=150)
-            out["fallback"] = True
-            return out
-
-    @staticmethod
-    def _qr_img_visible(fr) -> bool:
-        """码框里的二维码是不是真的摆出来了（快捷登录卡盖着时 img 在 DOM 里
-        但不可见，只数 count 会误判）。"""
-        try:
-            img = fr.locator('img[src*="/connect/qrcode/"]')
-            return bool(img.count()) and img.first.is_visible()
-        except Exception:  # noqa: BLE001
-            return False
-
-    @staticmethod
-    def _quick_login_switch(fr) -> None:
-        """快捷登录卡（平台记住了这个微信）→ 点「使用其他头像、昵称或账号」
-        把二维码换出来。找不到就不动（外层照常重试/报错）。"""
-        try:
-            link = fr.locator("text=使用其他头像")
-            if link.count() and link.first.is_visible():
-                link.first.click()
-        except Exception:  # noqa: BLE001
-            pass
+            page = self._pick_page()
+            if self._logged_in(page) and not force:
+                return {"logged_in": True}
+            if force and self._logged_in(page):
+                # 用户明确要换一个微信重新登录：先登出，别让快捷登录卡
+                # 一键就把旧微信又登回来。
+                self._logout()
+                page = self._open()
+            try:
+                url = page.url or ""
+            except Exception:  # noqa: BLE001
+                url = ""
+            if force or "channels.weixin.qq.com" not in url:
+                # 刚登出过要重新走登录入口；窗口开着但没停在助手上（刚重启/
+                # 停在空白页）也要带到登录页。已经在登录墙上就别动了——
+                # 用户可能正登着。
+                try:
+                    page.goto(PLATFORM, wait_until="domcontentloaded", timeout=45000)
+                except Exception:  # noqa: BLE001  导航失败不致命，窗口反正已经开了
+                    pass
+            return {"logged_in": bool(self._logged_in(page))}
+        return self.call(_go, timeout=150)
 
     # ── 对外：查登录状态 / 取昵称头像 ─────────────────────────────────────
     @staticmethod
@@ -481,7 +425,7 @@ class Session:
             pass
         return info
 
-    def _state(self) -> dict:
+    def _state(self, hard: bool = False) -> dict:
         page = self._pick_page()
         if not self._logged_in(page):
             # 别每次都重新导航：没登录时页面本来就停在登录页，重新取二维码由前端触发。
@@ -497,22 +441,44 @@ class Session:
             # 用户看到的正是「扫完码没反应」。
             if not self._logged_in(page) and not self._dom_logged_in(page):
                 return {"logged_in": False}
+        elif hard:
+            # 看着像登录 ≠ 真登录（2026-11-14 实测）：会话早被平台踢了，但残留的
+            # 旧标签页还停在上一回渲染好的后台页上——地址栏和 DOM 都在骗人，
+            # 账号卡一直亮「已登录」，实际每个读取都撞登录墙，扫码轮询还会把
+            # 刚摆出来的码误判成「已登录」直接关掉。真导航一次才算数：cookie
+            # 活着就停在后台页，死了会被弹回登录墙。
+            # **登录确认进行中绝不能导航**（地址在 oauth 回调、或码框还挂着 =
+            # 用户手机刚点了确认）：这时 goto 会让这次登录当场作废。放行，
+            # 交给下一轮轮询出结论。
+            mid = "/oauth" in (page.url or "") or self._qr_frame(page) is not None
+            if not mid:
+                try:
+                    page.goto(PLATFORM, wait_until="domcontentloaded", timeout=45000)
+                    page.wait_for_timeout(1500)
+                except Exception:  # noqa: BLE001
+                    pass
+                if not self._logged_in(page) and not self._dom_logged_in(page):
+                    return {"logged_in": False}
         return self._profile(page)
 
-    def state(self) -> dict:
-        """查登录态。**这一步不许切无头**：它属于扫码流程，浏览器得留着。"""
-        return self.call(lambda _s: self._state(), timeout=45)
+    def state(self, hard: bool = False) -> dict:
+        """查登录态。**这一步不许切无头**：它属于扫码流程，浏览器得留着。
 
-    # ── 对外：诊断（只在排查「扫了没反应」时用）────────────────────────────
+        hard=True：对「看着像登录」的旧标签页也做一次真导航验证，用来回答
+        「这个号现在到底还能不能用」。代价是一次真实页面跳转，别放进高频轮询。
+        """
+        return self.call(lambda _s: self._state(hard), timeout=45)
+
+    # ── 对外：诊断（只在排查「登录了没反应」时用）────────────────────────
     def _diag(self) -> dict:
-        """把浏览器内部真实状态倒出来：有哪些标签、停在哪个网址、
-        二维码 iframe 里写着什么（微信会在 iframe 里写「二维码已失效」这类字）。
+        """把浏览器内部真实状态倒出来：有哪些标签、停在哪个网址、帧列表。
 
-        为什么要有这个：扫码失败时外面只能看到 `logged_in: false`，无法区分
-        「码过期了」「手机没点确认」「微信拦了自动化」。没这个就只能猜。
+        为什么要有这个：登录失败时外面只能看到 `logged_in: false`，分不清是
+        「窗口被关掉了」「停在别的页上」还是「微信拦了自动化」。没这个只能猜。
+        登录页本身用户就看得见，这里不再去抓页面上的字。
         """
         page = self._pick_page()
-        out: dict = {"url": "", "pages": [], "frames": [], "qr_text": "", "qr_src": ""}
+        out: dict = {"url": "", "pages": [], "frames": []}
         try:
             out["url"] = page.url or ""
         except Exception:  # noqa: BLE001
@@ -527,17 +493,6 @@ class Session:
                 out["frames"].append((f.url or "")[:160])
         except Exception:  # noqa: BLE001
             pass
-        fr = self._qr_frame(page)
-        if fr:
-            try:
-                out["qr_text"] = " ".join((fr.locator("body").inner_text(timeout=2000) or "").split())[:160]
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                src = fr.locator('img[src*="/connect/qrcode/"]').get_attribute("src", timeout=2000)
-                out["qr_src"] = (src or "")[:120]
-            except Exception:  # noqa: BLE001
-                pass
         return out
 
     def diag(self) -> dict:

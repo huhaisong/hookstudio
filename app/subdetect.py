@@ -328,8 +328,6 @@ def detect_spans(src: str, dur: float, band: dict | None = None,
     3.02 秒就出现、3.25 秒才被抽到。外扩后宁可多抹 0.25 秒——那段本来就是
     同一块背景，抹掉看不出来；反过来不外扩，开头半个字会留在画面上。
     """
-    import numpy as np
-
     band = band if band else detect(src, dur)
     if not band:
         return None

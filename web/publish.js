@@ -17,15 +17,28 @@
     // 防搬运建议一致（2026-11-14 用户定），要用别的档随时点。
     // hist = 右栏当前在「队列 / 已提交」哪个视图（2026-11-14 新增已提交任务）。
     first: "", gap: 30, plan: null, planTimer: null, poll: null, hist: false,
-    key: "", scan: null, edit: null, picker: null, opts: {}, optBusy: {},
+    key: "", edit: null, picker: null, opts: {}, optBusy: {},
+    verifiedCur: "",   // 本次页面会话已经真导航核对过登录态的当前号（切号即验号）
     // 选好号后的静默预取：optFor 记住已经备好的是哪个号，optSeq 用来丢弃
     // 切号之前发出的旧响应，optState 只是 ② 里一行小字，不弹窗不打断。
     optFor: "", optSeq: 0, optState: "", optFailAt: 0,
+    // optRefreshAid：同一个号同时只允许一次强制重读（手动 / 静默共用），
+    // 别往单线程 session 队列里排两个 18 秒。optNote 是「先用着上次读的」说明。
+    optRefreshAid: "", optNote: "", optStale: false,
+    // 候选读取「用户看得见」的状态：什么时候开始读、是不是第一次、上次读好
+    // 是什么时候。阶段文案只改那一行字的 textContent，绝不整块重画字段区
+    // （用户可能正在标题/话题里打字）。
+    optLoadingAt: 0, optFirstRead: false, optReadAt: 0, optStageTimer: 0,
+    // 已提交列表的筛选：全部 / 要处理的 / 已完成的
+    qfilter: "all",
     // 当前选中的号只由 /api/publish/queue 下发（current_account_id），前端不存：
     // 刷新、多开页面都只会看到服务端那一份，避免界面显示 A、实际发到 B。
     tab: "pub", aid: "", stat: null, diag: null, mon: null,
     statBusy: false, diagBusy: false, abn: null, delBusy: false, openBusy: false,
-    fix: null,   // 「登录失效就地出码」的扫码卡；null＝没在修
+    // 登录会话：null＝没在登录。添加账号/重登/失效兜底全走这一个状态，
+    // 后端负责弹出可见浏览器窗口，前端只提示 + 轮询登录态（2026-11-14 用户定：
+    // 界面里不再显示二维码）。
+    login: null,
   };
 
   // 状态名一律说人话（2026-11-14 用户：「清空未排期」「撤回排期」这种词
@@ -40,13 +53,14 @@
     manual:    ["要你手动发", "bad"],
     failed:    ["失败", "bad"],
     skipped:   ["已取消", "mute"],
+    uncertain: ["结果待核实", "bad"],
   };
 
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const pad = (n) => String(n).padStart(2, "0");
   /** 拉候选要开一次浏览器。后端最坏 150 秒，前端不能跟着无限转：
-   *  超时就恢复按钮并把话说明白，不然用户只看到「正在读剧集」永远不动。
+   *  超时就恢复按钮并把话说明白，不然用户只看到「正在从号里读」永远不动。
    *  底层请求不取消（同号 session 单线程，硬取消只会把队列搅乱），
    *  迟到的响应由 optSeq 丢弃。 */
   function apiT(path, opts, ms) {
@@ -128,8 +142,8 @@
       gotoPubTab(S.tab || "pub");
     } else {
       stopPoll();
-      stopScanPoll();
-      S.scan = null;
+      stopLoginPoll();
+      S.login = null;
     }
   }
 
@@ -150,9 +164,11 @@
     if (which === "pub") {
       load();
       startPoll();
+      // 登录面板挂在全局账号条上，切 Tab 不收起它——回来时把轮询接上，
+      // 否则面板会一直停在「正在登录」，其实早就登好了。
+      if (S.login && !S.login.opening && !S.login.timer) startLoginPoll();
     } else {
       stopPoll();
-      stopScanPoll();
     }
     paintGlobalAcc();
     if (which === "stat") renderStat();
@@ -533,40 +549,88 @@
     if (prevAid !== S.aid) {
       // 这个页面或别的页面切了号：旧号的数据一律作废，绝不留在新号页面上
       S.stat = null; S.diag = null; S.mon = null; S.abn = null;
-      S.opts = {}; S.optFor = ""; S.optSeq++;
+      S.opts = {}; S.optFor = ""; S.optState = ""; S.optSeq++;
+      S.verifiedCur = "";          // 新号还没验过：下一轮 load 会补一次核对
       if (S.tab === "stat") renderStat(true);
       if (S.tab === "diag") renderDiag(true);
     }
     const key = JSON.stringify((d.jobs || []).map((j) => [j.id, j.status, j.plan_at, j.title]))
       + (d.gate ? d.gate.ok + d.gate.reason : "");
-    if (quiet && key === S.key) { paintBadge(d); paintGlobalAcc(); ensureOpts(); reconcileAccounts(); return; }
+    if (quiet && key === S.key) { paintBadge(d); paintGlobalAcc(); optWaitTick(); ensureOpts(); reconcileAccounts(); return; }
     S.key = key;
     render();
     maybePlan();
     paintBadge(d);
+    optWaitTick();
     ensureOpts();
     reconcileAccounts();
-    maybeAutoFix(d);
+    // 失效兜底的登录面板跟号走：目标号恢复了 / 当前号切走了 → 收面板。
+    // 不收的话，卡片会挂在一个跟当前操作无关的号上，看着像「当前号坏了」
+    // （2026-11-14 用户反馈：当前号明明已登录，却挂着别的号的失效卡）。
+    // 只对 auto 弹的生效：用户主动添加的号在登完之前还不是「当前号」，
+    // 拿当前号去比会把刚建的空壳当场删掉。
+    if (S.login && S.login.auto) {
+      const tgt = (d.accounts || []).find((a) => a.id === S.login.aid);
+      if (!tgt || tgt.state === "online" || currentAid() !== S.login.aid) cancelLogin(true);
+    }
+    maybeAutoLogin(d);
+    // 页面打开后的第一次 load：当前号哪怕亮着「已登录」也真核对一次
+    // （2026-11-14 用户反馈：会话被踢了卡片还亮着已登录，等到读取失败才发现）
+    if (!S.verifiedCur && currentAid()) verifyOnSwitch(currentAid());
   }
 
-  /** 当前号的登录态是「过期」→ 自动摆出就地出码的扫码卡
+  /** 当前号的登录态是「过期」→ 自动弹出登录窗口
    *  （2026-11-14 用户要求：「选择了登录过期的账号，不应该是到扫码的时候了吗」）。
-   *  一次页面会话每个号只自动摆一次；用户点「取消」后不再纠缠。
-   *  摆卡本身会自查登录态：其实已经续上了就直接收摊，不会让人白扫。 */
-  function maybeAutoFix(d) {
+   *  一次页面会话每个号只自动弹一次；用户点「取消」后不再纠缠。
+   *  要不要弹本身会先自查登录态：其实已经续上了就直接收摊。 */
+  function maybeAutoLogin(d) {
     const cur = d && d.current_account;
-    if (!cur || cur.state !== "expired" || S.scan || S.fix) return;
-    S.fixOffered = S.fixOffered || {};
-    if (S.fixOffered[cur.id]) return;
-    S.fixOffered[cur.id] = true;
-    openFix(cur.id, true);
+    if (!cur || cur.state !== "expired" || S.login) return;
+    S.loginOffered = S.loginOffered || {};
+    if (S.loginOffered[cur.id]) return;
+    S.loginOffered[cur.id] = true;
+    openLogin(cur.id, { auto: true, label: accLabel(cur.id) });
+  }
+
+  /** 切号即验号（2026-11-14 用户定，回应两个实拍问题）：
+   *  ① 状态是本地簿记——会话被平台踢了卡片还亮着「已登录」（重启服务后
+   *     尤其如此，对账逻辑只复查非 online 的号）；② 切到「登录过期」的号
+   *     以前只被动等读取失败/轮询兜底，用户还得手点「重登」。
+   *  现在切到哪个号就对哪个号真导航核对一次：online 的也验（防假已登录），
+   *  非 online 一律直接弹出登录窗口。
+   *  fromSwitch：切号触发的 = 用户明确要用这个号，清掉「只弹一次」的礼貌闸
+   *  直接弹窗；页面加载触发的 = 被动兜底，尊重用户之前点过的「取消」。 */
+  async function verifyOnSwitch(aid, fromSwitch) {
+    if (!aid || S.login) return;
+    S.verifiedCur = aid;        // 本次页面会话验过了，load() 不再重复
+    const acc = ((S.d && S.d.accounts) || []).find((x) => x.id === aid) || {};
+    if (acc.state === "online") {
+      try {
+        // hard=1 真导航：落在登录墙 = 会话死了，后端会就地标成 expired。
+        // r.error 是浏览器层出错（号可能在忙上传），不武断下结论。
+        const r = await apiT(`/api/publish/accounts/${aid}/login-state?hard=1`,
+          {}, 50000);
+        if (!r || r.error || r.logged_in !== false) return;   // 真登录着，没事
+        // 状态就地刷新（r.accounts 是后端更新过的全量账号卡），别等下一轮轮询；
+        // 只重画账号条，别整页 render（用户可能正打着字）
+        if (r.accounts && S.d) { S.d.accounts = r.accounts; paintGlobalAcc(); }
+      } catch (e) { return; }   // 核对失败不打扰：读取失败时 probeLoginOnFail 还会兜
+    }
+    if (S.login) return;   // 核对这几十秒里别的流程已经开了登录窗口，别抢
+    const cur = ((S.d && S.d.accounts) || []).find((x) => x.id === aid) || {};
+    if (cur.state && cur.state !== "online") {
+      S.loginOffered = S.loginOffered || {};
+      if (!fromSwitch && S.loginOffered[aid]) return;   // 用户取消过：不再纠缠
+      delete S.loginOffered[aid];   // 切号触发 = 明确要用这个号，直接弹窗
+      openLogin(aid, { auto: true, label: accLabel(aid) });
+    }
   }
 
   /** 对一遍账：把每个号的**真实**登录态读回来，更新列表。
    *
    *  为什么要有：账号状态是存在本地的。登录那一刻如果前端没赶上（页面刷新、
-   *  轮询被浏览器打断、窗口被关），库里就永远停在「待扫码」，而实际早就登录
-   *  好了 —— 用户看到的就是「明明已经登录了，还一直说要扫码」
+   *  轮询被浏览器打断、窗口被关），库里就永远停在「待登录」，而实际早就登录
+   *  好了 —— 用户看到的就是「明明已经登录了，还一直说要登录」
    *  （2026-11-13 用户反馈）。打开页面时对一次账，这条路就通了。
    */
   let lastReconcile = 0;
@@ -586,46 +650,148 @@
     } catch (e) { /* 对账失败不打扰，下一轮再来 */ }
   }
 
+  /** 这个号的批量上传还占着浏览器吗：「排到即上传」，queued/publishing 的
+   *  条目会一条条占住这个号的 session 线程（每条好几分钟）。预取排进去只会
+   *  白等 95 秒然后超时，最后被当成「没读到选项」——其实号没坏，是在忙。 */
+  function accBusy(aid) {
+    return ((S.d && S.d.jobs) || []).some((j) =>
+      j.account_id === aid && (j.status === "queued" || j.status === "publishing"));
+  }
+
+  /** 等待态/失败态跟着上传进度走（轮询每次都问一遍）：
+   *  - 号忙 → 失败态改成等待态（说明白「在传上一批」，不是坏了）；
+   *  - 号忙完 → 等待态自动补读一次，用户不用盯也不用挨个点重试。 */
+  function optWaitTick() {
+    const aid = currentAid();
+    if (!aid) return;
+    const busy = accBusy(aid);
+    if (S.optState === "fail" && busy) {
+      S.optState = "wait"; S.optFor = aid;
+      refreshFields();
+    }
+    if (S.optState === "wait" && !busy) ensureOpts(true);
+  }
+
+  /** 候选回来了只重画 ②：用户正在这个区里打字时先别重画，数据留在
+   *  S.opts，等焦点离开补一次，绝不把打到一半的字清掉。 */
+  function safeRefreshFields(retry) {
+    const ae = document.activeElement;
+    const typing = ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName || "")
+      && ae.closest && ae.closest("#pub-fields");
+    if (typing) {
+      if (!retry) setTimeout(() => safeRefreshFields(true), 1200);
+      return;
+    }
+    refreshFields();
+  }
+
+  /** 把一次批量读取的结果放进 S.opts。主请求和后台静默更新共用一份。 */
+  function applyOpts(r) {
+    ["declare", "link"].forEach((k) => { if (r[k]) S.opts[k] = r[k]; });
+    // 位置是用户输词才搜出来的，批量预取里那一支永远是「输入地名」空占位。
+    // 别让后台更新一次就把刚选好的地址洗没了。
+    if (r.location && !(S.opts.location && (S.opts.location.items || []).length)) {
+      S.opts.location = r.location;
+    }
+  }
+
   /** 选好号就把这个号能自动读的候选一次拉全。
    *
-   *  「无感」= 不弹提示、不整页重画、不挡住任何输入：只在 ② 里放一行小字，
-   *  回来后把它换成下拉。走的是**一个**批量接口，不是连发三个单项 ——
-   *  session 的 page 是复用的，同一号的操作排在一个线程里，连发会各开一次
-   *  浏览器、串行排队二十多秒，还会互相踩「弹层正在点」的状态。
+   *  候选按号缓存在后端（data/options_cache/）：开页命中缓存是毫秒级，只有
+   *  第一次 / 缓存过期 / 点「重新读一次」才真开一次浏览器（约 18 秒）。
+   *  过期时后端先把旧数据给出来，再由 silentRefreshOpts 在后台悄悄更新，
+   *  全程不摆加载条、不整页重画、不挡任何输入。
    *
+   *  仍然只走**一个**批量接口：session 的 page 是复用的，同一号的操作排在
+   *  一个线程里，连发会各开一次浏览器、串行排队，还会互相踩弹层状态。
    *  位置不预取：平台要地名才给候选，没关键词时读不到任何东西。
    */
-  function ensureOpts(force) {
+  function ensureOpts(force, refresh) {
     const aid = currentAid();
     if (!aid) { S.optFor = ""; return; }
     const acc = ((S.d && S.d.accounts) || []).find((x) => x.id === aid) || {};
     if (acc.state !== "online") return;
-    if (!force && S.optFor === aid) return;
+    if (!force && !refresh && S.optFor === aid) return;
     // load() 是轮询，失败后别每隔几秒就重开一次浏览器；单项手动重试不受限
     if (!force && Date.now() - (S.optFailAt || 0) < 5 * 60 * 1000) return;
+    // 同一个号已有一次强制重读在跑：别再排一个 18 秒进单线程队列
+    if (refresh && S.optRefreshAid === aid) return;
+    // 号在传上一批：预取只会排队白等，摆个等待态；传完 load() 里的
+    // optWaitTick 会自动补读。急的用户仍可以点字段里的按钮单项读。
+    if (accBusy(aid)) {
+      S.optFor = aid;
+      S.optState = "wait";
+      stopOptStage();
+      refreshFields();
+      return;
+    }
     S.optFor = aid;
     const seq = ++S.optSeq;
     S.optState = "loading";
+    S.optLoadingAt = Date.now();
+    S.optFirstRead = !(S.opts.declare || S.opts.link);
+    if (refresh) S.optRefreshAid = aid;
     refreshFields();
-    apiT(`/api/publish/options/all?aid=${encodeURIComponent(aid)}`)
+    startOptStage();
+    const url = `/api/publish/options/all?aid=${encodeURIComponent(aid)}`
+      + (refresh ? "&refresh=1" : "");
+    apiT(url)
       .then((r) => {
         // 中途换了号：旧响应直接丢，别把上一个号的剧集塞给这个号
         if (seq !== S.optSeq || currentAid() !== aid) return;
         if (!r || r.error) {
           S.optFor = ""; S.optFailAt = Date.now(); S.optState = "fail";
-          refreshFields();
+          S.optNote = (r && r.note) || "";
+          stopOptStage();
+          safeRefreshFields();
           probeLoginOnFail(aid);   // 失败最常见的原因就是登录掉了，问一句
           return;
         }
-        ["declare", "link", "location"].forEach((k) => { if (r[k]) S.opts[k] = r[k]; });
+        applyOpts(r);
         S.optState = "";
-        refreshFields();
+        S.optNote = r.note || "";
+        S.optStale = !!r.stale;
+        S.optReadAt = r.cached ? Date.now() - (r.age || 0) * 1000 : Date.now();
+        stopOptStage();
+        safeRefreshFields();
+        if (r.login) probeLoginOnFail(aid);
+        if (!r.cached) toast(refresh ? "选项更新好了" : "这个号的选项读好了");
+        // 后端说这份是旧的：号空闲就静默更新，界面上一直留着可用的旧选项
+        if (r.stale && !r.refreshing && !refresh) silentRefreshOpts(aid);
       })
       .catch(() => {
         if (seq !== S.optSeq) return;
         S.optFor = ""; S.optFailAt = Date.now(); S.optState = "fail";
-        refreshFields();
+        stopOptStage();
+        safeRefreshFields();
         probeLoginOnFail(aid);     // 95 秒超时这种，多半也是卡在登录页上
+      })
+      .finally(() => {
+        if (refresh && S.optRefreshAid === aid) S.optRefreshAid = "";
+      });
+  }
+
+  /** 缓存过期后的后台更新：不摆加载条、不整页重画、不弹窗。
+   *  号在传上一批就跳过（别去 session 单线程队列里挤），等 optWaitTick
+   *  忙完补读时自然还会再试。响应只更新下拉，绝不因 stale 再触发一次自己。 */
+  function silentRefreshOpts(aid) {
+    if (S.optRefreshAid === aid || accBusy(aid)) return;
+    S.optRefreshAid = aid;
+    const seq = S.optSeq;
+    apiT(`/api/publish/options/all?aid=${encodeURIComponent(aid)}&refresh=1`)
+      .then((r) => {
+        if (seq !== S.optSeq || currentAid() !== aid) return;
+        if (r && !r.error) {
+          applyOpts(r);
+          S.optNote = r.note || "";
+          S.optStale = !!r.stale;
+          S.optReadAt = Date.now();
+          safeRefreshFields();
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (S.optRefreshAid === aid) S.optRefreshAid = "";
       });
   }
 
@@ -676,17 +842,36 @@
     const accounts = d.accounts || [];
     const jobs = d.jobs || [];
     const drafts = jobs.filter((j) => j.status === "draft").length;
-    const queuedN = jobs.filter((j) => j.status === "queued").length;
     // 队列 = 设置工作台（还没安排的草稿）；已提交 = 点完「开始上传」的
     // 后台任务（等着传 / 正在传 / 已定时 / 已提交 / 已发布 / 失败 / 已取消）。
     // 开始上传成功后队列清空、通用设置恢复默认，下一批从头填
     // （2026-11-14 用户定稿：后台任务不占设置工作台）。
     const draftJobs = jobs.filter((j) => j.status === "draft");
     const submittedJobs = jobs.filter((j) => j.status !== "draft");
-    const failedN = submittedJobs.filter((j) => j.status === "failed").length;
+    // 已提交按号隔离（2026-11-14 用户反馈「切号后队列数据没变」）：任务自己
+    // 带着账号走，右边就只看当前号的；没选号时不过滤（页面刚打开还没号，
+    // 全部摆出来，选了号再看自己的）。草稿属于设置工作台，跟号无关，不过滤。
+    const cur = currentAid();
+    const mySubmitted = cur
+      ? submittedJobs.filter((j) => j.account_id === cur) : submittedJobs;
+    const otherSubmitted = cur
+      ? submittedJobs.filter((j) => j.account_id !== cur) : [];
+    const queuedN = mySubmitted.filter((j) => j.status === "queued").length;
+    const failedN = mySubmitted.filter((j) => j.status === "failed").length;
     const noAcc = !currentAid();
+    // 已提交一多（真号 20+ 条很常见）就得能一眼找到要管的那条
+    const TODO_ST = ["queued", "publishing", "failed", "uncertain", "manual"];
+    const todoN = mySubmitted.filter((j) => TODO_ST.includes(j.status)).length;
+    const qf = S.qfilter || "all";
+    const shownSubmitted = qf === "todo"
+      ? mySubmitted.filter((j) => TODO_ST.includes(j.status))
+      : qf === "done"
+        ? mySubmitted.filter((j) => !TODO_ST.includes(j.status))
+        : mySubmitted;
     const startTxt = noAcc ? "先在上面账号条选号"
       : `开始上传（${drafts} 条）`;
+    // 右侧预览里的警告容易漏看，在开始按钮旁再摆一条精简版（完整版进 title）
+    const warnMsg = ((S.plan && (S.plan.warns || [])[0]) || {}).msg || "";
     BODY().innerHTML = `
       <div class="pub-cols">
         <div class="pub-left">
@@ -698,9 +883,12 @@
               <button class="ghost sm" data-act="pickdir">＋ 选文件夹</button>
               <button class="ghost sm" data-act="pickfiles">＋ 选视频文件</button>
               <button class="ghost sm" data-act="pickproj">＋ 从项目挑</button>
-              <span class="hint">已选 ${S.sel.size} 条</span>
-              <button class="primary sm" data-act="add" ${S.sel.size && !noAcc ? "" : "disabled"}>加入队列</button>
+              <span class="hint">${noAcc ? "先在上面账号条选一个号"
+                : S.sel.size ? `已选 ${S.sel.size} 条` : "先勾几条视频"}</span>
+              <button class="primary sm" data-act="add" ${S.sel.size && !noAcc ? "" : "disabled"}
+                title="${noAcc ? "先在上面账号条选一个号" : !S.sel.size ? "先勾几条视频" : "把勾中的视频加进队列"}">加入队列</button>
             </div>
+            <div class="hist-chips" id="pub-hist-dir"></div>
           </section>
 
           <section class="pub-sec">
@@ -736,7 +924,7 @@
               标成失败，不会假装发成功。全部传完后电脑关了都没关系——到点平台自己发。
               上传一条要几分钟且逐条来，所以第一条时间别贴着现在排。</p>
               <p><b>传上去之前反悔</b>：在「已提交」里，等着上传的行内点「不上传这条」
-              退回队列；失败的行内有「重试」「扫码重登」。整批都不要了，
+              退回队列；失败的行内有「重试」「重新登录」。整批都不要了，
               点「已提交」下面的「批量取消」。
               <b>已经传到平台上的，程序删不掉</b>——要撤就去视频号助手
               （右上角「进入视频号助手」直达）的「待发布」里自己删。</p>
@@ -750,29 +938,64 @@
           <div class="pub-qhead">
             <div class="seg pub-qtabs">
               <button class="pub-qtab${S.hist ? "" : " on"}" data-act="qtab" data-hist="0">队列${draftJobs.length ? " " + draftJobs.length : ""}</button>
-              <button class="pub-qtab${S.hist ? " on" : ""}" data-act="qtab" data-hist="1">已提交${submittedJobs.length ? " " + submittedJobs.length : ""}</button>
+              <button class="pub-qtab${S.hist ? " on" : ""}" data-act="qtab" data-hist="1">已提交${mySubmitted.length ? " " + mySubmitted.length : ""}</button>
             </div>
           </div>
           ${!S.hist ? `
           <div id="pub-plan" class="pub-plan"></div>
           ${draftJobs.length ? `<div class="pub-rows">${draftJobs.map((j, i) => row(j, i)).join("")}</div>`
             : `<div class="pub-empty">队列是空的。左边选好视频、设好时间和内容，点「开始上传」。</div>`}
+          <div class="pub-start-warn" id="pub-start-warn"
+            style="${(drafts && warnMsg) ? "" : "display:none"}"
+            title="${esc(warnMsg)}">${esc(
+              warnMsg.length > 88 ? warnMsg.slice(0, 88) + "…" : warnMsg)}</div>
           <div class="pub-foot">
             <button class="ghost sm" data-act="clear" ${noAcc || !drafts ? "disabled" : ""}
               title="把「还没安排」的条目从队列里删掉">删掉没安排的${drafts ? `（${drafts} 条）` : ""}</button>
             ${drafts || noAcc ? `<button class="primary" data-act="start" ${noAcc ? "disabled" : ""}>${startTxt}</button>` : ""}
           </div>`
-          : (submittedJobs.length
-            ? `${failedN ? `<div class="pub-acts"><button class="ghost sm" data-act="retryAll">重试失败 ${failedN} 条</button></div>` : ""}
-              <div class="pub-rows">${submittedJobs.map((j, i) => row(j, i)).join("")}</div>
+          : (mySubmitted.length
+            ? `${failedN ? `<div class="pub-acts"><button class="ghost sm" data-act="retryAll" title="只重试当前号的失败条目">重试失败 ${failedN} 条</button></div>` : ""}
+              <div class="pub-qfilters">
+                <button class="pub-qf${qf === "all" ? " on" : ""}" data-act="qfilter" data-f="all">全部 ${mySubmitted.length}</button>
+                <button class="pub-qf${qf === "todo" ? " on" : ""}" data-act="qfilter" data-f="todo">要处理的 ${todoN}</button>
+                <button class="pub-qf${qf === "done" ? " on" : ""}" data-act="qfilter" data-f="done">已完成的 ${mySubmitted.length - todoN}</button>
+              </div>
+              ${shownSubmitted.length
+                ? `<div class="pub-rows">${shownSubmitted.map((j) => row(j, mySubmitted.indexOf(j))).join("")}</div>`
+                : `<div class="pub-empty">这一类现在是空的，切到「全部」看其它条目。</div>`}
               <div class="pub-foot">
             <button class="ghost sm" data-act="stop" ${noAcc || !queuedN ? "disabled" : ""}
-              title="取消还在排队、没上传的条目，退回队列重新设置；已经传到平台的取消不了，得到视频号助手手动删">批量取消${queuedN ? `（${queuedN} 条）` : ""}</button>
-              </div>`
-            : `<div class="pub-empty">还没有提交过的任务。点「开始上传」之后，交出去的都在这里跟踪。</div>`)}
+              title="取消当前号还在排队、没上传的条目，退回队列重新设置；已经传到平台的取消不了，得到视频号助手手动删">批量取消${queuedN ? `（${queuedN} 条）` : ""}</button>
+              </div>
+              ${otherSubmitted.length ? `<div class="pub-acts"><span class="hint">另外有 ${otherSubmitted.length} 条任务在别的号上，切到那个号就能看到。</span></div>` : ""}`
+            : `<div class="pub-empty">这个号还没有提交过的任务。点「开始上传」之后，交出去的都在这里跟踪。</div>
+              ${otherSubmitted.length ? `<div class="pub-acts"><span class="hint">另外有 ${otherSubmitted.length} 条任务在别的号上，切到那个号就能看到。</span></div>` : ""}`)}
         </aside>
       </div>`;
+    paintHist();
   }
+
+  /** ①「最近用过」的文件夹：后端记着每次确认过的位置（app/pickmem.py），
+   *  点一下直接列出里面的视频，不再走一遍原生对话框。
+   *  同一批素材天天发，这一步本来纯属多余；选好之后这块就撤掉，不占地方。 */
+  async function paintHist() {
+    const box = document.getElementById("pub-hist-dir");
+    if (!box) return;
+    if (S.cand.length || S.picker === "proj") { box.innerHTML = ""; return; }
+    let items = [];
+    try {
+      const r = await api("/api/pick-history?key=publish_dir&limit=3");
+      items = (r && r.items) || [];
+    } catch (e) { return; }
+    if (!document.body.contains(box)) return;       // 期间整页重画过了，别写进死节点
+    box.innerHTML = items.length
+      ? `<span class="hist-l">最近用过</span>` + items.map((it) =>
+        `<button class="hist-chip" data-act="recentdir" data-path="${esc(it.path)}"
+          title="${esc(it.path)}">${esc(tailDir(it.path))}</button>`).join("")
+      : "";
+  }
+
 
   // ── ① 选视频 ──────────────────────────────────────────────────────────
   function candBox() {
@@ -829,11 +1052,9 @@
   function globalAccBox(d) {
     const aid = (d && d.current_account_id) || "";
     const a = d && d.current_account;
-    // 「登录失效就地出码」：二维码卡挂在全局账号条下面，三个 Tab 都看得见。
-    const fix = S.fix ? fixBox() : "";
     if (!aid || !a) {
       return `<div class="pub-cur none global"><span>当前账号</span>
-        <b>还没选号</b><em>在下面点一张账号卡片就行。</em></div>${fix}`;
+        <b>还没选号</b><em>在下面点一张账号卡片就行。</em></div>`;
     }
     return `<div class="pub-cur global">
       <div class="pub-cur-l">
@@ -841,161 +1062,201 @@
         <b>${esc(a.label || a.name || aid)}</b>
         <em>点别的账号卡片可切换；提交过的任务在右边「已提交」里</em>
       </div>
-    </div>${fix}`;
+    </div>`;
   }
 
-  // ── 登录失效就地出码（2026-11-14）────────────────────────────────────
-  // 以前候选/上传失败只会说「点一下重试」，用户不知道其实是登录掉了。
-  // 现在失败时先探一次登录态，掉线就直接在这儿摆二维码，扫码成功后
-  // 自动把候选重新读一遍。复用扫码框的样式，但状态独立（S.fix ≠ S.scan）。
-  function fixBox() {
-    const f = S.fix || {};
-    return `<div class="pub-scan fix">
-      <div class="pub-scan-qr">
-        ${f.qr ? `<img src="${esc(f.qr)}" alt="微信扫码重新登录视频号助手">`
-               : `<div class="pub-scan-wait">${f.busy ? "正在取二维码…" : "…"}</div>`}
-      </div>
+  // ── 登录（2026-11-14 用户定：一律弹可见浏览器窗口手动登录，界面里不再显示二维码）
+  // 只有一张面板、一个会话状态：添加账号 / 重登 / 切到失效号 / 读取失败兜底
+  // 都走这里。以前 S.scan 与 S.fix 两套并行，同屏能摆两张卡、各挂一个定时器。
+  /** 登录面板：后端把视频号助手的登录页弹成可见窗口，用户对着真窗口登录
+   *  （快捷登录卡、换码、过期刷新平台自己会做），这边只提示 + 等结果。 */
+  function loginBox() {
+    const L = S.login || {};
+    const title = L.label ? `「${esc(L.label)}」要重新登录` : "在弹出的浏览器窗口里登录";
+    return `<div class="pub-scan">
       <div class="pub-scan-side">
-        <b>「${esc(f.label || "这个号")}」的登录失效了</b>
-        <p>用微信扫一扫上面的码，登录视频号助手${f.fallback ? "（截图取不到，弹了一个窗口，在那个窗口里扫）" : ""}。
-           扫完之后候选会自动重新读，不用刷新页面。</p>
-        ${f.err ? `<p class="bad">${esc(f.err)}</p>` : ""}
-        <div class="pub-scan-btns">
-          <button class="ghost sm" data-act="fixRescan">换一张二维码</button>
-          <button class="ghost sm" data-act="fixCancel">取消</button>
+        <b>${title}</b>
+        <p>${L.opening ? "正在打开浏览器窗口…" : "浏览器窗口已经打开了。"}
+          在里面点 <b>「微信快捷登录」</b>，<b>手机上确认一下</b>，这边就自动往下走。</p>
+        <p class="mini-note">登录成功会自动重读这个号的选项，不用刷新页面。
+          那个窗口留着别关，之后上传视频还要用它。</p>
+        ${L.err ? `<p class="bad">${esc(L.err)}</p>` : ""}
+        <div class="pub-acts">
+          <button class="ghost sm" data-act="loginRetry">再开一次窗口</button>
+          <button class="ghost sm" data-act="loginCancel">取消</button>
         </div>
       </div>
     </div>`;
   }
 
-  function paintFix() { paintGlobalAcc(); }
+  function paintLogin() { paintGlobalAcc(); }
 
   /** 顶部全局账号条的全部内容（骨架 #pub-global-acc 里，三个 Tab 共用）。
    *  2026-11-14 用户定：确认账号是发布/数据/诊断一切操作的前提，
    *  不是排片流程的一个步骤——从发布页步骤里挪出来，步骤只剩
-   *  选视频 → 通用设置 → 什么时候发。登录失效的就地出码卡（fix）也挂这儿。 */
+   *  选视频 → 通用设置 → 什么时候发。登录面板也挂这儿，三个 Tab 都看得见。 */
   function accountBar(d) {
     const accs = (d && d.accounts) || [];
     const head = globalAccBox(d);
-    if (S.scan) return `${head}${scanBox()}`;
+    if (S.login) return `${head}${loginBox()}`;
     return `${head}
       <div class="pub-acc-wrap">
         ${accs.length ? `<div class="pub-accs">${accs.map(accCard).join("")}</div>`
-          : `<div class="pub-empty">还没登录过账号。点「添加账号」，用微信扫一下就行。</div>`}
+          : `<div class="pub-empty">还没登录过账号。点「添加账号」，会弹出浏览器窗口让你登录。</div>`}
         <div class="pub-acts">
-          <button class="ghost sm" data-act="addacc">＋ 添加账号（微信扫码）</button>
+          <button class="ghost sm" data-act="addacc">＋ 添加账号</button>
           <span class="hint">还能加 ${Math.max(0, (d && d.max_accounts || 10) - accs.length)} 个号</span>
         </div>
       </div>`;
   }
 
-  function stopFixPoll() {
-    if (S.fix && S.fix.timer) clearInterval(S.fix.timer);
-    if (S.fix) S.fix.timer = null;
+  function stopLoginPoll() {
+    if (S.login && S.login.timer) clearInterval(S.login.timer);
+    if (S.login) S.login.timer = null;
   }
 
-  async function openFix(aid, auto) {
+  /** 同时只允许一个登录会话（2026-11-14 用户定）：重登、添加账号、切号、
+   *  失效兜底，谁后到谁先把上一个会话**连轮询一起停掉**——只置空会让旧定时器
+   *  继续在后台跑，变成界面上看不见的轮询。 */
+  function endLogin() {
+    stopLoginPoll();
+    S.login = null;
+  }
+
+  /** 开一个登录会话：后端在**可见浏览器窗口**里打开视频号助手的登录页，
+   *  这边只提示 + 每 2.5 秒问一次登录态（不再截码塞进界面）。
+   *  force=true（重登）＝后端先清掉旧登录态，保证换一个微信登录。
+   *  auto=true＝失效号自动弹的，用户没点任何按钮，取消后本轮不再纠缠。
+   *  label 只在「已知是哪个号」时给（重登/失效），新加的号不猜名字。 */
+  async function openLogin(aid, opts) {
+    const o = opts || {};
     if (!aid) aid = currentAid();
     if (!aid) { toast("先在上面账号条选号"); return; }
-    stopFixPoll();
-    S.fix = { aid: aid, label: accLabel(aid), qr: "", err: "", busy: true,
-              timer: null, since: Date.now(), busyPoll: false, fails: 0,
-              fallback: false, auto: !!auto };
-    paintFix();
+    endLogin();
+    S.login = { aid: aid, label: o.label || "", err: "", opening: true,
+                busy: false, fails: 0, timer: null, auto: !!o.auto };
+    paintLogin();
     try {
-      // visible=0：先无头截图嵌进界面；后端截不到会自己弹窗兜底并回传 fallback。
-      const r = await apiT(`/api/publish/accounts/${aid}/qr?visible=0`,
+      const r = await apiT(`/api/publish/accounts/${aid}/login${o.force ? "?force=1" : ""}`,
         { method: "POST" }, 170000);
-      if (!S.fix || S.fix.aid !== aid) return;
-      if (r.logged_in && !r.qr) {
-        // 探测时又变回登录态了（可能刚好被别的流程续上）——直接收摊重读。
-        await fixDone(aid);
+      if (!S.login || S.login.aid !== aid) return;
+      if (r.logged_in) {
+        // 开窗口的途中登录已经续上了（可能刚好被别的流程救活）——直接收摊重读。
+        await loginDone();
         return;
       }
-      S.fix.qr = r.qr || "";
-      S.fix.fallback = !!r.fallback;
-      S.fix.busy = false;
-      paintFix();
-      startFixPoll();
+      S.login.opening = false;
+      paintLogin();
+      startLoginPoll();
     } catch (e) {
-      if (S.fix) { S.fix.busy = false; S.fix.err = e.message || "取二维码失败"; paintFix(); }
+      if (S.login) { S.login.opening = false; S.login.err = e.message || "打不开浏览器窗口"; paintLogin(); }
     }
   }
 
-  async function rescanFix(hard) {
-    if (!S.fix) return;
-    S.fix.err = ""; S.fix.busy = true; S.fix.qr = "";
-    paintFix();
+  /** 窗口被关了/没弹出来 → 再开一次（同一个号，沿用当前会话的 label/auto）。 */
+  async function reopenLogin() {
+    if (!S.login) return;
+    const aid = S.login.aid;
+    S.login.err = ""; S.login.opening = true;
+    paintLogin();
     try {
-      const r = await apiT(`/api/publish/accounts/${S.fix.aid}/qr?refresh=${hard ? 1 : 0}`
-        + `&force=${hard ? 1 : 0}&visible=0`, { method: "POST" }, 170000);
-      if (!S.fix) return;
-      if (r.logged_in && !r.qr) { await fixDone(S.fix.aid); return; }
-      S.fix.qr = r.qr || "";
-      S.fix.fallback = !!r.fallback;
-      S.fix.since = Date.now();
-      S.fix.busy = false;
-      paintFix();
-      startFixPoll();
+      const r = await apiT(`/api/publish/accounts/${aid}/login`,
+        { method: "POST" }, 170000);
+      if (!S.login || S.login.aid !== aid) return;
+      if (r.logged_in) { await loginDone(); return; }
+      S.login.opening = false;
+      paintLogin();
+      startLoginPoll();
     } catch (e) {
-      if (S.fix) { S.fix.busy = false; S.fix.err = e.message || "取不到码，点「换一张」再试"; paintFix(); }
+      if (S.login) {
+        S.login.opening = false;
+        S.login.err = e.message || "打不开浏览器窗口，再点一次试试";
+        paintLogin();
+      }
     }
   }
 
-  function startFixPoll() {
-    stopFixPoll();
-    if (!S.fix) return;
-    S.fix.busyPoll = false;
-    S.fix.fails = 0;
-    S.fix.timer = setInterval(async () => {
-      if (!S.fix) return;
-      if (S.fix.busyPoll) return;
-      if (Date.now() - (S.fix.since || 0) > QR_TTL) { await rescanFix(true); return; }
-      S.fix.busyPoll = true;
+  function startLoginPoll() {
+    stopLoginPoll();
+    if (!S.login) return;
+    S.login.busy = false;
+    S.login.fails = 0;
+    S.login.timer = setInterval(async () => {
+      if (!S.login) return;
+      // 上一轮还没回来就别再发：接口慢时请求会越堆越多，最后看着像「没反应」。
+      if (S.login.busy) return;
+      S.login.busy = true;
       try {
-        const r = await api(`/api/publish/accounts/${S.fix.aid}/login-state`);
-        if (!S.fix) return;
-        if (r.error) { S.fix.err = r.error; paintFix(); return; }
+        // hard=1：死会话残留的旧标签页会把这里误报成「已登录」，登录面板刚摆出来
+        // 就被自动收掉，用户根本没机会登录。后端对「登录确认进行中」会放行。
+        const r = await api(`/api/publish/accounts/${S.login.aid}/login-state?hard=1`);
+        if (!S.login) return;
+        if (r.error) { S.login.err = r.error; paintLogin(); return; }
         if (!r.logged_in) return;
-        await fixDone(S.fix.aid);
+        await loginDone();
       } catch (e) {
-        if (!S.fix) return;
-        S.fix.fails = (S.fix.fails || 0) + 1;
-        if (S.fix.fails <= 3) { S.fix.err = e.message || "连不上本地服务"; paintFix(); }
+        // 不静默吞掉：登录完「没反应」最常见的原因就是这里连着报错却一个字不说。
+        if (!S.login) return;
+        S.login.fails = (S.login.fails || 0) + 1;
+        if (S.login.fails <= 3) { S.login.err = e.message || "连不上本地服务"; paintLogin(); }
       } finally {
-        if (S.fix) S.fix.busyPoll = false;
+        if (S.login) S.login.busy = false;
       }
-    }, 2500);
+    }, 10000);
   }
 
-  async function fixDone(aid) {
-    stopFixPoll();
-    const label = S.fix ? S.fix.label : "";
-    S.fix = null;
-    paintFix();
-    // 候选是按号缓存的，登录态变了就得重读；失败计数也一并清掉。
+  /** 登录成功的统一出口：收会话 → 清这个号的候选缓存（剧集/位置/合集按号
+   *  缓存，登录态变了就得重读）→ 选它为当前号 → 重新读队列和选项。
+   *  登录状态本身由后端在 login-state 探测成功那一刻写库置 online。 */
+  async function loginDone() {
+    const aid = S.login ? S.login.aid : "";
+    endLogin();
+    paintLogin();
+    if (!aid) return;
     S.opts = {}; S.optFor = ""; S.optState = ""; S.optFailAt = 0; S.optSeq++;
     await selectAccount(aid, true);
-    toast(label ? `已登录：${label}` : "登录成功，正在重新读这个号的选项");
+    const acc = ((S.d && S.d.accounts) || []).find((x) => x.id === aid);
+    toast(acc ? `已登录：${acc.label || acc.name || aid}` : "登录成功，正在重读这个号的选项");
     await load();
-    ensureOpts(true);
+    // load() 里的 ensureOpts() 已经会读：后端在登录成功那一刻清掉了该号
+    // 缓存，所以这一次必然真读一遍并写回新缓存。这里再调一次只会让同一个
+    // 号排两个 18 秒的浏览器任务（以前就重复，加缓存后更明显）。
   }
 
-  function closeFix() {
-    stopFixPoll();
-    S.fix = null;
-    paintFix();
+  /** 取消登录。新加的号还停在「待登录」→ 连这个空壳一起删掉，
+   *  别在账号条里留一个永远登不上的号。
+   *  quiet=true：跟号走的自动收面板（号已恢复 / 已切走），不用打扰用户。 */
+  async function cancelLogin(quiet) {
+    const L = S.login;
+    if (!L) return;
+    if (L.auto) {   // 自动弹的：用户明确不要，本轮不再自动纠缠
+      S.loginOffered = S.loginOffered || {};
+      S.loginOffered[L.aid] = true;
+    }
+    const aid = L.aid;
+    endLogin();
+    paintLogin();
+    const a = ((S.d && S.d.accounts) || []).find((x) => x.id === aid);
+    if (a && a.state === "pending") {
+      try { await api(`/api/publish/accounts/${aid}`, { method: "DELETE" }); }
+      catch (e) { /* 删不掉就留着，下次还能重登 */ }
+      await load();
+    } else if (!quiet) {
+      toast("收起了；要用这个号时点「重登」");
+    }
   }
 
-  /** 候选拉取失败后问一句「是不是登录掉了」：掉了就自动摆码，别让人猜。 */
+  /** 候选拉取失败后问一句「是不是登录掉了」：掉了就弹登录窗口，别让人猜。
+   *  hard=1 让后端对旧标签页做真导航验证（2026-11-14）：会话死了但残留页
+   *  还停在后台页上时，普通探测会误报「已登录」，只有真导航一次才作数。 */
   async function probeLoginOnFail(aid) {
-    if (S.fix) return;                       // 已经在扫码流程里就别叠一层
+    if (S.login) return;                     // 已经在登录流程里就别叠一层
     if (!aid || aid !== currentAid()) return;
     try {
-      const r = await apiT(`/api/publish/accounts/${aid}/login-state`,
+      const r = await apiT(`/api/publish/accounts/${aid}/login-state?hard=1`,
         {}, 50000);
       if (!r || r.logged_in !== false) return;   // 登录好好的，失败另有原因
-      await openFix(aid, true);
+      await openLogin(aid, { auto: true, label: accLabel(aid) });
     } catch (e) { /* 探测失败就保持原样，不打扰 */ }
   }
 
@@ -1006,15 +1267,21 @@
     syncOpenBtn();
   }
 
-  /** 「进入视频号助手」用的是当前号的登录态，没选号就不给点。
+  /** 「进入视频号助手」用的是当前号的登录态：**只有确认已登录才可点**
+   *  （2026-11-14 用户定）。没选号 / 待登录 / 登录过期一律置灰，
+   *  悬停提示说清「现在差哪一步」。
    *  按钮在骨架里，状态跟着队列接口走，不在前端自己记一个 aid。 */
   function syncOpenBtn() {
     const b = document.querySelector("#btn-open-platform");
     if (!b) return;
-    const has = !!((S.d && S.d.current_account_id) && S.d.current_account);
-    b.disabled = !has || S.openBusy;
+    const a = (S.d && S.d.current_account) || null;
+    const on = !!a && a.state === "online";
+    b.disabled = !on || S.openBusy;
     b.textContent = S.openBusy ? "正在打开…" : "进入视频号助手 ↗";
-    b.title = has ? "用当前号打开视频号助手，不用扫码" : "先在「发布」页选一个号";
+    b.title = !a ? "先在「发布」页选一个号"
+      : on ? "用当前号的登录态打开视频号助手"
+      : a.state === "expired" ? "这个号登录过期了，先重新登录再打开"
+      : "这个号还没登录，先登录再打开";
   }
 
   /** 没确认账号时三页统一的占位；账号管理（① 区）不受这个门槛。 */
@@ -1026,7 +1293,7 @@
 
   const ACC_STATE = {
     online:  ["已登录", "on"],
-    pending: ["待扫码", "wait"],
+    pending: ["待登录", "wait"],
     expired: ["登录过期", "bad"],
     unknown: ["未登录", "mute"],
   };
@@ -1039,19 +1306,22 @@
     const av = a.avatar
       ? `<img src="${esc(a.avatar)}" alt="">`
       : `<i>${esc((a.wx_name || a.name || "号").slice(0, 1))}</i>`;
-    // 三样东西都要露：备注名（自己起的，用来区分号）、视频号名称、视频号 ID。
-    // 只显示备注名时，客户加了三四个号就分不清哪个是哪个（2026-11-13 用户要求）。
-    const nick = a.wx_name || "";
-    const same = !nick || nick === a.name;
-    const sub = [same ? "" : nick, a.finder_id ? `ID ${a.finder_id}` : ""]
-      .filter(Boolean).join(" · ");
+    // 三样东西都要露，且各占一行带标签：别名（自己起的备注名，没有就整行不显示）、
+    // 视频号（平台昵称）、视频号 ID（sph 开头那串）。之前备注名当大字标题、下面把
+    // 「视频号名 · ID」挤成一行，客户容易看混（2026-11-16 用户要求分行加标签）。
+    const alias = (a.name || "").trim();
+    const wx = (a.wx_name || "").trim();
+    const fid = (a.finder_id || "").trim();
+    const row = (label, val) => `<span class="frow"><i>${label}</i><em>${
+      val ? esc(val) : "未读到"}</em></span>`;
+    const rows = [
+      alias ? row("别名", alias) : "",
+      row("视频号", wx),
+      row("视频号ID", fid),
+    ].filter(Boolean).join("");
     return `<div class="pub-acc${on ? " on" : ""}" data-acc="${a.id}">
       <span class="av">${av}</span>
-      <span class="who">
-        <b>${esc(a.name)}</b>
-        <span class="sub" title="${esc(sub || "还没读到视频号 ID，登录后会自动补上")}">${
-          sub ? esc(sub) : `<em>ID 未读到</em>`}</span>
-      </span>
+      <span class="who">${rows}</span>
       <span class="st ${st[1]}">${st[0]}</span>
       <span class="ops">
         <button class="mini" data-acc-relogin="${a.id}" title="换一个微信重新登录">重登</button>
@@ -1059,116 +1329,6 @@
         <button class="mini del" data-acc-del="${a.id}" title="删掉这个号（登录状态一起删）">删</button>
       </span>
     </div>`;
-  }
-
-  function scanBox() {
-    const s = S.scan || {};
-    return `<div class="pub-scan">
-      <div class="pub-scan-qr">
-        ${s.qr ? `<img src="${esc(s.qr)}" alt="微信扫码登录视频号助手">`
-               : `<div class="pub-scan-wait">正在打开视频号助手…</div>`}
-      </div>
-      <div class="pub-scan-side">
-        <b>用微信扫一下</b>
-        <p>微信 →「扫一扫」→ <b>手机上点一下确认</b>，这边就自动进去了。</p>
-        <p class="mini-note">扫完只是「扫到了」，手机上没有「确认登录」这一下是不会登录的。
-          二维码 5 分钟就过期，这边会自己换新的，不用管。</p>
-        <p class="mini-note">扫码时程序会打开一个浏览器窗口，<b>别关掉</b>——
-          之后上传视频还要用它。</p>
-        ${s.err ? `<p class="bad">${esc(s.err)}</p>` : ""}
-        <div class="pub-acts">
-          <button class="ghost sm" data-act="rescan">换一张二维码</button>
-          <button class="ghost sm" data-act="scancancel">取消</button>
-        </div>
-      </div>
-    </div>`;
-  }
-
-  const QR_TTL = 4 * 60 * 1000;
-
-  function stopScanPoll() {
-    if (S.scan && S.scan.timer) clearInterval(S.scan.timer);
-    if (S.scan) S.scan.timer = null;
-  }
-
-  function startScanPoll() {
-    stopScanPoll();
-    if (!S.scan) return;
-    if (!S.scan.since) S.scan.since = Date.now();
-    S.scan.busy = false;
-    S.scan.fails = 0;
-    S.scan.timer = setInterval(async () => {
-      if (!S.scan) return;
-      // 上一轮还没回来就别再发：接口慢的时候请求会越堆越多，
-      // 最后变成「界面一直转圈」，看起来跟没反应一模一样。
-      if (S.scan.busy) return;
-      if (Date.now() - (S.scan.since || 0) > QR_TTL) { await rescan(true); return; }
-      S.scan.busy = true;
-      try {
-        const r = await api(`/api/publish/accounts/${S.scan.aid}/login-state`);
-        if (r.error) { S.scan.err = r.error; render(); return; }
-        if (!r.logged_in) return;
-        stopScanPoll();
-        const nm = (r.account && (r.account.name || r.account.wx_name)) || "";
-        const loggedAid = S.scan.aid;
-        S.scan = null;
-        S.opts = {}; S.optFor = ""; S.optState = ""; S.optFailAt = 0; S.optSeq++;
-        await selectAccount(loggedAid, true);
-        toast(nm ? `已登录：${nm}` : "登录成功");
-        await load();
-      } catch (e) {
-        // 不再静默吞掉：扫完码「没反应」最常见的原因就是这里连着报错、
-        // 但界面上一个字都不显示。告诉用户连不上，比让他干瞪眼强。
-        if (!S.scan) return;
-        S.scan.fails = (S.scan.fails || 0) + 1;
-        S.scan.err = e.message || "连不上本地服务";
-        render();
-      } finally {
-        if (S.scan) S.scan.busy = false;
-      }
-    }, 2000);
-  }
-
-  async function beginScan(aid, qr) {
-    S.scan = { aid: aid, qr: qr || "", err: "", timer: null, since: Date.now(),
-               busy: false, fails: 0 };
-    render();
-    if (!qr) await rescan();
-    else startScanPoll();
-  }
-
-  async function rescan(force, hard) {
-    if (!S.scan) return;
-    S.scan.err = "";
-    render();
-    try {
-      // hard=1 是「重登」：后端会先把这个号的登录态清掉，保证给的是一张新码。
-      // 不带这个参数时，浏览器里还留着自己就回「已登录 + 空码」，界面看着就是没反应。
-      const r = await api(`/api/publish/accounts/${S.scan.aid}/qr?refresh=${force ? 1 : 0}`
-        + `&force=${hard ? 1 : 0}`, { method: "POST" });
-      if (!S.scan) return;
-      S.scan.qr = r.qr || "";
-      S.scan.since = Date.now();
-      if (r.logged_in && !r.qr) {
-        // 已经登录着、又没拿到新码：说明这次没真重登，如实说，别装作在扫码。
-        stopScanPoll();
-        S.scan.err = "这个号现在是登录状态，没能拿到新的二维码。再点一次「重登」试试。";
-        render();
-        return;
-      }
-      if (r.logged_in) {
-        stopScanPoll();
-        const loggedAid = S.scan.aid;
-        S.scan = null;
-        await selectAccount(loggedAid, true);
-        await load();
-        return;
-      }
-      render();
-      startScanPoll();
-    } catch (e) {
-      if (S.scan) { S.scan.err = e.message; S.scan.qr = ""; render(); }
-    }
   }
 
   // ── ② 整批通用设置（对齐真实发布页：全是「选」，不是「填」）─────────────
@@ -1181,11 +1341,62 @@
     const a = ((S.d && S.d.accounts) || []).find((x) => x.id === aid);
     return a ? (a.label || a.name || aid) : "已删除的号";
   }
-  /** ② 里的一行小字：候选是从哪个号读回来的，别让人猜。 */
+  /** ② 里的一行小字：候选是从哪个号读回来的，别让人猜。
+   *  等待态（号在传上一批）还没读到任何东西，这行先不摆，免得像已经有选项。 */
+  /** ② 顶部那一行「现在在干什么」。第一次读要十几秒，光写「正在读」
+   *  用户会以为卡死；按经过时间换三句人话，全程只改这一行字。 */
+  function optStageText() {
+    if (S.optState === "wait")
+      return "这个号正在传上一批的视频，选项等传完会自动读；急的话点字段里的按钮现在读";
+    if (S.optState === "fail") return "没读到选项，点字段里的按钮重试";
+    if (S.optState !== "loading") return "";
+    const sec = Math.floor((Date.now() - (S.optLoadingAt || Date.now())) / 1000);
+    const lead = S.optFirstRead
+      ? "第一次读约十几秒，之后不用等；别的字段现在就能填。"
+      : "正在更新，旧的还能接着用。";
+    if (sec < 6) return `${lead} 正在打开助手…`;
+    if (sec < 14) return `${lead} 正在读剧集和标注…`;
+    return `${lead} 快好了…`;
+  }
+
+  function tickOptStage() {
+    const el = document.querySelector("#pub-opt-state");
+    if (!el) {
+      if (S.optStageTimer) clearInterval(S.optStageTimer);
+      S.optStageTimer = 0;
+      return;
+    }
+    el.textContent = optStageText();
+    el.classList.toggle("bad", S.optState === "fail");
+  }
+
+  function startOptStage() {
+    if (S.optStageTimer) clearInterval(S.optStageTimer);
+    S.optStageTimer = setInterval(tickOptStage, 1500);
+  }
+
+  function stopOptStage() {
+    if (S.optStageTimer) clearInterval(S.optStageTimer);
+    S.optStageTimer = 0;
+    tickOptStage();
+  }
+
   function optsOwnerLine() {
-    if (!S.optFor) return "";
-    return `<div class="pub-opts-from">这些选项来自 <b>${esc(accLabel(S.optFor))}</b>${
-      S.optState === "loading" ? " · 正在读…" : ""}</div>`;
+    if (!S.optFor || S.optState === "wait") return "";
+    const updating = !!(S.optRefreshAid && S.optRefreshAid === currentAid());
+    const tail = updating ? " · 正在更新…"
+      : S.optState === "loading" ? " · 正在读…" : "";
+    const m = S.optReadAt ? Math.floor((Date.now() - S.optReadAt) / 60000) : 0;
+    const fresh = S.optReadAt
+      ? (m < 1 ? "刚刚读过" : m < 60 ? `${m} 分钟前读过`
+        : `${Math.floor(m / 60)} 小时前读过`) : "";
+    const staleTip = S.optStale
+      ? ` <em class="pub-opt-note">可能不是最新，点「重新读一次」</em>` : "";
+    return `<div class="pub-opts-from">这些选项来自 <b>${esc(accLabel(S.optFor))}</b>${tail}
+      ${fresh ? `<span class="pub-opt-fresh">${esc(fresh)}</span>` : ""}
+      <button class="ghost sm pub-reread" data-act="reloadOpts"
+        ${updating || S.optState === "loading" ? "disabled" : ""}>${updating ? "正在更新…" : "重新读一次"}</button>
+      ${S.optNote ? `<em class="pub-opt-note">${esc(S.optNote)}</em>` : ""}${staleTip}</div>`;
   }
   /** 切号只重画顶部账号条 + ② 的字段区，绝不整页 render：
    *  用户可能正在标题/话题里打字，整页重画会把半句话清掉。
@@ -1229,9 +1440,18 @@
         </div>
         <em>${esc((o && o.note) || hint || "")}</em></label>`;
     }
-    // 拉一次要开浏览器 8-15 秒。中间必须有个「在读」的样子，否则看着像按钮没反应。
+    // 读候选时不再拿禁用按钮占住整格：给一个仍可操作的空下拉 + 一行小字，
+    // 用户能继续填别处，也不会以为卡死。位置是「先输词再出候选」，保留原样。
     if (S.optBusy[key]) {
-      return `<label data-pk="${key}"><span>${label}</span>${face("正在读…")}
+      if (key === "location") {
+        return `<label data-pk="${key}"><span>${label}</span>${face("正在读…")}
+          <em>${esc(hint || "")}</em></label>`;
+      }
+      return `<label data-pk="${key}"><span>${label}</span>
+        <div class="pub-link">
+          <select data-opt="${key}"><option value="">— 不设置 —</option></select>
+          <span class="pub-reading"><i></i>正在从号里读…</span>
+        </div>
         <em>${esc(hint || "")}</em></label>`;
     }
     if (!o) {
@@ -1270,15 +1490,11 @@
    */
   function linkField(t) {
     const o = S.opts.link || null;
-    const busy = S.optBusy.link;
+    // 自动预取和单项重试都算「在读」，但都不许占住选择框：以前这里整个
+    // 变成禁用按钮，看着像卡死；现在下拉一直在，旁边只挂一行小字。
+    const busy = !!(S.optBusy.link || S.optState === "loading");
     let body;
-    if (busy) {
-      body = `<button class="pub-sel" disabled>正在读剧集…</button>`;
-    } else if (!o) {
-      body = `<button class="pub-sel" data-act="loadOpt" data-kind="link">选条目</button>`;
-    } else if (o.err) {
-      body = `<button class="pub-sel bad" data-act="loadOpt" data-kind="link">${esc(o.err)}</button>`;
-    } else if ((o.items || []).length) {
+    if (o && (o.items || []).length) {
       body = `<select data-opt="link">
         <option value="">— 不设置 —</option>
         ${o.items.map((it) => {
@@ -1293,15 +1509,25 @@
             >${esc(it.cn)}${esc(badge)}${esc(bad)}</option>`;
         }).join("")}
       </select>`;
-    } else {
+    } else if (o && o.err) {
+      body = `<button class="pub-sel bad" data-act="loadOpt" data-kind="link">${esc(o.err)}</button>`;
+    } else if (o) {
       body = `<button class="pub-sel" data-act="loadOpt" data-kind="link">重试一次</button>`;
+    } else if (busy) {
+      // 第一次读、还没有任何缓存：也给一个能选的空下拉，别整格变成禁用按钮
+      body = `<select data-opt="link"><option value="">— 不设置 —</option></select>`;
+    } else {
+      body = `<button class="pub-sel" data-act="loadOpt" data-kind="link">选条目</button>`;
     }
+    const reading = busy
+      ? `<span class="pub-reading"><i></i>正在从号里读…</span>` : "";
     const note = (!busy && o && !o.err && !(o.items || []).length) ? (o.note || "") : "";
     // 类型固定成「视频号剧集」：其它三种（文章/红包封面/小程序短剧）这轮不用，
     // 留一个类型下拉反而让人以为切过去就能用。字段值由 collectBatchFields 写死 series。
-    const owner = S.optFor ? `<i class="pub-from">来自 ${esc(accLabel(S.optFor))}</i>` : "";
+    const owner = (S.optFor && S.optState !== "wait")
+      ? `<i class="pub-from">来自 ${esc(accLabel(S.optFor))}</i>` : "";
     return `<label class="span2"><span>扩展链接 · 视频号剧集${owner}</span>
-      <div class="pub-link">${body}</div>
+      <div class="pub-link">${body}${reading}</div>
       <em class="${note ? "bad" : ""}">${esc(note || "选一个这个号已上架的剧集，可以不填")}</em>
     </label>`;
   }
@@ -1334,10 +1560,9 @@
    *  合集、活动本轮从界面移除（后端字段留着，老队列已有的值不丢）。 */
   function fieldsHTML(d) {
     const t = d.template || {};
-    const hint = S.optState === "loading"
-      ? `<div class="pub-opt-state">正在准备这个号的选项…不用等，继续填就行</div>`
-      : S.optState === "fail"
-        ? `<div class="pub-opt-state bad">没读到选项，点字段里的按钮重试</div>` : "";
+    // 三种状态都说人话：在读 / 号在忙（不是坏了）/ 真没读到
+    const hint = `<div class="pub-opt-state${S.optState === "fail" ? " bad" : ""}"
+      id="pub-opt-state">${esc(optStageText())}</div>`;
     return `${hint}${optsOwnerLine()}
       ${coverBox(t)}
       ${picker("location", "位置", t.location, "输入地名后按回车，从结果里挑")}
@@ -1353,6 +1578,40 @@
     const box = document.querySelector("#pub-fields");
     if (!box || !S.d) return;
     box.innerHTML = fieldsHTML(S.d);
+  }
+
+  /** 单项读取候选回来时重画 ②，但把用户正在打的字原样还回去。
+   *  整个 #pub-fields 都要重画（下拉要换成新候选），直接 innerHTML 会把
+   *  话题/地点里打了一半的字清掉；只延后重画又可能永远等不到焦点离开。
+   *  程序赋值不触发 input/change，不会误触「改动自动套用」。 */
+  function refreshFieldsPreserve() {
+    const box = document.querySelector("#pub-fields");
+    if (!box || !S.d) { refreshFields(); return; }
+    const keyOf = (n) => n.dataset.bf || n.dataset.optq || n.dataset.opt || "";
+    const saved = [];
+    box.querySelectorAll("input, textarea, select").forEach((n) => {
+      if (!keyOf(n)) return;
+      saved.push({ k: keyOf(n), tag: n.tagName, type: n.type || "",
+                   value: n.value, checked: !!n.checked,
+                   focused: n === document.activeElement,
+                   caret: n.selectionStart == null ? null : n.selectionStart });
+    });
+    refreshFields();
+    const box2 = document.querySelector("#pub-fields");
+    if (!box2) return;
+    const nodes = Array.from(box2.querySelectorAll("input, textarea, select"));
+    saved.forEach((s) => {
+      const n = nodes.find((x) => keyOf(x) === s.k && x.tagName === s.tag);
+      if (!n) return;
+      if (s.type === "checkbox") n.checked = s.checked;
+      else n.value = s.value;
+      if (s.focused) {
+        try {
+          n.focus();
+          if (s.caret != null && n.setSelectionRange) n.setSelectionRange(s.caret, s.caret);
+        } catch (e) { /* 光标还原失败不影响值 */ }
+      }
+    });
   }
 
   // ── ② 的自动套用（2026-11-13 用户要求：去掉「套用到这批视频」按钮）───────
@@ -1466,9 +1725,9 @@
     // 结束了，不会再回报）。状态如实叫「已提交」，去不去平台看由用户自己定
     // （2026-11-14 用户反馈：「时间已过·去平台看」这种提示不像给用户看的话）。
     const past = j.status === "scheduled" && j.plan_at && j.plan_at <= toLocal(new Date());
-    // 跟后端 LOCKED_STATUS 对齐（scheduled / published / publishing）：
-    // publishing 也算，否则界面上给了「文案」按钮，点进去后端一律拒。
-    const locked = ["scheduled", "published", "publishing"].includes(j.status);
+    // 跟后端 LOCKED_STATUS 对齐（scheduled / published / publishing / uncertain）：
+    // publishing / uncertain 也算，否则界面上给了「文案」按钮，点进去后端一律拒。
+    const locked = ["scheduled", "published", "publishing", "uncertain"].includes(j.status);
     const open = S.edit === j.id;
     const tags = topicsText(j.topics);
     const from = j.project ? ` · 来自「${esc(j.project)}」` : "";
@@ -1484,11 +1743,11 @@
         <input class="pub-title" data-title="${esc(j.id)}" value="${esc(j.title)}"
                maxlength="100" ${locked ? "disabled" : ""} title="点一下就能改标题">
         <div class="pub-meta">
-          ${esc(showTime(j.plan_at))} · 发到 ${esc(j.account_name || (j.status === "draft" ? "开始上传时确定" : "未选号"))} · ${esc(mb(j.size))}
-          ${tags ? ` · ${esc(tags)}` : ""}${from}
+          <span>${esc(showTime(j.plan_at))} · 发到 ${esc(j.account_name || (j.status === "draft" ? "开始上传时确定" : "未选号"))} · ${esc(mb(j.size))}
           ${j.cover_url ? `<img class="pub-cov-dot" src="${esc(j.cover_url)}"
              alt="" title="这条已指定封面图片">` : ""}
-          ${j.file_exists === false ? `<span class="bad">文件找不到了</span>` : ""}
+          ${j.file_exists === false ? `<span class="bad">文件找不到了</span>` : ""}</span>
+          ${(tags || from) ? `<span class="pub-meta2">${tags ? esc(tags) : ""}${from}</span>` : ""}
         </div>
       </div>
       <div class="pub-ops">
@@ -1502,7 +1761,10 @@
           ? `<button class="ghost sm" data-act="del" title="从队列里删掉这条记录">移除</button>` : ""}
         ${j.status === "failed"
           ? `<button class="primary sm" data-act="retry" data-jid="${esc(j.id)}">重试</button>
-             <button class="ghost sm" data-act="fixLogin">扫码重登</button>` : ""}
+             <button class="ghost sm" data-act="relogin">重新登录</button>` : ""}
+        ${j.status === "uncertain" ? `
+          <button class="primary sm" data-act="resolve" data-to="published">后台已有这条</button>
+          <button class="ghost sm" data-act="resolve" data-to="cancelled">核实没发出去，结束这条</button>` : ""}
       </div>
       ${open && !locked ? fedit(j) : ""}
     </div>`;
@@ -1550,6 +1812,17 @@
     S.planTimer = setTimeout(doPlan, 350);
   }
 
+  /** 右侧预览里的警告也摆一份到「开始上传」旁边。doPlan 是局部刷新，
+   *  不整页重画（用户在打字），所以这块自己更新，不等下一次 render。 */
+  function paintStartWarn(r) {
+    const box = document.querySelector("#pub-start-warn");
+    if (!box) return;
+    const msg = (((r && r.warns) || [])[0] || {}).msg || "";
+    box.style.display = msg ? "" : "none";
+    box.textContent = msg.length > 88 ? msg.slice(0, 88) + "…" : msg;
+    box.title = msg;
+  }
+
   async function doPlan() {
     const box = document.querySelector("#pub-plan");
     const tbox = document.querySelector("#pub-times");
@@ -1560,6 +1833,7 @@
       box.innerHTML = (S.d.jobs || []).length
         ? `<div class="hint">都已经安排好了，没有还没安排的。</div>` : "";
       if (tbox) tbox.innerHTML = "";
+      paintStartWarn(null);
       return;
     }
     try {
@@ -1568,6 +1842,7 @@
         body: JSON.stringify({ first_at: S.first, interval_min: Number(S.gap) || 30 }),
       });
       S.plan = r;
+      paintStartWarn(r);
       if (!r.n) { box.innerHTML = `<div class="hint">队列里还没有视频，先在左边勾几条。</div>`; return; }
       const errs = (r.errors || []).map((e) => `<div class="pub-alarm bad">${esc(e.msg)}</div>`).join("");
       const wrns = (r.warns || []).map((w) => `<div class="pub-alarm warn">${esc(w.msg)}</div>`).join("");
@@ -1588,6 +1863,7 @@
     } catch (e) {
       box.innerHTML = `<div class="pub-alarm bad">${esc(e.message)}</div>`;
       if (tbox) tbox.innerHTML = "";
+      paintStartWarn(null);
     }
   }
 
@@ -1614,6 +1890,19 @@
         // 整个文件夹默认全选：用户的意图就是「这些都要发」，再让他一条条勾一遍很烦
         S.sel = new Set(S.cand.map((_c, i) => i));
         if (!S.cand.length) toast("这个文件夹里没找到视频（支持 mp4/mov 等常见格式）");
+        render();
+        return;
+      }
+      if (name === "recentdir") {
+        // 「最近用过」点一下：直接读这个目录，等于选文件夹但不弹框
+        const path = el.dataset.path || "";
+        const r = await api(`/api/publish/dir-files?path=${encodeURIComponent(path)}`);
+        S.picker = "dir";
+        S.pname = r.path;
+        S.pid = "";
+        S.cand = (r.files || []).map((f) => ({ path: f.path, name: f.name, size: f.size }));
+        S.sel = new Set(S.cand.map((_c, i) => i));
+        if (!S.cand.length) toast("这个文件夹里没找到视频了");
         render();
         return;
       }
@@ -1653,27 +1942,32 @@
         if (!(body.sets.length || body.files.length)) { toast("先勾几条"); return; }
         const r = await api("/api/publish/add", { method: "POST", body: JSON.stringify(body) });
         const dup = (r.dup || []).length;
-        toast(`加了 ${(r.added || []).length} 条` + (dup ? `，${dup} 条已经在队列里` : ""));
+        const rep = (r.repost || []).length;
+        toast(`加了 ${(r.added || []).length} 条` + (dup ? `，${dup} 条已经在队列里` : "")
+          + (rep ? `；其中 ${rep} 条以前发过，提交前会再提醒一次` : ""));
         resetCand();
         await load();
         return;
       }
       if (name === "addacc") {
+        // 开新会话前把旧的（连轮询）收掉，保证任何时刻只有一个登录窗口
+        endLogin();
         toast("正在打开视频号助手，稍等一下…");
         const r = await api("/api/publish/accounts", { method: "POST", body: JSON.stringify({}) });
-        await beginScan(r.account.id, r.qr);
+        // 新加的号还没有名字，title 就不猜；后端刚才已经把它弹出来了。
+        await openLogin(r.account.id, {});
         return;
       }
-      if (name === "rescan") { await rescan(true); return; }
-      if (name === "scancancel") {
-        const aid = S.scan && S.scan.aid;
-        stopScanPoll();
-        S.scan = null;
-        const a = aid && ((S.d && S.d.accounts) || []).find((x) => x.id === aid);
-        if (a && a.state === "pending") {
-          try { await api(`/api/publish/accounts/${aid}`, { method: "DELETE" }); } catch (e) { /* 忽略 */ }
-        }
-        await load();
+      if (name === "loginRetry") { await reopenLogin(); return; }
+      if (name === "loginCancel") { await cancelLogin(); return; }
+      if (name === "reloadOpts") {
+        const aid = currentAid();
+        if (!aid) { toast("先在①里选一个号"); return; }
+        const acc = ((S.d && S.d.accounts) || []).find((x) => x.id === aid) || {};
+        if (acc.state !== "online") { toast("这个号的登录态不在了，先点「重登」登录一下"); return; }
+        if (accBusy(aid)) { toast("这个号正在传上一批，等传完再点「重新读一次」"); return; }
+        // 强制真读一遍并写回新缓存；界面上旧选项一直留着，不挡填写
+        ensureOpts(true, true);
         return;
       }
       if (name === "loadOpt") {
@@ -1681,7 +1975,7 @@
         const aid = currentAid();
         if (!aid) { toast("先在①里选一个号，候选要从这个号里拉"); return; }
         const acc = ((S.d && S.d.accounts) || []).find((x) => x.id === aid) || {};
-        if (acc.state !== "online") { toast("这个号的登录态不在了，先点「重登」扫一下"); return; }
+        if (acc.state !== "online") { toast("这个号的登录态不在了，先点「重登」登录一下"); return; }
         const box = document.querySelector(`[data-optq="${kind}"]`);
         const q = ((box && box.value) || (S.optQ && S.optQ[kind]) || "").trim();
         if (kind === "location" && !q) { toast("先输入地点名，比如「石牌」"); return; }
@@ -1689,18 +1983,30 @@
         S.optQ[kind] = q;
         const seq = S.optSeq;        // 中途切号，上一个号的旧候选不许写回来
         S.optBusy[kind] = true;      // 这一步要 8-15 秒，必须让界面看得出在读
-        render();
+        // 只改按钮那一行字：整页 render() 会把用户正在标题/话题里打的半句清掉
+        const busyBtn = document.querySelector(`[data-act="loadOpt"][data-kind="${kind}"]`);
+        if (busyBtn) busyBtn.textContent = kind === "location" ? "搜着…" : "正在读…";
+        let got = 0, err = "";
         try {
           // 类型固定成视频号剧集（界面上已经没有类型下拉了）
           const r = await apiT(`/api/publish/options?aid=${encodeURIComponent(aid)}`
             + `&kind=${encodeURIComponent(kind)}&q=${encodeURIComponent(q)}`
             + (kind === "link" ? "&link_kind=series" : ""));
-          if (seq === S.optSeq) S.opts[kind] = r;
+          if (seq === S.optSeq) {
+            S.opts[kind] = r;
+            got = (r && (r.items || []).length) || 0;
+            err = (r && r.err) || "";
+            // 后端认出登录墙会带 login=True：直接去对一次登录态，掉了就地摆码
+            if (r && r.login) probeLoginOnFail(aid);
+          }
         } catch (e) {
-          if (seq === S.optSeq) S.opts[kind] = { err: e.message };
+          if (seq === S.optSeq) { S.opts[kind] = { err: e.message }; err = e.message; }
         }
         delete S.optBusy[kind];
-        render();
+        refreshFieldsPreserve();
+        if (seq === S.optSeq) {
+          toast(err ? err : got ? `读到 ${got} 个选项` : "这次没读到选项，点一下重试");
+        }
         return;
       }
       if (name === "reOpt") {
@@ -1775,6 +2081,13 @@
         const n = ((S.d && S.d.jobs) || []).filter((j) => j.status === "draft").length;
         if (!n) { toast("队列里没有「还没安排」的视频，先在上面勾几条"); return; }
         await flushApply();   // 最后一次改动也要带上：没落库就排期，会被锁在门外
+        // 确认指纹必须跟「现在这一屏」一致：改完时间立刻点提交时，防抖的
+        // doPlan 可能还没跑，先强制刷一次预览再拿 intent
+        await doPlan();
+        if (S.plan && S.plan.ok === false) {
+          toast(((S.plan.errors || [])[0] || {}).msg || "这批还排不了，先看上面的提示");
+          return;
+        }
         const who = a.label || a.name || acc;
         // 第一条贴得太近而条数又多时，逐条上传多半赶不上排的时间——平台会拒
         // 或直接失败。提前一句话说清，比事后一条条标失败强（2026-11-14）。
@@ -1784,10 +2097,14 @@
             + `${n} 条逐条上传多半来不及，建议把第一条往后调。\n` : "";
         // 不可逆之前把「发到哪个号」写全：备注名 + 视频号名 + ID，
         // 不是一句「确定吗」能替代的（2026-11-13 用户要求）。
+        const rep = (S.plan && S.plan.repost) || [];
         const body = [
           `发给：【${who}】 · ${n} 条`,
           `首条 ${showTime(S.first)} · 间隔 ${Number(S.gap) || 30} 分钟`,
         ];
+        if (rep.length) body.push(
+          `其中 ${rep.length} 条以前发过或交过平台（${rep.slice(0, 3).map((x) => x.file).join("、")}${rep.length > 3 ? " 等" : ""}）。`
+          + "确认是有意再发一次；不确定就点「再看看」，先去「已提交」里核对。");
         if (warn) body.push(warn.replace(/^\n+/, "").trim());
         body.push(
           "确认后立刻逐条上传，并按上面的时间在平台定时；发出去就收不回来了。",
@@ -1803,7 +2120,8 @@
         if (!ok) return;
         const r = await api("/api/publish/start", {
           method: "POST",
-          body: JSON.stringify({ first_at: S.first, interval_min: Number(S.gap) || 30, account_id: acc }),
+          body: JSON.stringify({ first_at: S.first, interval_min: Number(S.gap) || 30,
+                                 account_id: acc, intent: (S.plan && S.plan.intent) || "" }),
         });
         // 提交成功：这批就成了后台任务——队列清空、设置恢复默认，下一批从头填；
         // 进度到「已提交」里跟踪（2026-11-14 用户定稿）
@@ -1829,9 +2147,13 @@
         return;
       }
       if (name === "retryAll") {
-        // 逐条调 retry 接口；start() 会自动把上传线程喊起来，不用单独管
+        // 逐条调 retry 接口；start() 会自动把上传线程喊起来，不用单独管。
+        // 只重试**当前号**的失败条目（2026-11-14：已提交列表按号隔离，操作
+        // 范围跟显示范围一致，别把别的号的失败条目一起带上）。
+        const cur = currentAid();
         const ids = ((S.d && S.d.jobs) || [])
-          .filter((j) => j.status === "failed").map((j) => j.id);
+          .filter((j) => j.status === "failed" && (!cur || j.account_id === cur))
+          .map((j) => j.id);
         let moved = 0;
         for (const id of ids) {
           const r = await api(`/api/publish/job/${id}/retry`, { method: "POST" })
@@ -1841,17 +2163,22 @@
         toast(ids.length
           ? `已重新排队 ${ids.length} 条，接着上传`
             + (moved ? `（其中 ${moved} 条原定时间已过，已往后顺延）` : "")
-          : "没有可重试的");
+          : "这个号没有失败的条目");
         await load();
         return;
       }
       if (name === "stop") {
-        if (!confirm("批量取消还在排队、没上传的条目？\n"
+        // 只取消当前号还在排队的（后端同样按号过滤，跨号误伤防在两边）
+        const who = accLabel(currentAid());
+        const n = ((S.d && S.d.jobs) || []).filter((j) =>
+          j.status === "queued" && j.account_id === currentAid()).length;
+        if (!confirm(`把【${who}】还在排队、没上传的 ${n} 条取消掉？\n`
           + "它们会退回队列重新设置；已经传到平台并定了时间的，程序取消不了"
           + "（要去视频号助手「待发布」里手动删），已经发出去的也不受影响。继续吗？")) return;
-        const r = await api("/api/publish/stop", { method: "POST" });
+        const r = await api("/api/publish/stop", { method: "POST",
+          body: JSON.stringify({ account_id: currentAid() || "" }) });
         toast(r.on_platform
-          ? `取消 ${r.reverted} 条；另有 ${r.on_platform} 条已交平台，取消不了`
+          ? `取消 ${r.reverted} 条；这个号另有 ${r.on_platform} 条已交平台，取消不了`
           : `取消 ${r.reverted} 条`);
         await load();
         return;
@@ -1878,6 +2205,11 @@
         render();
         return;
       }
+      if (name === "qfilter") {
+        S.qfilter = el.dataset.f || "all";
+        render();
+        return;
+      }
       if (name === "del") {
         // 这里的「移除」只面向还没交给平台的条目（draft/failed/manual）；
         // 已交平台的行不再摆这个按钮（2026-11-14 用户反馈：那是噪音）。
@@ -1886,12 +2218,26 @@
         await load();
         return;
       }
-      if (name === "fixLogin") {
-        await openFix();
+      if (name === "relogin") {
+        const aid = currentAid();
+        await openLogin(aid, { label: accLabel(aid) });
         return;
       }
-      if (name === "fixRescan") { await rescanFix(false); return; }
-      if (name === "fixCancel") { closeFix(); toast("收起了；需要时再点「扫码重登」"); return; }
+      if (name === "resolve") {
+        // 点过「发表」但没核对上：只能由人去平台看过之后收尾，程序不猜
+        const ok = el.dataset.to === "published";
+        const word = ok
+          ? "在视频号助手「待发布」里确认这条已经在了？\n点「确定」后记成「已发布」，不会再重传。"
+          : "在视频号助手里确认这条确实没发出去？\n点「确定」后结束这条，不会再重传。";
+        if (!confirm(word)) return;
+        await api(`/api/publish/job/${jid}/mark`, {
+          method: "POST",
+          body: JSON.stringify({ action: ok ? "resolved_published" : "resolved_cancelled", note: "" }),
+        });
+        toast(ok ? "记成「已发布」" : "这条结束了");
+        await load();
+        return;
+      }
       if (name === "mark") {
         // 界面上只剩「不上传这条」这一种用法：queued → 还没安排。
         // 以前「已定时」那行还有个「记成已取消」（状态 skipped），2026-11-14
@@ -1945,6 +2291,13 @@
         if (S.openBusy) return;
         const aid = currentAid();
         if (!aid) { toast("先在「发布」页选一个号"); return; }
+        const a = (S.d && S.d.current_account) || {};
+        if (a.state !== "online") {
+          // 置灰是主闸，这里是兜底（状态刚翻过来还没重画时点了）
+          toast(a.state === "expired" ? "这个号登录过期了，先重新登录再打开助手"
+                                      : "这个号还没登录，先重新登录再打开助手");
+          return;
+        }
         S.openBusy = true; syncOpenBtn();
         try {
           const r = await api("/api/publish/open-platform", {
@@ -1957,7 +2310,7 @@
             toast("窗口开了，但这个号的登录没带过去；在窗口里扫一次码就能进");
           } else {
             toast(r.already ? "窗口已经开着了，切过去看就行"
-                            : "已打开，用的是当前这个号，不用扫码");
+                            : "已打开，用的就是当前这个号");
           }
         } catch (e) { toast(e.message); }
         S.openBusy = false; syncOpenBtn();
@@ -1988,11 +2341,9 @@
       const relog = e.target.closest("[data-acc-relogin]");
       if (relog) {
         const aid = relog.dataset.accRelogin;
-        // 重登 = 一定要重新扫码（换一个微信登录），所以走 force。
-        S.scan = { aid: aid, qr: "", err: "", timer: null, since: Date.now(),
-                   busy: false, fails: 0 };
-        render();
-        rescan(true, true);
+        // 重登 = 一定要换一个微信登录，所以 force（后端先清旧登录态）。
+        // 已经在登录别的号：openLogin 会先把那个会话连轮询一起收掉。
+        await openLogin(aid, { force: true, label: accLabel(aid) });
         return;
       }
       const ren = e.target.closest("[data-acc-rename]");
@@ -2011,7 +2362,7 @@
       if (del) {
         const aid = del.dataset.accDel;
         const cur = ((S.d && S.d.accounts) || []).find((x) => x.id === aid) || {};
-        if (!confirm(`删掉「${cur.name || "这个号"}」？\n登录状态会一起清掉，之后要重新扫码。已经排好的发布计划不受影响。`)) return;
+        if (!confirm(`删掉「${cur.name || "这个号"}」？\n登录状态会一起清掉，之后要重新登录。已经排好的发布计划不受影响。`)) return;
         api(`/api/publish/accounts/${aid}`, { method: "DELETE" })
           .then(() => { toast("已删除"); return load(); })
           .catch((err) => toast(err.message));
@@ -2021,6 +2372,8 @@
       if (acc) {
         const aid = acc.dataset.acc;
         if (currentAid() === aid) return;
+        // 切号 = 开新会话：上一个登录窗口的提示（连轮询）先收掉，别带着走
+        endLogin();
         try {
           // 选号是服务端的动作：它会把「当前发到」记下来，并清掉上一个号
           // 专属的剧集 / 位置 / 合集 id。前端只负责重画，不自己拼状态。
@@ -2032,8 +2385,11 @@
           if (S.tab === "diag") renderDiag(true);
           paintAccountBox();
           refreshFields();
-          ensureOpts(true);
-          toast(`已切到【${accLabel(aid)}】，正在重读候选`);
+          toast(`已切到【${accLabel(aid)}】，正在核对这个号的登录态`);
+          // 切号即验号（2026-11-14 用户定）：卡片状态是本地簿记，切过来就
+          // 真核对一次；失效/未登录直接弹出登录窗口，不用再手点「重登」
+          await verifyOnSwitch(aid, true);
+          ensureOpts(true);              // 号是好的才会走到这里读候选
         } catch (err) { toast(err.message); }
         return;
       }

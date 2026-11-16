@@ -14,7 +14,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 import threading
 import time
 
@@ -22,8 +24,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from . import (audit, auth, core, nativedlg, publisher, remote, wxbot, wxdel,
-               wxmon, wxopen, wxpub, wxstat, wxworker)
+from . import (audit, auth, core, nativedlg, pickmem, publisher, remote, wxbot,
+               wxdel, wxmon, wxopen, wxpub, wxstat, wxworker)
 
 router = APIRouter()
 
@@ -31,6 +33,122 @@ router = APIRouter()
 _LEVEL_TTL = 30 * 60
 _LEVEL_KEEP = 24 * 3600
 _LEVELS: dict[int, tuple[str, float]] = {}
+
+# ── 发布页候选缓存（只给界面显示，绝不进发表链路）────────────────────────
+# 拉一次候选要开无头 Chrome 把发表页真点一遍（约 18 秒）。剧集和标注是号里
+# 相对静态的数据，按号落盘缓存后开页秒出。失效时机：TTL 到期（前端静默更新）、
+# 用户点「重新读一次」、登录态重新坐实（可能换了微信）。
+# **发表时剧集 id 仍走接口认领**（wxpost.py），这里的数据只用来画下拉，
+# 不参与选值校验 —— 否则选到已下架的剧集也照发不误。
+_OPTS_TTL = 6 * 3600
+_OPTS_DIR = os.path.join(core.DATA_DIR, "options_cache")
+
+
+def _opts_path(aid: str) -> str:
+    # aid 从 URL 来，文件名只留安全字符 + 短 hash，别让它拼出目录
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", aid)[:48] or "acc"
+    h = hashlib.sha256(aid.encode("utf-8")).hexdigest()[:10]
+    return os.path.join(_OPTS_DIR, f"{safe}_{h}.json")
+
+
+def _opts_read(aid: str) -> tuple[float, dict | None]:
+    try:
+        with open(_opts_path(aid), encoding="utf-8") as f:
+            rec = json.load(f)
+        data = rec.get("data")
+        if isinstance(data, dict) and "declare" in data and "link" in data:
+            return float(rec.get("ts") or 0), data
+    except (OSError, ValueError, TypeError):
+        pass
+    return 0.0, None
+
+
+def _opts_write(aid: str, data: dict) -> None:
+    # 先写临时文件再 replace：多开页面同时读也不会读到半截 JSON
+    try:
+        os.makedirs(_OPTS_DIR, exist_ok=True)
+        p = _opts_path(aid)
+        tmp = f"{p}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "aid": aid, "data": data},
+                      f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def invalidate_opts_cache(aid: str) -> None:
+    """登录态变了之后调用：旧候选可能属于上一个微信。"""
+    try:
+        os.remove(_opts_path(aid))
+    except OSError:
+        pass
+
+
+# 「加载中 / 暂无 / 创建合集」这些是页面的占位文案，不是号里真有的条目。
+# 拦 CGI 时偶尔混进响应，落进缓存就会在下拉里躺 6 小时（2026-11-15）。
+_PLACEHOLDER_RE = re.compile(
+    r"^(暂无|暂无数据|暂无记录|暂无合集|暂无短剧|暂无剧集|无数据|"
+    r"加载中|创建合集|添加合集|选择合集|请选择|搜索内容|合集名称|短剧名称|名称|标题)$")
+
+
+def _item_key(it) -> str:
+    """候选的稳定 key：有平台 id 用 id，没有就用归一化后的名字。
+
+    同一条剧集/标注常常在 DOM 和 CGI 响应里各出现一次，落进缓存就是下拉里
+    两个一模一样的选项，用户不知道选哪个（2026-11-15 A 档）。空 key 不去重，
+    宁可留重复也别把看不懂结构的条目丢掉。
+    """
+    if isinstance(it, dict):
+        ident = str(it.get("v") or it.get("id") or "").strip()
+        name = str(it.get("name") or it.get("label")
+                   or it.get("title") or it.get("cn") or "").strip()
+    elif isinstance(it, str):
+        ident, name = "", it.strip()
+    else:
+        return ""
+    return re.sub(r"\s+", "", (ident or name)).lower()
+
+
+def _clean_opts(data: dict) -> dict:
+    """过滤占位文案 + 按稳定 key 去重，别动 via / note 这些状态字段。"""
+    for kind in ("declare", "link", "location"):
+        part = data.get(kind)
+        if not isinstance(part, dict):
+            continue
+        items = part.get("items")
+        if not isinstance(items, list):
+            continue
+        kept, seen = [], set()
+        for it in items:
+            if isinstance(it, dict):
+                name = str(it.get("name") or it.get("label")
+                           or it.get("title") or "").strip()
+            elif isinstance(it, str):
+                name = it.strip()
+            else:
+                name = ""
+            if name and _PLACEHOLDER_RE.match(name):
+                continue
+            key = _item_key(it)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            kept.append(it)
+        part["items"] = kept
+    return data
+
+
+def _opts_valid(data: dict) -> bool:
+    """只有两支接口都真拿到模板才落缓存。
+
+    `via: none` = 没拦到 CGI 模板（弹层没点开 / 网络抖动），和「这个号真的
+    没有剧集」长得一模一样。把这种结果缓存 6 小时，用户会一直以为号里没
+    剧集 —— 所以宁可不缓存，下次照常重读。
+    """
+    return bool((data.get("declare") or {}).get("via") == "api"
+                and (data.get("link") or {}).get("via") == "api")
 
 
 def _dev_mode() -> bool:
@@ -134,6 +252,9 @@ class PlanBody(BaseModel):
 
 class StartBody(PlanBody):
     account_id: str = ""
+    # 预览时算出的「这批的指纹」。带了就核一遍：确认框看过之后视频或时间
+    # 又被改过的话，不能还按旧确认提交。留空兼容老前端/脚本。
+    intent: str = ""
 
 
 class JobPatch(BaseModel):
@@ -332,56 +453,49 @@ def accounts(request: Request):
 
 @router.post("/api/publish/accounts")
 def add_account(body: AccountBody, request: Request):
-    """建账号并给出二维码。
+    """建账号并直接把登录窗口弹出来。
 
-    **为什么不先要名字**：小V猫那样点加号直接出二维码，扫完用微信昵称回填。
-    先逼用户起名再扫码，扫完发现名字和号对不上还得改一次。
-    二维码拿不到就把这条空壳账号删掉，别在列表里留垃圾。
+    **为什么不先要名字**：点加号就弹视频号助手的登录页，登完用微信昵称回填。
+    先逼用户起名再登录，登完发现名字和号对不上还得改一次。
+    窗口打不开（没装 Chrome 之类）就把这条空壳账号删掉，别在列表里留垃圾。
     """
     me = _require(request)
     acc = _run(publisher.add_account, body.name, pending=not (body.name or "").strip())
     try:
-        r = wxbot.session(acc["id"]).qr(refresh=True)
+        wxbot.session(acc["id"]).open_login()
     except Exception as exc:  # noqa: BLE001
         wxbot.drop(acc["id"], remove_profile=True)
         publisher.remove_account(acc["id"])
         raise HTTPException(400, _wx_msg(exc)) from exc
     audit.log_event(me, "hookcut.publish", target=f"account:{acc['id']}",
-                    payload={"op": "add_account", "scan": True}, request=request,
+                    payload={"op": "add_account", "login": True}, request=request,
                     route="/api/publish/accounts", status_code=200)
-    return {"account": acc, "qr": r.get("qr") or "",
-            "logged_in": bool(r.get("logged_in")),
-            "accounts": publisher.public_accounts()}
+    return {"account": acc, "accounts": publisher.public_accounts()}
 
 
-@router.post("/api/publish/accounts/{aid}/qr")
-def account_qr(aid: str, request: Request, refresh: bool = False, force: bool = False,
-               visible: bool = True):
-    """取二维码。
-
-    `refresh=0`（默认）：页面上已经有码就原地截一张，不重新导航——用户可能刚扫完，
-    正在等手机上点确认，这时候导航会把这次登录作废。
-    `refresh=1`：换一张新的（手动「换一张」/ 快过期自动换）。
-    `force=1`：「重登」= **一定要重新扫码**（换一个微信登录）。先把浏览器里
-    上一次的登录态清掉再出码；不清的话后端只会回「已登录 + 空码」，
-    界面看上去就是「点了重登没反应」（2026-11-13 用户反馈）。
-    `visible=0`：「登录失效就地出码」（2026-11-14）——先无头截图嵌进界面，
-    截不到再由后端自己回退弹窗，回传 fallback=1 让界面说一声。
+@router.post("/api/publish/accounts/{aid}/login")
+def account_login(aid: str, request: Request, force: bool = False):
+    """把这个号的登录页在**可见浏览器窗口**里弹出来（2026-11-14 用户定：
+    登录一律弹窗口手动做，界面里不再显示二维码——平台登录页自带快捷登录卡、
+    换码、过期刷新，用户对着真窗口比自己截一张码清楚得多）。
+    登没登上由前端轮询 `login-state` 判断，这个接口只负责开窗口。
+    `force=1`：「重登」= 换一个微信登录。先把浏览器里上一次的登录态清掉再开
+    登录页；不清的话平台快捷登录卡一键就把旧微信又登回来了，界面看上去就是
+    「点了重登没反应」（2026-11-13 用户反馈）。
     """
     _require(request)
     if not publisher.get_account(aid):
         raise HTTPException(404, "这个账号已经不在了")
     try:
-        r = wxbot.session(aid).qr(refresh=refresh, force=force, visible=visible)
+        r = wxbot.session(aid).open_login(force=force)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, _wx_msg(exc)) from exc
     if force:
-        # 强制重登＝这个号的登录态已经被清掉了，列表里就该显示「待扫码」，
+        # 强制重登＝这个号的登录态已经被清掉了，列表里就该显示「待登录」，
         # 别还挂着「已登录」骗用户。
         publisher.update_account(aid, state="pending",
                                  last_check=publisher.fmt(publisher.now()))
-    return {"qr": r.get("qr") or "", "logged_in": bool(r.get("logged_in")),
-            "fallback": bool(r.get("fallback")), "headless": bool(r.get("headless"))}
+    return {"logged_in": bool(r.get("logged_in"))}
 
 
 @router.get("/api/publish/accounts/state")
@@ -419,8 +533,9 @@ def accounts_state(request: Request):
             publisher.update_account(aid, **patch)
             fixed.append({"id": aid, "from": st,
                           "wx_name": patch.get("wx_name") or acc.get("wx_name") or ""})
-            if not (publisher.get_account(aid) or {}).get("finder_id"):
-                _fill_profile_async(aid)
+            # 对账把号坐实成 online = 登录这回事刚被证实，号资料也重新拉一遍
+            # （2026-11-14 用户定：每次登录之后都重取，别拿旧昵称/旧 ID）。
+            _fill_profile_async(aid, force=True)
         elif st == "expired":
             publisher.update_account(aid, state="expired",
                                      last_check=publisher.fmt(publisher.now()))
@@ -437,33 +552,45 @@ def accounts_state(request: Request):
 
 
 @router.get("/api/publish/accounts/{aid}/login-state")
-def account_login_state(aid: str, request: Request, diag: int = 0):
+def account_login_state(aid: str, request: Request, diag: int = 0, hard: int = 0):
     """前端每 2 秒问一次。登录成功后把微信昵称/头像写回账号并置 online。
 
-    `?diag=1` 时额外返回浏览器内部状态（标签页网址、二维码 iframe 里的文字）。
-    扫码失败时外面只能看到 `logged_in: false`，分不清「码过期」「没点确认」
-    「微信拦了自动化」，没有这个就只能猜。
+    `?hard=1`：对「看着像登录」的旧标签页做一次真导航验证（2026-11-14 加）。
+    读取候选失败后前端用它对账——旧标签页会把死会话误报成已登录，不真导航
+    一次就永远查不出「账号卡亮着已登录、实际每个读取都撞登录墙」这种局。
+    `?diag=1` 时额外返回浏览器内部状态（有哪些标签、停在哪个网址、帧列表）。
+    登录失败时外面只能看到 `logged_in: false`，分不清「窗口被关了」「停在别的
+    页上」「微信拦了自动化」，没有这个就只能猜。
     """
     _require(request)
     acc = publisher.get_account(aid)
     if not acc:
         raise HTTPException(404, "这个账号已经不在了")
     try:
-        st = wxbot.session(aid).state()
+        st = wxbot.session(aid).state(hard=bool(hard))
     except Exception as exc:  # noqa: BLE001
         return {"logged_in": False, "error": _wx_msg(exc),
                 "account": publisher.public_accounts()}
     if st.get("logged_in"):
         now = publisher.fmt(publisher.now())
+        was_online = (acc.get("state") or "") == "online"
         patch = {"state": "online", "last_check": now, "last_ok": now}
         if st.get("wx_name"):
             patch["wx_name"] = st["wx_name"][:30]
         if st.get("avatar"):
             patch["avatar"] = st["avatar"]
         acc = publisher.update_account(aid, **patch)
-        # DOM 里只有昵称，视频号 ID 要从 auth_data 读 → 后台补一次（不堵这个 2 秒轮询）
-        if not acc.get("finder_id"):
-            _fill_profile_async(aid)
+        # 昵称/头像上面已按这次读到的覆盖；视频号 ID/粉丝数要从 auth_data 拉 →
+        # 后台补一次（不堵这个 2 秒轮询）。2026-11-14 用户定：**每次登录之后都
+        # 重新拉一遍号资料**——以前只在 ID 缺失时补一次，换了微信或改了号名
+        # 界面就一直显示旧值。刚从非 online 翻过来 = 这次轮询亲眼看到的登录
+        # 成功，绕过 10 分钟节流；切号验号这类平时探测仍按节流来，别为资料
+        # 反复开浏览器。
+        if not was_online:
+            # 刚坐实成 online（多半是重新登录，甚至换了微信）：这个号之前
+            # 缓存的剧集/标注可能属于上一个登录态，删掉让它重读一次。
+            invalidate_opts_cache(aid)
+        _fill_profile_async(aid, force=not was_online)
     elif (acc.get("state") or "") == "online":
         # 之前是好的，现在掉到登录页了 = 登录态过期（微信那边会踢）。标出来让人重扫，
         # 别等发布失败了才说「未登录」。
@@ -516,6 +643,7 @@ def del_account(aid: str, request: Request):
 
 
 # ── 本机选文件（浏览器拿不到绝对路径，只能让后端弹系统框）─────────────────
+# 起始位置走 pickmem：上次在这个用途下确认过哪儿就开在哪儿（见 app/pickmem.py）
 @router.post("/api/publish/pick-files")
 def pick_files(request: Request):
     """一次多选本地视频。浏览器拖拽拿不到绝对路径，所以走原生对话框。"""
@@ -526,7 +654,7 @@ def pick_files(request: Request):
     def _pick():
         try:
             result["paths"] = nativedlg.pick_files(
-                "选择要发布的视频", "",
+                "选择要发布的视频", pickmem.recall_dir("publish_files"),
                 filetypes=[("视频文件", "*.mp4 *.mov *.m4v *.flv *.mkv *.avi *.wmv"),
                            ("所有文件", "*.*")])
         except Exception as exc:  # noqa: BLE001
@@ -537,6 +665,8 @@ def pick_files(request: Request):
     t.join(timeout=300)
     if err:
         raise HTTPException(500, f"弹不出选择框（{err['msg']}）")
+    for p in result["paths"][:1]:          # 只记一个目录，多选的文件同属一个文件夹
+        pickmem.remember("publish_files", p, False)
     return {"paths": result["paths"]}
 
 
@@ -551,7 +681,7 @@ def pick_cover(request: Request):
     def _pick():
         try:
             result["path"] = nativedlg.pick_file(
-                "选择封面图片", "",
+                "选择封面图片", pickmem.recall_dir("cover"),
                 filetypes=[("图片文件", "*.png *.jpg *.jpeg *.webp *.bmp"),
                            ("所有文件", "*.*")])
         except Exception as exc:  # noqa: BLE001
@@ -564,6 +694,7 @@ def pick_cover(request: Request):
         raise HTTPException(500, f"弹不出选择框（{err['msg']}）")
     if not result["path"]:
         return {"ok": False}
+    pickmem.remember("cover", result["path"], False)
     try:
         out = publisher.save_cover(result["path"])
     except publisher.PublishError as exc:
@@ -739,7 +870,8 @@ def plan(body: PlanBody, request: Request):
 @router.post("/api/publish/start")
 def start(body: StartBody, request: Request):
     me = _require(request)
-    res = _run(publisher.start, body.first_at, body.interval_min, body.account_id)
+    res = _run(publisher.start, body.first_at, body.interval_min,
+               body.account_id, body.intent)
     # 排到即上传（2026-11-13 用户定稿）：排完立刻开传，不等到点——
     # 全部传完后电脑关了平台照发。worker 自己会把 queued 一条条处理掉。
     wxworker.start()
@@ -760,10 +892,16 @@ def start(body: StartBody, request: Request):
     return {**res, "monitor_started": mon_started, "queue": _view()}
 
 
+class StopBody(BaseModel):
+    account_id: str = ""
+
+
 @router.post("/api/publish/stop")
-def stop(request: Request):
+def stop(request: Request, body: StopBody | None = None):
+    """批量取消。body 里带 account_id 时只撤这个号的（界面「批量取消」
+    只显示当前号的任务，操作范围跟显示范围一致，不跨号误伤）。"""
     _require(request)
-    res = publisher.stop()
+    res = publisher.stop((body or StopBody()).account_id)
     return {**res, "queue": _view()}
 
 
@@ -837,6 +975,10 @@ def publish_options(request: Request, aid: str = "", kind: str = "",
     me = auth.current_user(request)
     try:
         data = wxpub.options(wxbot.session(aid), kind, q=q, link_kind=link_kind)
+    except wxpub.LoginLostError as exc:
+        # 登录墙单独标出来：前端看到 login=True 会直接探登录态、弹登录窗口，
+        # 不让用户对着「重试」按钮无限点下去（2026-11-14 实测）。
+        return {"items": [], "note": str(exc), "login": True}
     except Exception as exc:  # noqa: BLE001
         return {"items": [], "note": _wx_msg(exc)}
     # 拉一次候选就是一次真页面操作，量不大但能看出「客户在配什么」，记一条
@@ -848,27 +990,59 @@ def publish_options(request: Request, aid: str = "", kind: str = "",
 
 
 @router.get("/api/publish/options/all")
-def publish_options_all(request: Request, aid: str = ""):
-    """选好号之后静默预取：一次开页把能自动读的候选全拉回来。
+def publish_options_all(request: Request, aid: str = "", refresh: int = 0):
+    """选好号之后静默预取：命中缓存秒回，过期先给旧数据再由前端静默更新。
 
-    前端选完号就调它，用户不用挨个点「从号里选」。位置（location）不在这
-    里 —— 平台要地名才给候选，没有关键词时预取不到东西，只能等用户输词。
+    `refresh=1` 强制真开一次页面重读（用户点「重新读一次」、缓存过期后
+    前端后台更新时用）。位置（location）不在这里 —— 平台要地名才给候选，
+    没有关键词时预取不到东西，只能等用户输词。
     """
     _require(request)
     if not aid or not publisher.get_account(aid):
         raise HTTPException(404, "这个账号已经不在了")
     _check_option_aid(aid)
+
+    ts, cached = _opts_read(aid)
+    age = int(time.time() - ts) if ts else 0
+    if cached is not None and not refresh:
+        # 有缓存就永远秒回。过期只打个标记，真读交给前端的后台静默更新，
+        # 绝不让「开个页面」为了刷剧集列表干等 18 秒。
+        out = dict(cached)
+        out.update({"cached": True, "stale": age >= _OPTS_TTL, "age": age})
+        return out
+
+    def _stale(note: str = "") -> dict:
+        # 有旧数据就先把旧数据给出去，别让界面因为一次网络抖动整个清空
+        if cached is not None:
+            out = dict(cached)
+            out.update({"cached": True, "stale": True, "age": age})
+            if note:
+                out["note"] = note
+            return out
+        return {"error": note or "这次没读到，点一下重试。", "stale": True}
+
     try:
         data = wxpub.options_batch(wxbot.session(aid))
+    except wxpub.LoginLostError as exc:
+        invalidate_opts_cache(aid)
+        return _stale(str(exc)) | {"login": True}
     except Exception as exc:  # noqa: BLE001
-        return {"error": _wx_msg(exc)}
+        return _stale(_wx_msg(exc))
+    if not isinstance(data, dict) or data.get("error"):
+        return _stale((data or {}).get("error") or "这次没读到，点一下重试。")
+
+    data = _clean_opts(data)
+    if _opts_valid(data):
+        _opts_write(aid, data)
+    out = dict(data)
+    out.update({"cached": False, "stale": False, "age": 0})
     me = auth.current_user(request)
     audit.log_event(me, "hookcut.publish", target=f"account:{aid}",
-                    payload={"op": "options_all",
+                    payload={"op": "options_all", "refresh": bool(refresh),
                              "n": {k: len((v or {}).get("items") or [])
-                                   for k, v in data.items()}},
+                                   for k, v in data.items() if isinstance(v, dict)}},
                     request=request, route="/api/publish/options/all", status_code=200)
-    return data
+    return out
 
 
 # ── 选文件夹（和选文件一样，必须走原生对话框拿绝对路径）───────────────────
@@ -880,7 +1054,8 @@ def pick_folder(request: Request):
 
     def _pick():
         try:
-            result["path"] = nativedlg.pick_folder("选择放着视频的文件夹")
+            result["path"] = nativedlg.pick_folder("选择放着视频的文件夹",
+                                                   pickmem.recall_dir("publish_dir"))
         except Exception as exc:  # noqa: BLE001
             err["msg"] = str(exc)
 
@@ -892,8 +1067,22 @@ def pick_folder(request: Request):
     path = result["path"] or ""
     if not path:
         return {"path": "", "files": []}
+    pickmem.remember("publish_dir", path, True)
     files = publisher.scan_dir(path)
     return {"path": path, "files": files}
+
+
+# ── 「最近用过」的文件夹点一下就列视频：不走原生对话框 ─────────────────────
+@router.get("/api/publish/dir-files")
+def dir_files(request: Request, path: str = ""):
+    """界面上点历史文件夹时用：直接扫这个目录，等于「选文件夹」但省掉弹框。"""
+    _require(request)
+    if not path or not os.path.isdir(path):
+        raise HTTPException(404, "这个文件夹不在了，重新选一个吧")
+    try:
+        return {"path": path, "files": publisher.scan_dir(path)}
+    except publisher.PublishError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 # ── 全局概览（顶栏角标 / 到点提醒）────────────────────────────────────────
@@ -963,10 +1152,13 @@ _PROF_TRIED: dict = {}
 _PROF_GAP = 600          # 同一个号补资料失败后，10 分钟内不再试（别每 2 秒开一次浏览器）
 
 
-def _fill_profile_async(aid: str) -> None:
-    """登录成功后补一次视频号 ID。放后台线程：登录态是 2 秒轮询的，不能在这儿等 6 秒。"""
+def _fill_profile_async(aid: str, force: bool = False) -> None:
+    """登录成功后补一次视频号资料（ID/粉丝数/昵称头像）。放后台线程：
+    登录态是 2 秒轮询的，不能在这儿等 6 秒。
+    force=True（登录成功这种明确事件）绕过失败节流；平时探测仍按节流，
+    别为了资料反复开浏览器。"""
     now = time.time()
-    if aid in _PROF_BUSY or now - _PROF_TRIED.get(aid, 0) < _PROF_GAP:
+    if aid in _PROF_BUSY or (not force and now - _PROF_TRIED.get(aid, 0) < _PROF_GAP):
         return
     _PROF_BUSY.add(aid)
     _PROF_TRIED[aid] = now
@@ -1034,7 +1226,7 @@ def publish_stat_sample(request: Request, aid: str = ""):
     if not acc:
         raise HTTPException(404, "先在页面顶部确认账号，数据要从这个号里读")
     if acc.get("state") != "online":
-        raise HTTPException(400, "这个号的登录态不在了。先点「重登」扫一下，再来读数据")
+        raise HTTPException(400, "这个号的登录态不在了。先点「重登」登录一下，再来读数据")
     try:
         snap = wxstat.sample(wxbot.session(aid), aid=aid)
         _absorb_profile(aid, snap.get("account") or {})
@@ -1097,7 +1289,7 @@ def publish_diag_one(aid: str, request: Request):
     row["login"] = (
         {"ok": True, "text": "已登录"} if st == "online" else
         {"ok": False, "text": "登录过期，要重扫"} if st == "expired" else
-        {"ok": False, "text": "还没扫码"} if st == "pending" else
+        {"ok": False, "text": "还没登录"} if st == "pending" else
         {"ok": None, "text": "未判定"}
     )
 
@@ -1280,5 +1472,8 @@ def probe(body: ProbeBody, request: Request):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, _wx_msg(exc)) from exc
     name = f"probe-{body.what}" + ("-net" if body.net else "")
-    data["saved"] = wx.save_dump(data, name)
+    p = wx.save_dump(data, name)
+    data["saved"] = p
+    # 用户发回排查时优先给这一份：完整 dump 只留开发机
+    data["summary_saved"] = p[:-5] + ".summary.json"
     return data

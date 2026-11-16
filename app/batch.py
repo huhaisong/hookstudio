@@ -52,6 +52,47 @@ def _model_label(v: str) -> str:
     return MODEL_LABELS.get(v, "自定义")
 
 
+def legacy_plan_result(p: dict) -> dict | None:
+    """老项目（2026-11-16 之前生成的）没有 batch.plan_result，读项目时补一份**只读推断**。
+
+    只认两个既有事实：batch.jobs 每组要几套、plans[] 每套的 model 标记；差额就是
+    那组没出来的套数。不猜失败原因、不猜时间，原因指向已有的 plan_note 原文。
+    推断结果不落盘：下一次生成（含补跑）会写真正的 plan_result 把它覆盖掉。
+    """
+    b = p.get("batch") or {}
+    jobs = b.get("jobs") or []
+    plans = p.get("plans") or []
+    if not jobs or not plans or any(pl.get("mode") == "hook" for pl in plans):
+        return None
+    requested = sum(max(0, int(j.get("count") or 0)) for j in jobs)
+    if requested <= len(plans):
+        return None
+    got_by_model: dict[str, int] = {}
+    for pl in plans:
+        m = str(pl.get("model") or "")
+        got_by_model[m] = got_by_model.get(m, 0) + 1
+    left = dict(got_by_model)
+    failed = []
+    for j in jobs:
+        m = str(j.get("model") or "")
+        want = max(0, int(j.get("count") or 0))
+        have = min(left.get(m, 0), want)
+        left[m] = left.get(m, 0) - have
+        missing = want - have
+        if missing <= 0:
+            continue
+        failed.append({
+            "model": m, "label": _model_label(m), "count": missing,
+            "min_minutes": float(j.get("min_minutes") or 3.0),
+            "max_minutes": float(j.get("max_minutes") or 7.0),
+            "reason": "上次这一组没生成完，具体原因见下方生成说明",
+        })
+    if not failed:
+        return None
+    return {"requested": requested, "got": len(plans), "total": len(plans),
+            "append": False, "failed": failed, "legacy": True}
+
+
 def _seg_key(s: dict) -> tuple:
     return (s["ep"], round(s["start"], 1), round(s["end"], 1))
 
@@ -203,7 +244,8 @@ def ai_plan_run(pid: str, count: int, min_minutes: float = 4.0,
     }], order)
 
 
-def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None:
+def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
+                  append: bool = False) -> None:
     """第 2 步（多模型版）：jobs 里每个模型各配一套 {model, count, min/max_minutes}，
     各走 1 次 API（多组时按设置里的「同时生成几条」并行），所有套落到同一个项目里、index 连续编号、
     每套带 model 标记。
@@ -219,6 +261,12 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None
     API 白花钱、还一套都拿不到。超线就在 note 里点名，由用户决定。
     （2026-11-12 用户明确：「原来程序只在事后上报重复率，不拦截。我不需要你去拦截。」
     之前那版在 _fit_target 里逐块卡 70%，已按此撤销。）
+
+    append=True 是「只补跑没生成成功的组」（2026-11-16 A 档）：产出**追加**到现有
+    plans 后面，index 继续编号，绝不覆盖已有结构或已出片的进度。accepted 先装进
+    旧套的 edl，这样新套的重复度会跟全部旧套一起算，点名里的套号也是全局的。
+    batch.plan_result 记本次「要几套 / 到手几套 / 哪几组没出来（带可重跑参数）」，
+    界面据此显示提示条和补跑按钮；全部成功时 failed 为空，提示条自动消失。
     """
     p = core.load(pid)
     if not p:
@@ -227,14 +275,21 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None
         raise RuntimeError("还没有转写结果，请先转写")
     if not jobs:
         raise RuntimeError("没有指定任何模型")
+    existing: list[dict] = list(p.get("plans") or []) if append else []
+    if append and any(pl.get("mode") == "hook" for pl in existing):
+        raise RuntimeError("当前是单集钩子结构，不能往里追加混剪的套")
     total_all = sum(float(ep.get("duration") or 0) for ep in p["episodes"])
-    plans: list[dict] = []
-    accepted: list[list[dict]] = []
+    plans: list[dict] = list(existing)   # 旧套先入列，index = len(plans)+1 天然连续
+    accepted: list[list[dict]] = [pl["edl"] for pl in existing if pl.get("edl")]
+    fresh_start = len(existing)
     job_summ: list[dict] = []       # 每个模型的产出小结（写进 note）
     budget_notes: list[str] = []
     total_sets = sum(max(1, min(20, int(j.get("count") or 1))) for j in jobs)
     done_sets = 0
     job_errors: list[str] = []
+    # 结构化失败清单：前端提示条按它列明细，补跑按钮按它带参数重跑
+    failed_jobs: list[dict] = []
+    errored_ji: set[int] = set()
     n_jobs = len(jobs)
     multi = n_jobs > 1
     prepared: list[dict] = []
@@ -269,6 +324,9 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None
     # 老行为（进度由 build_plans 自己写、超时用全局 600 秒）。异常当结果带回，
     # 到第二阶段按组顺序记进 job_errors，避免线程池里抛异常把整批带走。
     def _one(it: dict):
+        # 池子里的子线程没有 start_task 设的上下文，AI 请求认不出自己属于
+        # 哪个任务，中止标记就查不到（2026-11-16）。绑一次，finally 里解绑。
+        core.bind_call_ctx(pid, "cuts")
         try:
             return analyze.build_plans(
                 p, it["count"], it["mn"], it["mx"], model=it["label"] or None,
@@ -276,6 +334,8 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None
                 timeout=PLAN_JOB_TIMEOUT if multi else None)
         except Exception as exc:  # noqa: BLE001
             return exc
+        finally:
+            core.bind_call_ctx(None, None)
 
     results: list = [None] * n_jobs
     if multi:
@@ -283,7 +343,8 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None
         batches = math.ceil(n_jobs / conc)
         core.set_task(pid, "plan", 3,
                       f"共 {n_jobs} 组，预计约 {batches * PLAN_EST_MIN} 分钟")
-        with ThreadPoolExecutor(max_workers=conc) as pool:
+        pool = ThreadPoolExecutor(max_workers=conc)
+        try:
             futs = {pool.submit(_one, it): it["ji"] for it in prepared}
             finished = 0
             for fut in as_completed(futs):
@@ -293,6 +354,11 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None
                 tail = f" · 预计还需约 {left} 分钟" if left else " · 正在整理结果"
                 core.set_task(pid, "plan", 3 + 89 * finished / n_jobs,
                               f"已完成 {finished}/{n_jobs} 组{tail}")
+        finally:
+            # 原来 with 的 __exit__ 是 wait=True：只要有一组抛 TaskCancelled，
+            # 也会被剩下几组 300/600 秒的请求拖住，中止看起来还是「没反应」。
+            # 正常跑完时所有 future 都已完成，wait=False 不改变任何行为。
+            pool.shutdown(wait=False, cancel_futures=True)
     else:
         results[0] = _one(prepared[0])
 
@@ -305,6 +371,12 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None
         if isinstance(sets, Exception):
             # 单组失败只记录、不中断：5 组里 1 组超时，不能把另外 4 组的成果带走
             job_errors.append(f"{_model_label(label)}：{sets}")
+            errored_ji.add(ji)
+            failed_jobs.append({
+                "model": label, "label": _model_label(label),
+                "count": it["count"], "min_minutes": mn, "max_minutes": mx,
+                "reason": str(sets),
+            })
             continue
         job_plans: list[dict] = []
         for i, st in enumerate(sets, 1):
@@ -407,38 +479,63 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None
         # 全军覆没时把每个模型的报错原文带出来，别只说「不可用」
         raise RuntimeError("；".join(job_errors) or "AI 给出的结构都不可用，请重试")
 
-    avgs = [pl["overlap"] for pl in plans[1:]]
-    avg_ov = sum(avgs) / len(avgs) if avgs else 0.0
-    # 带上组号：多组选了同一档位时，只写档位名会出现四行一模一样的「自定义 出 1 套」
-    desc = "、".join(
-        f"第 {i} 组（{_model_label(j['model'])}）出 {len(j['plans'])} 套"
-        f"（均 {sum(x['sec'] for x in j['plans']) / len(j['plans']) / 60:.1f} 分钟）"
-        for i, j in enumerate(job_summ, 1) if j["plans"])
-    over = [pl for pl in plans if pl["overlap"] > MAX_OVERLAP]
-    note = ("；".join(budget_notes) + " " if budget_notes else "") + (
-        f"AI 通读全剧 {total_all / 60:.1f} 分钟：{desc}；套间平均重合 {avg_ov * 100:.0f}%")
-    if over:
-        detail = "、".join(f"第{pl['index']}套与第{pl['vs']}套 {pl['overlap'] * 100:.0f}%"
-                           for pl in over)
-        note += (f"；其中 {len(over)} 套超过 {int(MAX_OVERLAP * 100)}% 上限（{detail}）。"
-                 "同一部剧剪多套，素材复用是必然的——要更不一样，就减少套数或缩短单套时长")
+    fresh = plans[fresh_start:]
+    # 没抛异常却一套都没排出来（AI 给的片段全被 _ensure_geo / _blocks 筛掉）也要能补跑
+    for ji, summ in enumerate(job_summ):
+        if ji in errored_ji or summ["plans"]:
+            continue
+        failed_jobs.append({
+            "model": summ["model"], "label": _model_label(summ["model"]),
+            "count": summ["count"], "min_minutes": summ["mn"], "max_minutes": summ["mx"],
+            "reason": "这次返回的片段都用不上，一套也没排出来",
+        })
+
+    if not fresh:
+        note = f"这次没生成出新的套；已有的 {len(existing)} 套保持不变"
     else:
-        note += f"，全部在 {int(MAX_OVERLAP * 100)}% 以内"
-    hit = [pl for pl in plans if pl["anchor_hit"] >= 2]
-    if hit:
-        detail = "、".join(f"第{pl['index']}套与第{pl['anchor_vs']}套撞 {pl['anchor_hit']} 条"
-                           for pl in hit)
-        # 2026-11-12 用户改口径：名场面可以两套都用，只要总重复率没破 80%。
-        # 所以这里只报数，不再劝「同一个最狠的镜头别两套都用」。
-        note += f"；名场面锚点与前面撞 {detail}（可以共用，只看上面那行总重复率）"
-    boom = [pl for pl in plans if pl["climax"] >= 6]
-    if boom:
-        detail = "、".join(f"第{pl['index']}套连爆 {pl['climax']} 块" for pl in boom)
-        note += f"；{detail}，中间缺缓冲，看着会累"
+        # 只统计真正跟前面比过的套：非追加时第一套没有前套可比（vs=None）；
+        # 追加时第一套已经跟全部旧套比过，要计入。
+        avgs = [pl["overlap"] for pl in fresh if pl.get("vs")]
+        avg_ov = sum(avgs) / len(avgs) if avgs else 0.0
+        # 带上组号：多组选了同一档位时，只写档位名会出现四行一模一样的「自定义 出 1 套」
+        desc = "、".join(
+            f"第 {i} 组（{_model_label(j['model'])}）出 {len(j['plans'])} 套"
+            f"（均 {sum(x['sec'] for x in j['plans']) / len(j['plans']) / 60:.1f} 分钟）"
+            for i, j in enumerate(job_summ, 1) if j["plans"])
+        over = [pl for pl in fresh if pl["overlap"] > MAX_OVERLAP]
+        note = ("；".join(budget_notes) + " " if budget_notes else "") + (
+            f"AI 通读全剧 {total_all / 60:.1f} 分钟：{desc}；套间平均重合 {avg_ov * 100:.0f}%")
+        if over:
+            detail = "、".join(f"第{pl['index']}套与第{pl['vs']}套 {pl['overlap'] * 100:.0f}%"
+                               for pl in over)
+            note += (f"；其中 {len(over)} 套超过 {int(MAX_OVERLAP * 100)}% 上限（{detail}）。"
+                     "同一部剧剪多套，素材复用是必然的——要更不一样，就减少套数或缩短单套时长")
+        else:
+            note += f"，全部在 {int(MAX_OVERLAP * 100)}% 以内"
+        hit = [pl for pl in fresh if pl["anchor_hit"] >= 2]
+        if hit:
+            detail = "、".join(f"第{pl['index']}套与第{pl['anchor_vs']}套撞 {pl['anchor_hit']} 条"
+                               for pl in hit)
+            # 2026-11-12 用户改口径：名场面可以两套都用，只要总重复率没破 80%。
+            # 所以这里只报数，不再劝「同一个最狠的镜头别两套都用」。
+            note += f"；名场面锚点与前面撞 {detail}（可以共用，只看上面那行总重复率）"
+        boom = [pl for pl in fresh if pl["climax"] >= 6]
+        if boom:
+            detail = "、".join(f"第{pl['index']}套连爆 {pl['climax']} 块" for pl in boom)
+            note += f"；{detail}，中间缺缓冲，看着会累"
     if job_errors:
         note += "；有组没生成成功（其它组的套都在）：" + "；".join(job_errors)
+    if append:
+        note = "补跑：" + note
 
     p = core.load(pid) or p
+    if append and fresh_start:
+        # 补跑跑了几分钟，期间用户可能改过勾选 / 每套设置。旧套以最新盘为准，
+        # 只把新套接在后面，别拿开头的快照把用户的改动盖回去。
+        # 数量对不上说明期间又整批重排过，这时保留本次结果，不硬拼两套编号。
+        latest_old = list(p.get("plans") or [])
+        if len(latest_old) == fresh_start:
+            plans = latest_old + plans[fresh_start:]
     gen = int(p.get("plan_gen") or 0) + 1
     p["plan_gen"] = gen
     p["plans"] = plans
@@ -446,19 +543,35 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO) -> None
     # 模式的卡片和出片按钮显示（结构已经被下面这份 plans 覆盖了，界面就自相矛盾）。
     # hook_sec / hook_eps 保留着，用户切回钩子模式时上次的选择还在。
     old = p.get("batch") or {}
+    new_jobs = [{"model": j["model"], "count": j["count"],
+                 "min_minutes": j["mn"], "max_minutes": j["mx"]} for j in job_summ]
+    new_mn = min(j["mn"] for j in job_summ)
+    new_mx = max(j["mx"] for j in job_summ)
+    # 补跑只是往这批结构里添几套：参数面板仍回填最初那次的配置；出片进度也不能清零，
+    # done 归零会让已经出片的套被重渲一遍。
+    saved_jobs = (old.get("jobs") or new_jobs) if append else new_jobs
+    saved_mn = old.get("min_minutes", new_mn) if append else new_mn
+    saved_mx = old.get("max_minutes", new_mx) if append else new_mx
     p["batch"] = {
         "count": len(plans),
         "cut_mode": "mix",
         "hook_sec": old.get("hook_sec") or 15,
         "hook_eps": old.get("hook_eps") or [],
-        "min_minutes": min(j["mn"] for j in job_summ),
-        "max_minutes": max(j["mx"] for j in job_summ),
+        "min_minutes": saved_mn,
+        "max_minutes": saved_mx,
         "order": order, "plan_note": note,
         "summary": " / ".join(pl.get("ai_name") or f"第{pl['index']}套" for pl in plans[:8]),
         # count 记用户填的套数，不记实际产出。产出少一套时回填会把输入框改掉。
-        "jobs": [{"model": j["model"], "count": j["count"],
-                  "min_minutes": j["mn"], "max_minutes": j["mx"]} for j in job_summ],
-        "done": 0, "gen": gen, "by": "ai",
+        "jobs": saved_jobs,
+        "done": old.get("done", 0) if append else 0, "gen": gen, "by": "ai",
+        # 本次生成的结构化结果：前端提示条与「只补跑没出来的套」按钮的唯一数据来源
+        "plan_result": {
+            "requested": total_sets,
+            "got": len(fresh),
+            "total": len(plans),
+            "append": bool(append),
+            "failed": failed_jobs,
+        },
     }
     core.set_task(pid, None)
     # 只写结构相关的字段：第 3 步分镜可能正在并行保存，整份覆盖会把分镜清掉。
@@ -812,6 +925,14 @@ def _pic_sig(fx: dict) -> str:
         # 现场做：抹除参数、新字幕风格、台词内容都影响画面，全在 ver_sig 里算，
         # 这里只要一个「不是原片」的标记，别和预生成的 SUBV 混在一起
         out.append("LIVEV")
+    # 字幕样式（2026-11-16 从第 2 步搬到出片）：只在真要烧字的两档里算。
+    # 不加这一位的后果是「改了动效点出片，进度一闪而过，拿回的还是旧动感」。
+    if ver in ("nosub", "live"):
+        try:
+            mo = int(round(float(fx.get("newsub_motion") or 0.5) * 100))
+        except (TypeError, ValueError):
+            mo = 50
+        out.append(f"ST{str(fx.get('newsub_style') or 'rise')[0]}{mo}")
     return "".join(out)
 
 
@@ -946,7 +1067,10 @@ def render_plans(pid: str, save_dir: str | None = None,
 
     # 「现场做」（src_ver=live）要在切段前把逐句字幕区域量好：第 2 步做过就复用
     # 它的缓存，没做过就在这儿补量一次（一集十几秒，所以放在后台任务里做）。
-    def _wants_live() -> bool:
+    # 「要烧台词字幕」的套（现场做 live，或干净副本 nosub）都得先有字幕区域：
+    # 第 2 步做过就复用缓存，没做过就在这儿补量一次（一集十几秒，放后台做）。
+    def _needs_spans() -> bool:
+        burned = render._copy_burned(p)
         for pl in plans:
             ov = (sets_fx or {}).get(str(pl.get("index")))
             if ov is None:
@@ -954,11 +1078,12 @@ def render_plans(pid: str, save_dir: str | None = None,
             ov = dict(ov or {})
             if ov.get("src_ver") is None:
                 ov["src_ver"] = (fx or {}).get("src_ver")
-            if str(ov.get("src_ver") or "").strip() == "live":
+            ver = str(ov.get("src_ver") or "").strip()
+            if ver == "live" or (ver == "nosub" and not burned):
                 return True
         return False
 
-    if _wants_live():
+    if _needs_spans():
         nosub.ensure_spans(pid, on_msg=lambda m: core.set_task(pid, "batch", 0, m))
 
     for k, pl in enumerate(plans):
@@ -994,7 +1119,12 @@ def render_plans(pid: str, save_dir: str | None = None,
         # 「裁掉」重做「柔和抹掉」后点出片，必须重渲，不能拿旧版素材出的片充数。
         _ver = str(setfx.get("src_ver") or "").strip()
         if _ver == "nosub":
-            ver_sig = str((p.get("nosub") or {}).get("sig") or "")
+            # 副本指纹 + 烧字指纹（2026-11-16）：副本只负责抹，台词和字幕样式是
+            # 出片时才烧上去的。只算副本指纹的话，改了台词/样式点出片会被判成
+            # 「没变」直接跳过，用户拿回的还是旧字的片子。
+            ns = p.get("nosub") or {}
+            ver_sig = (str(ns.get("sig") or "") + "|"
+                       + str(ns.get("burn_sig") or ""))
         elif _ver == "live":
             # 现场做：抹除参数 + 新字幕风格 + 每集台词内容都由 sig_of 算，
             # 改了任一项都必须重渲（台词改了字幕就得跟着变）

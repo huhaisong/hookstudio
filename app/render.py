@@ -5,9 +5,9 @@ import json
 import math
 import os
 import random
-import shutil
 import subprocess
 import time
+import unicodedata
 
 from . import core
 
@@ -796,6 +796,9 @@ def _subs_filter(ass_path: str) -> str:
 #   每条 Dialogue 的动效基准是它自己的 Start/End，跟切段边界无关——
 #   所以切段 ffmpeg 的 t 从 0 起算也不会让字幕位置在切点跳回起点。
 NEWSUB_DEFAULTS = {"pos": 0.80, "motion": 0.5, "style": "rise"}
+# 2026-11-16 删掉「字幕比声音晚」这一项：真正治「字比声音先出来」的是
+# retime（拿原片字幕当真值逐句对时）。微调只是把偏差往另一个方向推，准的集
+# 会被推晚，留着还会让人以为得手动补偏移。现在出场时刻＝台词时间码本身。
 # 新字幕的出场动效。原来只有一条 0-100 的「动感」滑杆，实际只有三档
 # （静止 / 落位 / 漂浮），用户看不出自己在选什么，也没法要「弹出」「逐字」。
 # 现在给成枚举：每种风格对应一串确定的 ASS 标签，观感可预期。
@@ -925,6 +928,52 @@ def _cap_layout(text: str, cap_h: float) -> tuple[int, list[str]]:
     return min(44, max(26, (W - 72) // n)), lines
 
 
+def _cap_text_lines(text: str, cap_h: float) -> tuple[int, list[str]]:
+    """定字号 + 折行 + **去掉标点**（烧到画面上的字不要句读）。
+
+    2026-11-16 用户定：台词文本（第 1 步查看/导出）保留标点，那是给人读的；
+    但烧到画面上的字幕一行没几个字，标点既占位置又扎眼，一律不显示。
+
+    顺序很关键——**先按带标点的原文折行，再逐行去标点**：
+    `_wrap_cn` 是「在标点后断」，标点先删掉的话「你们到底，想干什么？」
+    会被硬切成「你们到底想干」「什么」；先折行就还是断在逗号处，
+    去标点只是把那一个字符拿掉。
+
+    返回的 lines 可能比原文短一两个字，字宽只会更富余，不会溢出。
+    """
+    size, lines = _cap_layout(text, cap_h)
+    return size, [x for x in (_cap_strip_punct(l) for l in lines) if x]
+
+
+# 不删的符号：百分号、千分比不是句读，删了「涨了 5%」就成「涨了 5」
+_CAP_KEEP = set("%％‰")
+# 只有夹在数字/字母中间才有意义的：3.5 万、10:30、3-5、A/B
+_CAP_KEEP_BETWEEN = set(".:/-")
+
+
+def _cap_strip_punct(s: str) -> str:
+    """去掉这一行里的标点（Unicode P* 类），保留数字里的点、冒号、斜杠。"""
+    if not s:
+        return s
+    out: list[str] = []
+    n = len(s)
+    for i, ch in enumerate(s):
+        if ch.isspace() or ch in _CAP_KEEP:
+            out.append(ch)
+            continue
+        if not unicodedata.category(ch).startswith("P"):
+            out.append(ch)
+            continue
+        if ch in _CAP_KEEP_BETWEEN:
+            prev = s[i - 1] if i else ""
+            nxt = s[i + 1] if i + 1 < n else ""
+            if prev.isalnum() and nxt.isalnum():
+                out.append(ch)
+        # 其余标点直接丢
+    # 删掉句中逗号后可能留下两格空格；中文一般没有空格，顺手收紧
+    return " ".join("".join(out).split())
+
+
 def _cap_ass_file(rows: list, spec: dict, out_dur: float, path: str) -> None:
     """整段台词的 ASS。一句一条 Dialogue，各自带淡入淡出与句内动效。
 
@@ -945,8 +994,8 @@ def _cap_ass_file(rows: list, spec: dict, out_dur: float, path: str) -> None:
         d = e - s
         if d < 0.12:
             continue
-        size, lines = _cap_layout(text, cap_h)
-        body = _ass_text("\n".join(lines) or text)
+        size, lines = _cap_text_lines(text, cap_h)
+        body = _ass_text("\n".join(lines))
         if not body:
             continue
         # 淡入淡出别拖太长：实帧上 200ms 淡出让句尾明显发灰，短剧一句才
@@ -973,24 +1022,38 @@ def _cap_ass_file(rows: list, spec: dict, out_dur: float, path: str) -> None:
             dlg.append(f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Cap,,0,0,0,,"
                        f"{tags}{body}\n")
             continue
+        # 动效幅度一律跟滑杆走 m（0~1），且**滑杆拉到 0 时真要接近静止**——
+        # 界面上 0 那端写的是「几乎不动」。2026-11-15 用户反馈"动效幅度不够大、
+        # 上浮看不出，像直接出现"：旧版 rise 只浮 6+8m（最大 14px，1280 高的 1%），
+        # float 写死 ±12px、pop 写死 86%，三个风格在实帧上都接近硬切。
+        # 现在起点拉开：rise 4+96m（默认 m=0.5 → 52px，约画面 4%），
+        # float 2+28m，pop 起始 100-(4+24m)%（默认与旧版同为 86%）。
         if ms == "fade":
             tags = f"{{\\fad({fi},{fo})}}{fs}{at}"
         elif ms == "float":
-            # 整句一直在慢慢上浮（幅度小，不干扰阅读）
+            # 整句一直在慢慢上浮：幅度太小等于没动，太大又干扰阅读
+            amp = round(2 + 28 * m)
             tags = (f"{{\\fad({fi},{fo})}}{fs}"
-                    f"{{\\move({W // 2},{round(y + 12)},{W // 2},{round(y - 12)},"
+                    f"{{\\move({W // 2},{round(y + amp)},{W // 2},{round(y - amp)},"
                     f"0,{int(d * 1000)})}}")
         elif ms == "pop":
-            # 88% 弹到 100%：短剧口播感强，不会显得太跳
-            t1 = min(240, max(120, int(d * 1000 * 0.35)))
+            # 从偏小弹到 100%：起始缩放跟滑杆走
+            sc = round(100 - (4 + 24 * m))
+            t1 = min(300, max(140, int(d * 1000 * 0.35)))
             tags = (f"{{\\fad({fi},{fo})}}{fs}"
-                    f"{{\\fscx86\\fscy86\\pos({W // 2},{round(y)})}}"
+                    f"{{\\fscx{sc}\\fscy{sc}\\pos({W // 2},{round(y)})}}"
                     f"{{\\t(0,{t1},\\fscx100\\fscy100)}}")
         else:  # rise
-            # 从下方约 10px 缓慢落位，之后静止到句末
-            t1 = min(620, max(120, int(d * 1000 * 0.45)))
+            # 从明显更低的位置浮上来，再用 200~520ms 落位，之后静止到句末。
+            # 落位时长比旧版长：一句才 0.8 秒时也得让"浮上来"这段看得见。
+            amp = round(4 + 96 * m)
+            # 不许浮到画面外：起始位置要留出「半个字高 + 8px」的余量，
+            # 不然 pos 拉到 0.92 那种贴底的设置会把字顶出底边。
+            room = int(H * (0.985 - float(spec.get("pos") or 0.80)))
+            amp = max(4, min(amp, int(room - 8 - size * 0.55)))
+            t1 = min(520, max(200, int(d * 1000 * 0.45)))
             tags = (f"{{\\fad({fi},{fo})}}{fs}"
-                    f"{{\\move({W // 2},{round(y + 6 + 8 * m)},{W // 2},{round(y)},"
+                    f"{{\\move({W // 2},{round(y + amp)},{W // 2},{round(y)},"
                     f"0,{t1})}}")
         dlg.append(f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Cap,,0,0,0,,"
                    f"{tags}{body}\n")
@@ -1010,8 +1073,10 @@ def _cap_drawtext_filters(rows: list, spec: dict, out_dur: float,
         s, e = min(s, out_dur), min(e, out_dur)
         if e - s < 0.12:
             continue
-        size, lines = _cap_layout(text, _spec_cap_h(spec))
-        body = "\n".join(lines) or text
+        size, lines = _cap_text_lines(text, _spec_cap_h(spec))
+        body = "\n".join(lines)
+        if not body:
+            continue
         tfile = f"{dst}.cap{j:02d}.txt"
         with open(tfile, "w", encoding="utf-8") as f:
             f.write(body)
@@ -1155,13 +1220,64 @@ def _live_clean(p: dict, ep: dict, start: float, end: float) -> dict | None:
     return {"spec": spec, "spans": spans}
 
 
+def _copy_burned(p: dict) -> bool:
+    """第 2 步的副本里是不是**已经烧了字幕**（旧版产物）。
+
+    2026-11-16 起副本只抹不烧，产物里写 `burned=False`；没有这个字段的老项目
+    一律当作「已烧」——拿它再烧一遍台词会出现两层字，必须让用户先重做第 2 步。
+    """
+    ns = p.get("nosub") or {}
+    if "burned" in ns:
+        return bool(ns.get("burned"))
+    return True
+
+
+def _cap_h_of(sd_ep: dict | None) -> float:
+    """这一集原字幕的**字高**（归一化到画面高），给新字幕定字号。
+
+    算法放在 nosub._cap_h 里（和识别判据放一起，免得两处漂移），这里只借来用。
+    """
+    try:
+        from . import nosub
+        return float(nosub._cap_h(sd_ep) or 0.0)
+    except Exception:  # noqa: BLE001  拿不到就用全局兜底字号，不该让出片失败
+        return 0.0
+
+
 def _live_cap(p: dict, ep: dict, start: float, end: float,
-              speed: float) -> dict | None:
-    """src_ver=live 时，本段要现场烧回去的新字幕（跟着台词走）。"""
-    cfg = (p.get("nosub") or {}).get("cfg") or {}
+              speed: float, fx: dict | None = None) -> dict | None:
+    """本段要烧回去的台词字幕（干净副本 nosub / 现场做 live 两条路共用）。
+
+    字幕样式（动效/幅度）2026-11-16 搬到出片这一层：底片里没有字，样式改的是
+    「这一套怎么画」，所以优先读本次出片的 fx，老项目没有这两个字段时回落到
+    第 2 步存的 nosub_cfg，观感和以前一样。
+
+    位置和字号**按这一集自己量出来的字幕带走**：一个项目里常混着不同来源的片子
+    （真人剧 1080×1920 字幕在 78%，AI 生成片 720×1280 在 72%），套全局值会一眼
+    看出字幕跳了位。位置取各句框中心的**中位数**，不用并集的上下沿中点——一句
+    误检就能把范围拉偏（实测把中心从 72.8% 拽到 75.7%，整行压低 40px）。
+    """
+    ns = p.get("nosub") or {}
+    cfg = dict((ns.get("cfg") or {}))
+    # 出片这一层永远要烧字，不看 nosub_cfg.newsub（那是旧版「副本里烧不烧」的开关）
+    cfg["newsub"] = True
+    for k in ("newsub_style", "newsub_motion"):
+        v = (fx or {}).get(k)
+        if v is not None and v != "":
+            cfg[k] = v
     spec = newsub_spec(cfg)
     if not spec.get("on"):
         return None
+    by_ep = (ns.get("spans") or {}).get("by_ep") or {}
+    sd = by_ep.get(str(ep.get("file") or "")) or {}
+    cs = sorted((float(x["t"]) + float(x["b"])) / 2.0
+                for x in (sd.get("spans") or [])
+                if x.get("t") is not None and x.get("b") is not None)
+    if cs:
+        spec = dict(spec, pos=round(min(0.92, max(0.50, cs[len(cs) // 2])), 4))
+    ch = _cap_h_of(sd)
+    if ch > 0:
+        spec = dict(spec, cap_h=round(ch, 5))
     rows = cap_rows(ep.get("lines") or [], start, end, speed)
     if not rows:
         return None
@@ -1719,8 +1835,13 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                 #   src_ver=live  → 用原片，在这一趟里「抹原字幕 → 画面处理 → 烧新字幕」。
                 # live 是为了和「左右镜像」共存：字在 hflip 之后才画，翻不到。
                 live = src_ver == "live"
+                # 2026-11-16：副本是「干净版」（第 2 步只抹不烧）时，字幕也在这一趟
+                # 现烧，但画面不用再抹一遍——抹是全流程最贵的动作（实测同一段
+                # 重算掩码 60s、从干净副本切只要 18s，3.4 倍）。所以能复用副本就复用。
+                burn = live or (src_ver == "nosub" and not _copy_burned(p))
                 clean = _live_clean(p, ep, float(seg["start"]), float(seg["end"])) if live else None
-                cap = _live_cap(p, ep, float(seg["start"]), float(seg["end"]), sp) if live else None
+                cap = _live_cap(p, ep, float(seg["start"]), float(seg["end"]), sp,
+                                fx) if burn else None
                 _cut(src, seg["start"], seg["end"], dst, title, sp, zoom,
                      fade_in=bool(hook) and i == 0, grade=gspec,
                      cap=cap, clean=clean,

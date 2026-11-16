@@ -1201,6 +1201,12 @@ _ROUTE_ACTION = {
     ("POST", "/api/merge/open"): "merge.open",
     ("POST", "/api/projects/{id}/transcribe-ep"): "project.transcribe_ep",
     ("PUT", "/api/projects/{id}/lines"): "project.lines_edit",
+    # 人名写法统一（2026-11-16）：和 app/audit.py 的动作表必须一一对应
+    ("PUT", "/api/names"): "names.save",
+    ("POST", "/api/projects/{id}/names-apply"): "project.names_apply",
+    # 繁体转简体（2026-11-16）：同样与 app/audit.py 一一对应
+    ("PUT", "/api/zh"): "zh.toggle",
+    ("POST", "/api/projects/{id}/zh-apply"): "project.zh_apply",
     ("PUT", "/api/projects/{id}/plans-select"): "plan.select",
     ("PUT", "/api/projects/{id}/plan-hook"): "plan.hook",
     ("PUT", "/api/projects/{id}/plan-fx"): "plan.fx",

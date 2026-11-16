@@ -65,7 +65,9 @@ _LOCK = threading.Lock()
 
 # 状态：draft 未排期 / queued 已排期待发 / scheduled 平台已托管 / published 已发
 # manual 需人工补发 / failed 失败 / skipped 跳过
-OPEN_STATUS = ("draft", "queued", "failed", "manual", "publishing")
+# uncertain = 点过「发表」但没核对上（或断电断在那一刻），平台收没收到不知道。
+# 跟 failed 分开：failed 能「重试」，uncertain 绝不能自动重试，先让人去后台核实。
+OPEN_STATUS = ("draft", "queued", "failed", "manual", "publishing", "uncertain")
 
 # ── 每条视频要填的发布字段（对齐视频号发布页）───────────────────────────
 # 键 → (中文名, 长度上限, 提示)。上限基本都是平台的硬限制：
@@ -96,7 +98,7 @@ DECLARES = (("", "无需标注"), ("3", "内容为虚构剧情，仅供娱乐"),
 # 所以不在 BATCH_KEYS 里，由 apply_fields 单独处理（见下方注释）。
 BATCH_KEYS = ("collection", "location", "activity", "link", "original", "declare", "topics")
 # 已经是「平台托管」或「已发」的，任何字段都不许再改（改了也发不出去，只会让人误会）
-LOCKED_STATUS = ("scheduled", "published", "publishing")
+LOCKED_STATUS = ("scheduled", "published", "publishing", "uncertain")
 
 # 「这批还没发完」的状态。只要还剩一条，账号就锁死：半批发到 A、半批发到 B
 # 是最难发现的事故，且发出去收不回来（2026-11-13 用户选 C 档）。
@@ -224,7 +226,7 @@ def public_accounts() -> list[dict]:
         out.append({
             "id": r["id"],
             # 名字优先用用户自己起的，其次微信昵称，都没有就是「待扫码账号」
-            "name": r.get("name") or r.get("wx_name") or "待扫码账号",
+            "name": r.get("name") or r.get("wx_name") or "待登录账号",
             "wx_name": r.get("wx_name") or "",
             # 视频号 ID（sph 开头那串）。界面上要显示，不然多个号的备注名一混就分不清
             # 哪个是哪号。老账号还没读到就是空，登录/采一次之后自动补。
@@ -245,8 +247,8 @@ MAX_ACCOUNTS = 10  # 一台电脑最多 10 个号（用户 2026-11-13 定），�
 def add_account(name: str = "", pending: bool = False) -> dict:
     """建账号。
 
-    `pending=True` 是扫码流程用的：先建一个空壳（state=pending），二维码扫完再回填
-    昵称头像。名字允许空——小V猫那样「点加号直接出二维码」，不该先逼用户起名。
+    `pending=True` 是登录流程用的：先建一个空壳（state=pending），窗口里登完再回填
+    昵称头像。名字允许空——小V猫那样「点加号直接弹登录窗口」，不该先逼用户起名。
     """
     name = (name or "").strip()
     rows = load_accounts()
@@ -267,7 +269,7 @@ def add_account(name: str = "", pending: bool = False) -> dict:
                  "last_check": "", "last_ok": "", "note": "",
                  "created_at": fmt(datetime.now())})
     save_accounts(rows)
-    return {"id": aid, "name": name or "待扫码账号", "state": "pending" if pending else "unknown"}
+    return {"id": aid, "name": name or "待登录账号", "state": "pending" if pending else "unknown"}
 
 
 def update_account(aid: str, **patch) -> dict:
@@ -306,7 +308,10 @@ def remove_account(aid: str) -> None:
 def account_name(aid: str) -> str:
     for r in load_accounts():
         if r.get("id") == aid:
-            return r.get("name") or ""
+            # 只扫码登录没起备注名的号，name 是空，但 wx_name（平台昵称）在。
+            # 校验时回退到 wx_name，和 public_accounts() 前端展示口径一致，
+            # 否则这种号会被误判成「账号不存在」，挡在发布门外（2026-11-16）。
+            return (r.get("name") or r.get("wx_name") or "").strip()
     return ""
 
 
@@ -355,6 +360,10 @@ def queue() -> dict:
         "batch": raw.get("batch") if isinstance(raw.get("batch"), dict) else {},
         # 界面「当前发到哪个号」的唯一持久化来源，由 select_account() 写。
         "current_account_id": str(raw.get("current_account_id") or ""),
+        # 提交台账：条目从队列里删掉/归档后仍要留下「可能已经交给平台」的
+        # 证据，否则清空一次队列就绕过了防重复发（2026-11-15）。
+        "ledger": [x for x in (raw.get("ledger") or [])
+                   if isinstance(x, dict) and x.get("job_id")],
         "jobs": [j for j in jobs if isinstance(j, dict) and j.get("id")],
     }
 
@@ -390,6 +399,61 @@ def save_queue(q: dict) -> None:
         os.replace(tmp, QUEUE_FILE)
 
 
+def _ledger_add(q: dict, job: dict) -> None:
+    """条目离开队列前留一条提交证据。只记能判重的最小字段，不存视频内容。"""
+    if not (job.get("submit_started_at") or
+            job.get("status") in ("scheduled", "published", "uncertain")):
+        return
+    rec = {
+        "job_id": str(job.get("id") or ""),
+        "account_id": str(job.get("account_id") or ""),
+        "title": str(job.get("title") or "")[:80],
+        "file": str(job.get("file") or "")[:300],
+        "status": str(job.get("status") or ""),
+        "submit_started_at": str(job.get("submit_started_at") or ""),
+        "scheduled_at": str(job.get("scheduled_at") or ""),
+        "left_at": fmt(now()),
+    }
+    q["ledger"] = [x for x in (q.get("ledger") or [])
+                   if x.get("job_id") != rec["job_id"]]
+    q["ledger"].append(rec)
+    q["ledger"] = q["ledger"][-500:]
+
+
+def mark_submit_started(jid: str) -> dict:
+    """点「发表」**之前**落盘：写不进去就别点（回调抛错会中断发布，安全）。
+
+    有这个时间戳 = 这条可能已经交给平台。重启、失败、重试都不许当成
+    「还没点过」重新来一遍。
+    """
+    q = queue()
+    job = next((j for j in q["jobs"] if j["id"] == jid), None)
+    if not job:
+        raise PublishError("这条已经不在队列里了，没敢点发表")
+    job["submit_started_at"] = fmt(now())
+    job["status"] = "publishing"
+    save_queue(q)
+    return job
+
+
+def account_identity(aid: str) -> dict:
+    """排期时把「发到哪个号」冻结成平台昵称，发表前跟浏览器里登的号比对。
+
+    **只认 wx_name**（平台昵称）。name 是用户自己写的备注名，跟页面上的
+    昵称不是一回事，拿去比对会把整批误判成「登错号」。资料没抓全就返回
+    空 dict，那这次不核对，别误伤。
+    """
+    for r in load_accounts():
+        if r.get("id") != aid:
+            continue
+        name = str(r.get("wx_name") or "").strip()
+        if not name:
+            return {}
+        return {"name": name[:30],
+                "finder_id": str(r.get("finder_id") or "").strip()[:40]}
+    return {}
+
+
 ARCHIVE_FILE = os.path.join(core.DATA_DIR, "queue_archive.json")
 # 归档的门槛：完结（已定时/已提交/已取消）超过 7 天的条目。7 天是平台定时
 # 的最大提前量——超过它，平台上要么已经发了、要么早该处理完了。
@@ -415,6 +479,8 @@ def archive_old_jobs(keep_days: int = 7) -> int:
             keep.append(j)
     if not moved:
         return 0
+    for j in moved:
+        _ledger_add(q, j)
     arch = {"archived_at": fmt(datetime.now()), "jobs": moved}
     try:
         with open(ARCHIVE_FILE, encoding="utf-8") as f:
@@ -810,7 +876,10 @@ def add_jobs(files: list[str] | None = None, sets: list[int] | None = None,
         added.append(job["id"])
 
     save_queue(q)
-    return {"added": added, "dup": dup, "total": len(q["jobs"])}
+    # 刚加进来的这批里，有以前发过 / 交过平台的吗？只提示，不拦。
+    new_ids = set(added)
+    rep = repost_conflicts([j for j in q["jobs"] if j.get("id") in new_ids], q)
+    return {"added": added, "dup": dup, "total": len(q["jobs"]), "repost": rep}
 
 
 def job_full(j: dict) -> dict:
@@ -822,6 +891,7 @@ def job_full(j: dict) -> dict:
         "activity": "", "activity_id": "",
         "link": "", "link_kind": "", "link_id": "", "link_title": "",
         "original": False, "declare": "",
+        "account_identity": {}, "submit_started_at": "",
         "pid": "", "project": "",
     }
     base.update({k: v for k, v in j.items() if v is not None})
@@ -931,8 +1001,11 @@ def del_job(jid: str, allow_platform: bool = False) -> None:
         # 浏览器正在传，删掉本地记录不会让发表停下来，
         # 只会把这条弄丢、并让批次锁号悄悄解开。
         raise PublishError("这条正在上传，删了也停不下来，等它传完再说")
+    if st == "uncertain":
+        raise PublishError("这条还没核实结果，先点「后台已有这条」或「核实没发出去」")
     if st in ("scheduled", "published") and not allow_platform:
         raise PublishError("这条已经交给视频号了，要取消得去视频号后台")
+    _ledger_add(q, job)
     q["jobs"] = [j for j in q["jobs"] if j["id"] != jid]
     save_queue(q)
 
@@ -950,8 +1023,13 @@ def clear_draft() -> dict:
 # ── 排期 ────────────────────────────────────────────────────────────────
 def build_plan(first_at: str, interval_min: int, n: int,
                existing: list[dict] | None = None,
-               account_id: str = "") -> dict:
-    """算排期 + 全部告警。**只算不存**，前端拿它渲染预览。"""
+               account_id: str = "",
+               now_at: datetime | None = None) -> dict:
+    """算排期 + 全部告警。**只算不存**，前端拿它渲染预览。
+
+    `now_at` 只给回归脚本传固定时间用（2026-11-15）：排期结果不该依赖
+    「跑脚本的钟点」，否则跨天就假红。不传就跟原来一样取当前时间。
+    """
     start = parse(first_at)
     if not start:
         raise PublishError("先选一个首条发布时间")
@@ -963,7 +1041,7 @@ def build_plan(first_at: str, interval_min: int, n: int,
         raise PublishError("队列里还没有视频")
 
     errors, warns = [], []
-    t0 = now()
+    t0 = now_at or now()
 
     if gap < INTERVAL_MIN:
         errors.append({
@@ -1070,6 +1148,69 @@ def build_plan(first_at: str, interval_min: int, n: int,
     }
 
 
+def _norm_file(p) -> str:
+    """台账里的路径按「同一个文件」归一，别让 \\ 和 / 把同一条算成两条。"""
+    return str(p or "").strip().replace("\\", "/").rstrip("/").lower()
+
+
+def repost_conflicts(jobs: list[dict], q: dict | None = None) -> list[dict]:
+    """这批里哪些视频以前发过 / 交过平台（只看提交台账）。
+
+    **只提醒，不拦**：同一个片子换个时间重发是合法场景（2026-11-15 A 档）。
+    队列里现存的条目 `add_jobs` 已经按 hash 挡过，这里专治「删掉记录或归档
+    之后又加回来」——那时队列里查不到，但台账里留着证据。
+    """
+    q = q or queue()
+    prev: dict[str, list[dict]] = {}
+    for rec in (q.get("ledger") or []):
+        f = _norm_file(rec.get("file"))
+        st = str(rec.get("status") or "")
+        if not f or st in ("cancelled", "skipped"):
+            continue
+        prev.setdefault(f, []).append({
+            "status": st,
+            "at": str(rec.get("scheduled_at") or rec.get("submit_started_at")
+                      or rec.get("left_at") or ""),
+            "title": str(rec.get("title") or "")[:60],
+        })
+    out = []
+    for j in jobs:
+        hits = prev.get(_norm_file(j.get("file"))) or []
+        if not hits:
+            continue
+        hits.sort(key=lambda x: x["at"], reverse=True)
+        out.append({
+            "job_id": str(j.get("id") or ""),
+            "file": os.path.basename(str(j.get("file") or "")),
+            "prev_status": hits[0]["status"],
+            "prev_at": hits[0]["at"],
+            "prev_title": hits[0]["title"],
+            "times": len(hits),
+        })
+    return out
+
+
+def _plan_intent(jobs: list[dict], first_at, interval_min,
+                 repost: list[dict]) -> str:
+    """「确认框当时看的是哪一批」的指纹，只算不存（不留服务端状态）。
+
+    刻意**不含账号**：预览接口拿不到「当前号」，而 batch.account_id 是历史值，
+    绝不能参与「当前」判断。账号在确认框里已经写全、start 自己也会校验。
+    """
+    raw = {
+        "first": str(first_at or ""),
+        "gap": int(interval_min or 0),
+        "files": sorted(str(j.get("hash") or _norm_file(j.get("file")))
+                        for j in jobs),
+        "repost": sorted(
+            f"{_norm_file(r.get('file'))}|{r.get('prev_status')}|{r.get('prev_at')}"
+            for r in repost),
+    }
+    return hashlib.sha1(
+        json.dumps(raw, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+
+
 def preview(first_at: str, interval_min: int) -> dict:
     q = queue()
     jobs = [j for j in q["jobs"] if j.get("status") in ("draft", "queued")]
@@ -1077,10 +1218,15 @@ def preview(first_at: str, interval_min: int) -> dict:
     res = build_plan(first_at, interval_min, len(jobs), jobs, acc)
     res["titles"] = [j.get("title") or os.path.basename(j.get("file") or "")
                      for j in jobs]
+    # 指纹只覆盖「还没安排」的那批：start 落库时也只看 draft，两边必须同口径。
+    drafts = [j for j in jobs if j.get("status") == "draft"]
+    res["repost"] = repost_conflicts(drafts, q)
+    res["intent"] = _plan_intent(drafts, first_at, interval_min, res["repost"])
     return res
 
 
-def start(first_at: str, interval_min: int, account_id: str) -> dict:
+def start(first_at: str, interval_min: int, account_id: str,
+          intent: str = "") -> dict:
     """落库排期：draft → queued，写入计划时间。"""
     q = queue()
     jobs = [j for j in q["jobs"] if j.get("status") == "draft"]
@@ -1094,10 +1240,20 @@ def start(first_at: str, interval_min: int, account_id: str) -> dict:
     res = build_plan(first_at, interval_min, len(jobs), jobs, account_id)
     if not res["ok"]:
         raise PublishError(res["errors"][0]["msg"])
+    # 确认框看过之后，视频或时间又变了 → 不能还按旧确认提交。指纹只算不存，
+    # 前端把预览返回的 intent 原样带回来即可（留空兼容老前端 / 脚本）。
+    want = _plan_intent(jobs, first_at, interval_min,
+                        repost_conflicts(jobs, q))
+    if intent and intent != want:
+        raise PublishError("这批视频或时间刚改过，请重新看一遍预览再提交。")
 
+    ident = account_identity(account_id)
     for job, t in zip(jobs, res["times"]):
         job["plan_at"] = t
         job["account_id"] = account_id
+        # 发表前拿它跟浏览器里登的号比对；资料没抓全就是 {}，跳过核对
+        job["account_identity"] = ident
+        job["submit_started_at"] = ""
         job["status"] = "queued"
         job["attempts"] = 0
         job["error"] = ""
@@ -1119,22 +1275,30 @@ def start(first_at: str, interval_min: int, account_id: str) -> dict:
     return {"started": len(jobs), "first": res["first"], "last": res["last"]}
 
 
-def stop() -> dict:
+def stop(account_id: str = "") -> dict:
     """撤回排期：还没传的（queued）退回 draft，同时数一下已经在平台的条目。
 
+    account_id 非空时只撤**这个号**的（2026-11-14 加）：界面上「批量取消」
+    挂在当前号的已提交列表下，操作范围必须跟显示范围一致，否则在 B 号页面上
+    点一下会把 A 号正在排队的也退回来——跨号误伤。
     已上传的（scheduled）**本地退不了**：平台的删除自动化还没打通
     （wxdel.py 顶部有记录），只能如实让用户去助手手动删——绝不能假装
     「撤回了」，到点它还是会照发。
     """
+    account_id = str(account_id or "")
     q = queue()
     n = 0
     for j in q["jobs"]:
+        if account_id and j.get("account_id") != account_id:
+            continue
         if j.get("status") == "queued":
             j["status"] = "draft"
             j["plan_at"] = ""
             n += 1
     save_queue(q)
-    on_platform = len([j for j in q["jobs"] if j.get("status") == "scheduled"])
+    on_platform = len([j for j in q["jobs"]
+                       if j.get("status") == "scheduled"
+                       and (not account_id or j.get("account_id") == account_id)])
     return {"reverted": n, "on_platform": on_platform}
 
 
@@ -1142,18 +1306,26 @@ def reset_stuck_publishing() -> int:
     """把上次没跑完就退出的「正在上传」条目放回队列。
 
     程序在传到一半时被关掉/断电，条目会永远停在 publishing——worker 只认
-    queued，不重置就再也不会发。重放的代价：如果退出发生在「点发表」之后、
-    「回读核对」之前，重试会在平台上多出一条定时条目，待发布列表里看得到、
-    能手动删。两害相权：永远卡死的条目更糟。
+    queued，不重置就再也不会发。
+
+    **2026-11-15 改**：有 submit_started_at（点过发表）的绝不放回 queued，
+    改成「结果待核实」，等人去后台核对。以前无条件重放，退出正好发生在
+    「点发表之后、回读之前」时会在平台上多出一条 —— 那是重复发表。
     """
     q = queue()
     n = 0
     for j in q["jobs"]:
-        if j.get("status") == "publishing":
+        if j.get("status") != "publishing":
+            continue
+        if j.get("submit_started_at"):
+            j["status"] = "uncertain"
+            j["error"] = ("上次在点「发表」前后退出了，不知道平台收没收到。"
+                          "先去视频号助手「待发布」里核对，别直接重试。")
+        else:
             j["status"] = "queued"
             j["attempts"] = 0
             j["error"] = "程序中途退出，已自动重新排队"
-            n += 1
+        n += 1
     if n:
         save_queue(q)
     return n
@@ -1185,7 +1357,18 @@ def mark(jid: str, action: str, note: str = "") -> dict:
     job = next((j for j in q["jobs"] if j["id"] == jid), None)
     if not job:
         raise PublishError("这条已经不在队列里了")
-    if action == "published":
+    if action in ("resolved_published", "resolved_cancelled"):
+        # 「结果待核实」的收尾：只能由人在后台看过之后选，程序不猜
+        if job.get("status") != "uncertain":
+            raise PublishError("只有「结果待核实」的条目能做这个确认")
+        ok = action == "resolved_published"
+        job["status"] = "published" if ok else "skipped"
+        job["done_at"] = fmt(datetime.now())
+        job["error"] = "" if ok else "核实后台没有这条，结束"
+        job["resolved_by"] = "user"
+        if ok:
+            job["verified_at"] = job["done_at"]
+    elif action == "published":
         job["status"] = "published"
         job["done_at"] = fmt(datetime.now())
         job["verified_at"] = job["done_at"]
@@ -1215,14 +1398,15 @@ def mark(jid: str, action: str, note: str = "") -> dict:
 def set_status(jid: str, status: str, note: str = "", extra: dict | None = None) -> dict:
     """给自动发表流程改状态用（worker 调）。
 
-    允许的状态：publishing / scheduled / failed / queued / manual。
-    `extra` 里的 attempts / scheduled_at / verified_at 一起写进去。
+    允许的状态：publishing / scheduled / failed / queued / manual / uncertain。
+    `extra` 里的 attempts / scheduled_at / verified_at / submit_evidence 一起写进去。
 
     为什么单独一个函数：`mark()` 是给人手动点「已发/跳过」用的，
-    它只认那两个动作；自动流程要走的状态多得多，混在一起会把
+    它只认那几个动作；自动流程要走的状态多得多，混在一起会把
     「人点的」和「机器点的」混为一谈。
     """
-    ok = ("publishing", "scheduled", "failed", "queued", "manual", "draft")
+    ok = ("publishing", "scheduled", "failed", "queued", "manual", "draft",
+          "uncertain")
     if status not in ok:
         raise PublishError("不认识的状态")
     q = queue()

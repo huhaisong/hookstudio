@@ -23,7 +23,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -76,6 +76,14 @@ ACTION_RULES: dict[tuple[str, str], str] = {
     ("PUT", "/api/projects/{id}/lines"): "project.lines_edit",
     # 单集重转写（排障入口）：和整剧转写要分开，不然「转写」一列分不清是重跑哪集
     ("POST", "/api/projects/{id}/transcribe-ep"): "project.transcribe_ep",
+    # 人名写法统一（2026-11-16）：改对照表 / 把对照表套到已有台词上。
+    # 不占额度但要单独记——这两个动作会**成批改台词文字**，排查「台词怎么变了」全靠它。
+    ("PUT", "/api/names"): "names.save",
+    ("POST", "/api/projects/{id}/names-apply"): "project.names_apply",
+    # 繁体转简体（2026-11-16）：开关 + 把已有台词里的繁体换掉。
+    # 后者同样**成批改台词文字**，排查「台词怎么变了」必须能查到这个动作。
+    ("PUT", "/api/zh"): "zh.toggle",
+    ("POST", "/api/projects/{id}/zh-apply"): "project.zh_apply",
     ("POST", "/api/projects/{id}/analyze"): "project.analyze",
     ("POST", "/api/projects/{id}/plan"): "plan.generate",
     # 第 2 步的第二种编排：单集钩子前置（一集一条成片）。与 plan.generate
@@ -101,6 +109,8 @@ ACTION_RULES: dict[tuple[str, str], str] = {
     # 第 2 步：去字幕 + 加自己的字幕，产出已处理视频（2026-11-11）。纯本机编码，不占 AI 额度。
     ("PUT", "/api/projects/{id}/nosub-config"): "nosub.config",
     ("POST", "/api/projects/{id}/nosub"): "nosub.generate",
+    ("POST", "/api/projects/{id}/retime"): "nosub.retime",
+    ("POST", "/api/projects/{id}/retime/revert"): "nosub.retime_revert",
     ("POST", "/api/projects/{id}/nosub/open"): "nosub.open",
     ("POST", "/api/projects/{id}/nosub/preview"): "nosub.preview",
     # 批量定时发布（2026-11-13）：全部挂在 hookcut.publish 前缀下，后台按前缀
@@ -122,9 +132,9 @@ ACTION_RULES: dict[tuple[str, str], str] = {
     ("POST", "/api/publish/diag/{id}"): "hookcut.publish.diag",
     # 开/关流速监控：会改本机后台是否持续去号里采，算配置变更
     ("POST", "/api/publish/monitor"): "hookcut.publish.monitor",
-    # 扫码登录（2026-11-13）：出二维码 / 改账号名 是有动作含义的；
+    # 弹登录窗口（2026-11-13）／改账号名 是有动作含义的；
     # login-state 是每 2 秒一次的轮询，进 noisy 列表，不占后台日志。
-    ("POST", "/api/publish/accounts/{id}/qr"): "hookcut.publish",
+    ("POST", "/api/publish/accounts/{id}/login"): "hookcut.publish",
     ("PUT", "/api/publish/accounts/{id}"): "hookcut.publish.rename",
     # 手改剪辑表（第 3/4 步的文本框直接保存）
     ("PUT", "/api/projects/{id}/edl"): "edl.save",
@@ -580,6 +590,10 @@ def _worth_logging_get(route: str) -> bool:
         # 页面加载顺带刷的查询（无动作名，后台纯噪音）
         # 曲库状态也是开设置页时读一次，只读、无副作用，别占后台日志
         "/api/projects", "/api/projects/{id}/plan", "/api/bgm/library",
+        # 第 1 步开页面读一次人名对照表：只读、无副作用，别占后台日志
+        "/api/names",
+        # 同上：读繁转简开关状态
+        "/api/zh",
         # 后台/前端的身份与看板自查询（读，无副作用）
         "/api/auth/me", "/api/admin/users", "/api/admin/logs",
         "/api/admin/logs/filters", "/api/admin/logs/stats", "/api/admin/settings",
@@ -614,8 +628,11 @@ def _worth_logging_get(route: str) -> bool:
 # 任何方法都不记的接口：弹系统文件框（选文件夹/选音乐/选要发布的视频），没有审计价值。
 # /api/publish/media 是发表时页面回本机取视频/封面的通道（带 HMAC 签名），
 # 它是文件字节流而不是用户动作，记进去只会把后台日志刷成一条条 media。
-_SILENT_ROUTES = ("/api/pick-folder", "/api/pick-file", "/api/publish/pick-files",
-                  "/api/publish/pick-folder", "/api/publish/pick-cover",
+# /api/pick-history 和 /api/publish/dir-files 是「上次选过的位置」和「列这个目录里
+# 的视频」，属于选文件的同一件事（点历史文件夹等于选一次文件夹），同样没有审计价值。
+_SILENT_ROUTES = ("/api/pick-folder", "/api/pick-file", "/api/pick-history",
+                  "/api/publish/pick-files", "/api/publish/pick-folder",
+                  "/api/publish/pick-cover", "/api/publish/dir-files",
                   "/api/publish/cover/preview", "/api/publish/_probe",
                   "/api/publish/media")
 

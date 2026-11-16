@@ -169,11 +169,7 @@ async function boot() {
   const st = await api("/api/status");
   ST.status = st;
   loadWho();
-  // 顶栏只报「能不能用」，不报服务商、型号、档位这些内部信息
-  $("#pills").innerHTML = [
-    `<span class="pill ${st.llm_key ? "ok" : "bad"}">AI 生成 ${st.llm_key ? "已就绪" : "暂不可用"}</span>`,
-    `<span class="pill ${st.whisper_model ? "ok" : "bad"}">台词识别 ${st.whisper_model ? "已就绪" : "需检查"}</span>`,
-  ].join("");
+  paintPills(st);
 
   const roots = await api("/api/roots");
   renderDrives(roots);
@@ -196,6 +192,9 @@ async function boot() {
   await loadModelsAlive();
   updateModeHint();
   await loadList();
+  loadSaveDirHist();
+  loadNames();   // 人名对照表：只是给第 1 步填编辑框，不阻塞主流程
+  loadZh();      // 繁转简开关：同上，读不到就按默认（开）
 }
 
 async function loadList() {
@@ -232,6 +231,55 @@ function applyProjFilter() {
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
+
+/* 顶栏状态（2026-11-15 用户定）：只在**出问题**时出现。
+   两个都正常时是纯噪音——信息在设置里也有，还占掉顶栏最显眼的位置、跟
+   「联系作者」抢注意力。所以正常就一个胶囊都不留，异常才变红并可点去设置。
+   留着而不是删掉，是因为 AI 不可用时这是全站唯一随时可见的健康信号，
+   删干净以后用户只会看到一串失败提示，不知道是配置问题。 */
+function paintPills(st) {
+  const bad = [];
+  if (!st || !st.llm_key) bad.push("AI 生成不可用");
+  if (st && !st.whisper_model) bad.push("台词识别未就绪");
+  $("#pills").innerHTML = bad.length
+    ? bad.map((t) => `<button class="pill bad" data-pill-fix
+        title="${t}：点一下打开设置检查">${t}</button>`).join("")
+    : "";
+  document.querySelectorAll("[data-pill-fix]").forEach((el) =>
+    el.addEventListener("click", () => $("#btn-settings").click()));
+}
+
+/* 「最近用过」：位置由后端记着（app/pickmem.py，选完就记），这里只负责摆出来。
+   点一下等于「选中那个位置」，不再弹框——同一批素材天天用，省一次翻目录。 */
+function tailDir(p, n = 2) {
+  const segs = String(p || "").replace(/\\/g, "/").split("/").filter(Boolean);
+  if (!segs.length) return String(p || "");
+  const tail = segs.slice(-n).join("/");
+  return segs.length > n ? "…/" + tail : tail;
+}
+
+async function loadHistChips(boxId, key, onPick) {
+  const box = document.getElementById(boxId);
+  if (!box) return;
+  let items = [];
+  try {
+    const r = await api(`/api/pick-history?key=${encodeURIComponent(key)}&limit=3`);
+    items = (r && r.items) || [];
+  } catch (e) {
+    box.innerHTML = "";                       // 读不到历史不影响主流程
+    return;
+  }
+  if (!items.length) {
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = `<span class="hist-l">最近用过</span>` + items.map((it) =>
+    `<button class="hist-chip" data-path="${esc(it.path)}"
+      title="${esc(it.path)}">${esc(tailDir(it.path))}</button>`).join("");
+  box.querySelectorAll(".hist-chip").forEach((el) =>
+    el.addEventListener("click", () => onPick(el.dataset.path)));
+}
+
 
 /* 盘符切换：本机可能有多个盘，素材常常不在系统盘上 */
 function renderDrives(roots) {
@@ -434,7 +482,7 @@ async function autoTranscribe(id) {
 const TASK_FALLBACK = {
   transcribe: "正在整理台词", plan: "AI 正在编排结构",
   analyze: "正在让 AI 出结构表", render: "正在出片", batch: "正在批量出片",
-  shots: "AI 正在写镜号提示词", nosub: "正在生成处理好的视频",
+  shots: "AI 正在写镜号提示词", nosub: "正在生成干净底片",
 };
 
 /* 任务是不是「还在跑」。
@@ -470,15 +518,21 @@ function activeBarTask(p) {
    避免连点；也别因为另一条还在跑就把这一条的按钮一直锁着。 */
 const _cancelSent = { cuts: false, nosub: false, shots: false };
 /* 中止后的反馈条：状态条不能「啪一下就没了」，只剩一个 toast 抓不住
-   （2026-11-14 用户反馈）。留 60 秒的结果反馈，期间有新任务就自然覆盖。 */
-const _abortNote = { group: "", at: 0 };
+   （2026-11-14 用户反馈）。留 60 秒的结果反馈，期间有新任务就自然覆盖。
+   2026-11-16：原来只有一个全局槽，别的产线还在跑时会被无条件清掉（跨组并行
+   是常态），用户就看不到「已中止」。改成按产线各记一份，并带上被中止那一趟
+   任务的 started，用来分辨「同一趟在收尾」和「用户又点了生成」。 */
+const _abortNote = { cuts: null, nosub: null, shots: null };
 
 /* 顶部状态条：有任务时显示「在做什么 + 进度 + 已用时间 + 预计还需」，没有就收起 */
 function updateBar(t, group) {
   const bar = $("#gbar");
   const stop = $("#btn-task-cancel");
+  const key = group || "cuts";
+  const note = _abortNote[key];
+  const fresh = !!note && Date.now() - note.at < 60000;
+  if (!fresh) _abortNote[key] = null;
   if (!taskBusy(t)) {
-    const fresh = _abortNote.group && Date.now() - _abortNote.at < 60000;
     if (fresh) {
       bar.classList.remove("hidden");
       $("#gbar-fill").style.width = "100%";
@@ -486,11 +540,21 @@ function updateBar(t, group) {
       if (stop) { stop.disabled = true; stop.textContent = "中止"; }
       return;
     }
-    _abortNote.group = "";
     bar.classList.add("hidden");
     return;
   }
-  _abortNote.group = "";
+  // 刚点过中止、后端还在收尾：别再把旧百分比和「预计还需」摆出来，那看起来
+  // 跟完全没反应一样。started 变了说明用户已经重新发起了这一条产线。
+  const sameTask = fresh && (!note.started
+    || Number(t.started || 0) === Number(note.started));
+  if (sameTask) {
+    bar.classList.remove("hidden");
+    $("#gbar-fill").style.width = "100%";
+    $("#gbar-text").textContent = "正在收尾，马上停…";
+    if (stop) { stop.disabled = true; stop.textContent = "中止中…"; }
+    return;
+  }
+  if (fresh) _abortNote[key] = null;   // 这条产线又起了新任务，旧反馈让位
   const pct = Math.max(2, Math.min(100, Math.round(t.pct || 0)));
   bar.classList.remove("hidden");
   $("#gbar-fill").style.width = pct + "%";
@@ -530,24 +594,39 @@ $("#btn-task-cancel").addEventListener("click", async () => {
     danger: true,
   });
   if (!ok) return;
+  const curTask = { cuts: p.task, nosub: p.task_nosub, shots: p.task_shots }[key];
   _cancelSent[key] = true;
   btn.disabled = true;
   btn.textContent = "中止中…";
+  // 点下去的这一刻就要有可见变化，不能等下一拍轮询（2026-11-16 用户反馈：
+  // 「点了中止之后没有刷新状态」）。
+  _abortNote[key] = { at: Date.now(), started: Number((curTask || {}).started || 0) };
+  render();
   try {
     const r = await api(`/api/projects/${p.id}/task/cancel`, {
       method: "POST", body: JSON.stringify({ group }),
     });
     if (!(r.cancelled || []).length) {
       _cancelSent[key] = false;
+      _abortNote[key] = null;
       toast("这一步刚好已经结束了");
     } else {
-      _abortNote.group = key;
-      _abortNote.at = Date.now();
       toast("已中止，正在收尾；已经做好的部分都还在");
     }
   } catch (e) {
     _cancelSent[key] = false;
+    _abortNote[key] = null;
     toast(e.message || "没能中止，请再试一次");
+  } finally {
+    // 三条路径都立刻拉一次真实状态：原来只靠 1.5 秒轮询，而轮询空闲 3 拍
+    // 就自动停掉，界面会永远停在旧进度上。
+    try {
+      const freshProj = await api("/api/projects/" + p.id);
+      // 请求期间用户可能已经切到别的项目，别把旧项目的数据盖回来
+      if (ST.proj && ST.proj.id === p.id) ST.proj = freshProj;
+    } catch (e) { /* 拉不到就交给轮询兜底 */ }
+    render();
+    startPoll();
   }
 });
 
@@ -589,9 +668,9 @@ function stepNavItems(p) {
     const ns = p.nosub || {};
     const nsDone = Object.keys(ns.files || {}).length;
     const nsAll = eps.length > 0 && nsDone >= eps.length;
-    items.push({ key: "0", no: "2", label: "重做字幕", sub: "换成自己的台词",
+    items.push({ key: "0", no: "2", label: "抹掉原字幕", sub: "做一次，多套共用",
       state: nsAll ? "done" : "todo",
-      txt: nsAll ? "已备好" : nsDone ? `已备 ${nsDone}/${eps.length} 集` : "可跳过" });
+      txt: nsAll ? "已做好" : nsDone ? `已做 ${nsDone}/${eps.length} 集` : "未做" });
     const hasPlan = p.mode === "batch" ? plans.length : (p.edl || []).length;
     const hasOut = p.mode === "batch" ? (p.sets || []).length : p.output;
     items.push({ key: "2", no: "3", label: "剪辑与出片", sub: "排结构 · 出片",
@@ -805,20 +884,24 @@ function render() {
     }
   }
   renderNoSub(p);
+  renderNames();
+  renderZh();
   renderStepNav(p);
 }
 
-/* ---------- 台词整理之后的一步：重做字幕（2026-11-11，2026-11-12 收敛）-------
-   逐集把原字幕抹掉，再按这一集整理好的台词把新字幕烧在原来那行字幕的位置上，
-   产出每集一条独立视频；后面剪辑出片直接从这些视频切段。整步可选，跳过也行。
+/* ---------- 台词整理之后的一步：抹掉原字幕（2026-11-11 起，2026-11-16 重组）
+   逐集把画面上的原字幕抹干净，产出「没有字幕的底片」；台词在出片时才烧上去，
+   所以底片一份多套共用，镜像也不会把字翻反。整步不做也能出片（选「原始视频」）。
 
-   界面上有四调项：出场动效、动效幅度、抹除柔和程度、抹掉的地方怎么补。
-   其余（做法、字幕位置、要不要加字幕）都已固定（2026-11-12 用户要求），
-   所以 mode/auto/newsub 不再从界面读，直接写死跟后端一致。 */
+   界面上只剩两项：抹除柔和程度、抹掉的地方怎么补（都是「抹得干不干净」），
+   外加字幕时间自动对齐。
+   **字幕样式（动效/幅度）2026-11-16 搬到出片第 5 组**：这一步的产物不含字，
+   留在面板上改了也不会有任何变化，等于骗人。
+   其余（做法、字幕位置、要不要加字幕）都已固定，mode/auto/newsub 写死。 */
 const NS_DEF = { mode: "soft", auto: true, pos: 0.75, size: 0.10, soft: 0.5,
                  fill: "above", fill_mode: "mirror",
                  newsub: true, newsub_pos: 0.80, newsub_motion: 0.5,
-                 newsub_style: "rise" };
+                 newsub_style: "rise", retime: true };
 /* 新字幕出场动效。跟后端 render.NEWSUB_STYLES 一一对应，
    首字母参与设置指纹（改风格就得重做副本）。 */
 const NS_STYLES = ["fade", "rise", "pop", "float", "type"];
@@ -845,8 +928,6 @@ function readNoSubCfg() {
   const saved = Object.assign({}, NS_DEF,
     (ST.proj && ST.proj.nosub_cfg) || ns.cfg || {});
   const pick = (k) => (det[k] == null ? saved[k] : det[k]);
-  const style = $("#ns-nstyle") ? String($("#ns-nstyle").value) : "";
-  const motion = Math.round(saved.newsub_motion * 100);
   const fm = $("#ns-fillmode") ? String($("#ns-fillmode").value) : "";
   return {
     mode: "soft",
@@ -858,34 +939,36 @@ function readNoSubCfg() {
     fill_mode: fm === "borrow" ? "borrow" : "mirror",
     newsub: true,
     newsub_pos: Math.min(0.92, Math.max(0.50, pick("newsub_pos"))),
-    newsub_motion: Math.min(1, Math.max(0,
-      v("ns-nmotion", Number.isFinite(motion) ? motion : 50) / 100)),
-    newsub_style: NS_STYLES.indexOf(style) >= 0 ? style : "rise",
+    // 字幕样式已搬到出片面板：这里沿用项目里存的值，控件不在了就原样传回去，
+    // 免得每次保存都把它重置成出厂值（顺手改了用户上次选的动效）。
+    newsub_motion: Math.min(1, Math.max(0, Number(saved.newsub_motion) || 0.5)),
+    newsub_style: NS_STYLES.indexOf(saved.newsub_style) >= 0 ? saved.newsub_style : "rise",
+    // 生成时要不要先按原片字幕重排时间（默认要）。跟着勾选框走；
+    // 勾选框不在页面上时才退回项目里存的值。
+    retime: $("#ns-retime") ? !!$("#ns-retime").checked : saved.retime !== false,
   };
 }
 
 /* 跟后端 nosub.sig_of(cfg)（只算设置那一半）同一套算法：用来判断
    「现在面板上的设置，和已经生成的那份副本是不是同一版」。不一致就提示重做。
    c 必须是**完整**的 cfg（pos/size/fill/newsub_pos 都在），因为识别出来的
-   新字幕位置也算在指纹里；只拿面板上的三个值算会永远对不上。 */
+   新字幕位置也算在指纹里；只拿面板上的三个值算会永远对不上。
+   |N5 的 5 是出场参数版本（先后做过：放大动效幅度、加「字幕比声音晚」、
+   删掉它、烧字去标点），两处必须同步，否则面板永远认为「没改过」。 */
 function nsSig(c) {
   return `${NS_ENGINE}F${Math.round(c.pos * 1000)}${Math.round(c.size * 1000)}`
     + `${Math.round(c.soft * 100)}${c.fill === "below" ? "d" : "u"}`
     + `${c.fill_mode === "borrow" ? "B" : "M"}`
-    + `|N${Math.round(c.newsub_pos * 1000)}${Math.round(c.newsub_motion * 100)}`
+    + `|N5${Math.round(c.newsub_pos * 1000)}${Math.round(c.newsub_motion * 100)}`
     + `${(c.newsub_style || "rise").charAt(0)}`;
 }
 
-/* 面板上只剩三个可调项：出场动效、动效幅度、抹除柔和程度。
-   位置、带高、从哪边补、识别到的范围都不再显示——识别是机器的事，
-   结果只落在成品里；原理放在「这一步会做什么」里讲。 */
+/* 面板上只剩「抹得干不干净」两项 + 时间对齐开关。位置、带高、从哪边补都不显示——
+   识别是机器的事，结果只落在成品里；原理放在「这一步会做什么」里讲。 */
 function nsSync() {
   const c = readNoSubCfg();
   const n = Math.round(c.soft * 100);
   setText("#ns-softv", n < 25 ? "偏清晰" : n < 75 ? "中等" : "更柔");
-  const m = Math.round(c.newsub_motion * 100);
-  setText("#ns-nmotionv", m <= 0 ? "几乎不动" : m >= 90 ? "明显"
-    : m < 30 ? "很轻" : m < 70 ? "推荐" : "偏明显");
   return c;
 }
 
@@ -897,9 +980,9 @@ function writeNoSubCfg(p) {
   const c = Object.assign({}, NS_DEF, p.nosub_cfg || (p.nosub || {}).cfg || {});
   const put = (id, v) => { const e = $("#" + id); if (e) e.value = v; };
   put("ns-soft", Math.round((c.soft == null ? 0.5 : c.soft) * 100));
-  put("ns-nmotion", Math.round((c.newsub_motion == null ? 0.5 : c.newsub_motion) * 100));
-  put("ns-nstyle", NS_STYLES.indexOf(c.newsub_style) >= 0 ? c.newsub_style : "rise");
   put("ns-fillmode", c.fill_mode === "borrow" ? "borrow" : "mirror");
+  const rt = $("#ns-retime");
+  if (rt) rt.checked = c.retime !== false;
   nsSync();
 }
 
@@ -925,8 +1008,8 @@ function renderNoSub(p) {
   const t = p.task_nosub;
   const busy = taskBusy(t) && t.kind === "nosub";
   const cur = readNoSubCfg();
-  // 能动的只有「柔和程度 / 动效幅度 / 出场动效」三项。位置、带高、填充方向
-  // 都是识别出来的，所以拿上一次那份完整 cfg 当底、只把这三项盖上去再算
+  // 能动的只有「柔和程度 / 动效幅度 / 出场动效 / 补法」四项。位置、带高、填充方向
+  // 都是识别出来的，所以拿上一次那份完整 cfg 当底、只把这几项盖上去再算
   // 指纹——直接用手拼的话 newsub_pos 会差一位，界面会一直喊「要重做」。
   const base = ns.cfg && ns.cfg.pos != null
     ? Object.assign({}, ns.cfg, {
@@ -940,15 +1023,15 @@ function renderNoSub(p) {
 
   const state = busy ? `${Math.round(t.pct || 0)}% · ${t.msg}`
     : t && t.error && t.kind === "nosub" ? "失败：" + String(t.error).slice(0, 120)
-      : done >= total && total ? `已备好 ${done} 集`
-        : done ? `已备 ${done}/${total} 集` : "可选，可跳过";
+      : done >= total && total ? `已做好 ${done} 集`
+        : done ? `已做 ${done}/${total} 集` : "还没做，可跳过";
   setText("#s0-state", state);
 
   let note = "";
   if (busy) note = "正在生成；可以切到第 3 步同时出片（那边「用哪份视频」要选原始视频）。";
   else if (done && changed) note = `现有这 ${done} 集是按旧设置做的，改过设置了——点生成会按新设置重做一遍。`;
-  else if (done && failed) note = `已备好 ${done} 集，还有 ${failed} 集没做成，点生成会补做。`;
-  else if (done) note = `已备好 ${done} 集。设置没变时再点生成只会补没做过的集；改过台词的话，回来点一次让字幕跟上。`;
+  else if (done && failed) note = `已做好 ${done} 集，还有 ${failed} 集没做成，点生成会补做。`;
+  else if (done) note = `已做好 ${done} 集。设置没变时再点生成只会补没做过的集；改过台词后不用重做底片，出片时会按新台词重烧字幕。`;
   else note = "这一步可以跳过；想用「原字幕换成自己台词」的视频，随时回来生成。";
   setText("#ns-state", note);
 
@@ -956,14 +1039,221 @@ function renderNoSub(p) {
   if (btn) {
     btn.disabled = busy || taskBusy(t) || total === 0;
     btn.textContent = done && changed ? "按新设置重做"
-      : done && failed ? "补做没成功的集" : "生成处理好的视频";
+      : done && failed ? "补做没成功的集" : "生成干净底片";
   }
   const has = done > 0;
   $("#btn-nosub-preview").classList.toggle("hidden", !has);
   $("#btn-nosub-open").classList.toggle("hidden", !has);
+  renderRetime(p);
 }
 
-["ns-soft", "ns-nmotion", "ns-nstyle", "ns-fillmode"].forEach((id) => {
+/* 「字幕时间自动对齐」的状态。2026-11-16 用户定：不再有「校正」按钮——
+   第 2 步生成时自动做（后端 nosub.run 里量完每集字幕的真实出现时刻，当场就把
+   台词时间排准，同一趟编码直接用上；以前要「先点校正、再回来点生成」两遍）。
+   这里只回答两件事：开关是什么状态、已经对过多少集。
+   「撤销」留着当安全阀：万一某集对得不好，要有个退回原始时间码的口子；
+   撤销的同时后端会把开关关掉，否则下次生成又自动排回去。 */
+function renderRetime(p) {
+  const box = $("#retime-state");
+  if (!box) return;
+  const t = p.task;
+  const busy = taskBusy(t) && t.kind === "retime";
+  const eps = p.episodes || [];
+  const fixed = eps.filter((e) => e.lines_time_bak).length;
+  const on = $("#ns-retime") ? !!$("#ns-retime").checked : true;
+  const undo = $("#btn-retime-undo");
+  if (undo) {
+    undo.classList.toggle("hidden", !fixed);
+    undo.disabled = busy;
+  }
+  let s;
+  if (busy) s = `正在对齐 ${Math.round(t.pct || 0)}% · ${t.msg}`;
+  else if (t && t.error && t.kind === "retime") s = "上次对齐失败：" + String(t.error).slice(0, 120);
+  else if (!on && fixed) s = `开关关着：时间还是上次对齐过的那份（${fixed}/${eps.length} 集）`;
+  else if (!on) s = "关着：用识别出来的原始时间码";
+  else if (fixed) s = `已对齐 ${fixed}/${eps.length} 集，下次生成不会重复对`;
+  else s = "生成时自动对齐一次，不用管";
+  setText("#retime-state", s);
+}
+
+$("#btn-retime-undo").addEventListener("click", async () => {
+  const p = ST.proj;
+  if (!p) return;
+  if (!confirm("会把每集的台词时间退回识别出来的原始时间，并关掉「生成时按原片字幕重排时间」"
+    + "（不重新勾上就不会再动时间）。文字不受影响。\n\n继续？")) return;
+  try {
+    await api(`/api/projects/${p.id}/retime/revert`, { method: "POST" });
+    toast("已退回原始时间，自动对齐也关掉了");
+    ST.proj = await api("/api/projects/" + p.id);
+    nsCfgBuiltFor = null;   // 让勾选框按服务端的新值回填一次
+    render();
+  } catch (e) {
+    toast(e.message);
+  }
+});
+
+/* ── 人名写法统一（第 1 步）────────────────────────────────────────────
+   转写会把同一个人名写成好几种同音字（实测四个模型三家都写错，只有一家对，
+   而那一家的分句是废的），换模型救不了，所以给一张对照表、转写后按表替换。
+   表存在服务端（data/names.txt），这里只是编辑入口；「现在统一一次」作用于
+   已有台词——只改字，说话时间一点不动。 */
+const NAMES = { text: "", count: 0, loaded: false, last: 0 };
+
+function renderNames() {
+  const p = ST.proj;
+  const btn = $("#btn-names-apply");
+  if (!btn) return;
+  btn.disabled = !p || !NAMES.count || taskBusy(p && p.task);
+  let s;
+  if (!NAMES.count) s = "对照表还是空的，展开下面「改对照表」加一条";
+  else if (NAMES.last) s = `刚统一了 ${NAMES.last} 处；第 2 步要重新生成，字幕才会变`;
+  else s = `对照表 ${NAMES.count} 条，整理台词时会自动套用`;
+  setText("#names-state", s);
+}
+
+async function loadNames() {
+  if (NAMES.loaded) return NAMES;
+  try {
+    const r = await api("/api/names");
+    NAMES.text = r.text || "";
+    NAMES.count = r.count || 0;
+    NAMES.loaded = true;
+    const ta = $("#names-text");
+    if (ta && document.activeElement !== ta) ta.value = NAMES.text;
+  } catch (_) {
+    NAMES.loaded = true;   // 读失败别每次渲染都重试，界面上有「表是空的」提示
+  }
+  renderNames();
+  return NAMES;
+}
+
+$("#btn-names-apply").addEventListener("click", async () => {
+  const p = ST.proj;
+  if (!p) return toast("先打开一个项目");
+  if (!NAMES.count) return toast("对照表还是空的，先加一条");
+  if (!confirm("会按对照表把这部戏里所有台词的人名统一，只改字、说话时间不动。\n\n"
+    + "改完第 2 步的成品要重新生成一次，字幕才会跟着变。继续？")) return;
+  const btn = $("#btn-names-apply");
+  btn.disabled = true;
+  setText("#names-state", "正在统一…");
+  try {
+    const r = await api(`/api/projects/${p.id}/names-apply`, { method: "POST" });
+    NAMES.last = r.changed || 0;
+    if (r.changed) {
+      ST.proj = await api("/api/projects/" + p.id);
+      render();
+      toast(`已统一 ${r.changed} 处`);
+    } else {
+      toast("没有需要改的地方，写法已经统一了");
+    }
+  } catch (e) {
+    toast(e.message);
+  }
+  renderNames();
+});
+
+$("#btn-names-save").addEventListener("click", async () => {
+  const ta = $("#names-text");
+  const btn = $("#btn-names-save");
+  if (!ta) return;
+  btn.disabled = true;
+  try {
+    const r = await api("/api/names", {
+      method: "PUT", body: JSON.stringify({ text: ta.value }),
+    });
+    NAMES.text = ta.value;
+    NAMES.count = r.count || 0;
+    const bad = r.invalid || [];
+    setText("#names-save-state", bad.length
+      ? `已保存 ${r.count} 条；有 ${bad.length} 行没生效——${bad[0]}`
+      : `已保存 ${r.count} 条`);
+    toast(`对照表已保存，共 ${r.count} 条`);
+    renderNames();
+  } catch (e) {
+    setText("#names-save-state", e.message);
+  }
+  btn.disabled = false;
+});
+
+/* ── 繁体转简体（第 1 步）──────────────────────────────────────────────
+   和人名统一是两件事：那层管「同一个人名写成好几种同音字」，这层管「整段繁体」。
+   whisper 偶尔整集输出繁体（实测第 3 集 24 句、第 25 集 11 句是「會員」「餐廳」），
+   同一部剧一会儿简一会儿繁。开关开着时，整理台词会先提示模型用简体、转完再按
+   字表兜底；「现在转一次」只作用于已有台词。
+   开关只管「以后自动转」，按钮是显式动作、点了就转——不做「开关关着按钮还亮着
+   但点了没反应」这种说不清的状态。 */
+const ZH = { on: true, pairs: 0, loaded: false, last: 0 };
+
+function renderZh() {
+  const p = ST.proj;
+  const box = $("#zh-on");
+  const btn = $("#btn-zh-apply");
+  if (!btn) return;
+  if (box && document.activeElement !== box) box.checked = !!ZH.on;
+  btn.disabled = !p || taskBusy(p && p.task);
+  let s;
+  if (ZH.last) s = `刚换了 ${ZH.last} 个字；第 2 步要重新生成，字幕才会变`;
+  else if (!ZH.loaded) s = "";
+  else if (ZH.on) s = "开着：以后整理台词自动转简体";
+  else s = "关着：新整理的台词不转，只在你点上面按钮时转";
+  setText("#zh-state", s);
+}
+
+async function loadZh() {
+  if (ZH.loaded) return ZH;
+  try {
+    const r = await api("/api/zh");
+    ZH.on = !!r.on;
+    ZH.pairs = r.pairs || 0;
+  } catch (_) { /* 读不到就保持默认（开），不挡主流程 */ }
+  ZH.loaded = true;
+  renderZh();
+  return ZH;
+}
+
+async function zhToggle() {
+  const on = !!($("#zh-on") || {}).checked;
+  const box = $("#zh-on");
+  if (box) box.disabled = true;
+  try {
+    const r = await api("/api/zh", { method: "PUT", body: JSON.stringify({ on }) });
+    ZH.on = !!r.on;
+  } catch (e) {
+    toast(e.message);
+    if (box) box.checked = !on;   // 没存上就把勾弹回去，别让界面显示一个没生效的状态
+  }
+  if (box) box.disabled = false;
+  renderZh();
+}
+
+const zhBox = $("#zh-on");
+if (zhBox) zhBox.addEventListener("change", zhToggle);
+
+$("#btn-zh-apply").addEventListener("click", async () => {
+  const p = ST.proj;
+  if (!p) return toast("先打开一个项目");
+  if (!confirm("会把这部戏所有台词里的繁体字换成简体，只换字、说话时间不动。\n\n"
+    + "改完第 2 步的成品要重新生成一次，字幕才会跟着变。继续？")) return;
+  const btn = $("#btn-zh-apply");
+  btn.disabled = true;
+  setText("#zh-state", "正在转…");
+  try {
+    const r = await api(`/api/projects/${p.id}/zh-apply`, { method: "POST" });
+    ZH.last = r.changed || 0;
+    if (r.changed) {
+      ST.proj = await api("/api/projects/" + p.id);
+      render();
+      toast(`已换 ${r.changed} 个字`);
+    } else {
+      toast("没有繁体字，已经是简体了");
+    }
+  } catch (e) {
+    toast(e.message);
+  }
+  renderZh();
+});
+
+["ns-soft", "ns-fillmode", "ns-retime"].forEach((id) => {
   const e = $("#" + id);
   if (!e) return;
   const onChange = () => {
@@ -991,7 +1281,7 @@ $("#btn-nosub-run").addEventListener("click", async () => {
     p.task_nosub = { kind: "nosub", pct: 0, msg: "启动中", error: "" };
     render();
     startPoll();
-    toast("开始生成处理好的视频，进度在页面顶部");
+    toast("开始生成干净底片，进度在页面顶部");
   } catch (e) {
     toast(e.message);
   }
@@ -1002,7 +1292,7 @@ $("#btn-nosub-preview").addEventListener("click", async () => {
   if (!p) return;
   try {
     await api(`/api/projects/${p.id}/nosub/preview`, { method: "POST" });
-    toast("已用系统播放器打开第一集处理好的视频");
+    toast("已用系统播放器打开第一集底片");
   } catch (e) { toast(e.message); }
 });
 
@@ -1192,6 +1482,7 @@ function renderPlans() {
     $("#plan-note").textContent = "";
     $("#btn-render-plans").textContent = HK.mode === "hook" ? "出片（已选 0 集）" : "出片（已选 0 套）";
     $("#btn-render-plans").disabled = true;
+    renderPlanShortfall();
     return;
   }
   // 结构没变就不重建 DOM：出片时前端每两三秒轮询一次进度，每次都调这里，
@@ -1273,7 +1564,91 @@ function renderPlans() {
   updatePlanStat();
   updatePlanFxChips();
   syncHookFxLocks();
+  renderPlanShortfall();
 }
+
+/* ---------- 没生成成功的组：提示条 + 只重跑这些组（2026-11-16 A 档） ----------
+   只在**有组没出来**时出现。按钮把上次失败组的原参数原样发回去，后端 append=True
+   把新套接在现有结构后面；已有的套、勾选状态和出片进度都不动。 */
+let shortfallPending = false;
+
+function renderPlanShortfall() {
+  const el = $("#plan-shortfall");
+  if (!el) return;
+  const p = ST.proj;
+  const r = (p && p.batch && p.batch.plan_result) || {};
+  const failed = Array.isArray(r.failed) ? r.failed : [];
+  if (!failed.length) {
+    el.classList.add("hidden");
+    el._sig = "";
+    return;
+  }
+  el.classList.remove("hidden");
+  const busy = shortfallPending || taskBusy(p && p.task);
+  const want = failed.reduce((a, f) => a + (Number(f.count) || 0), 0);
+  const keep = (p && p.plans && p.plans.length) || 0;
+  const asked = Number(r.requested) || want;
+  const got = Number(r.got) || 0;
+  const sig = JSON.stringify([asked, got, r.total, r.append, r.legacy, failed, busy]);
+  const when = r.legacy ? "上次" : "这次";
+  const items = failed.map((f) =>
+    `<li><b>${esc(f.label || modelLabel(f.model))}</b> · 要 ${esc(f.count)} 套 — ${esc(f.reason || "没返回结果")}</li>`).join("");
+  const btnTxt = busy ? "正在生成…" : `重新生成没出来的 ${want} 套`;
+  patchHtml(el, sig, () => `
+    <h4>${when}要 ${esc(asked)} 套，只出来 ${esc(got)} 套（现在一共 ${esc(keep)} 套）</h4>
+    <p class="sf-why">有 ${esc(failed.length)} 组没生成成功。没出来的套可以单独再生成一次，已有的 ${esc(keep)} 套不会动。</p>
+    <ul>${items}</ul>
+    <div class="sf-act">
+      <button class="primary" id="btn-plan-retry" ${busy ? "disabled" : ""}>${esc(btnTxt)}</button>
+      <span class="sf-why">${busy ? "生成完会自己刷新，不用守着" : `会用到 ${esc(failed.length)} 次今日生成机会`}</span>
+    </div>`);
+}
+
+$("#plan-shortfall").addEventListener("click", async (e) => {
+  if (!e.target.closest("#btn-plan-retry") || shortfallPending) return;
+  const p = ST.proj;
+  if (!p) return;
+  const failed = Array.isArray((p.batch || {}).plan_result && p.batch.plan_result.failed)
+    ? p.batch.plan_result.failed : [];
+  if (!failed.length || taskBusy(p.task)) return toast("这个项目已有任务在跑，等它结束再试");
+  const jobs = failed.map((f) => ({
+    model: f.model || "", count: Math.max(1, Math.min(20, Number(f.count) || 1)),
+    min_minutes: Number(f.min_minutes) || 3, max_minutes: Number(f.max_minutes) || 5,
+  }));
+  const want = jobs.reduce((a, j) => a + j.count, 0);
+  const keep = (p.plans || []).length;
+  const ok = await askConfirm({
+    title: "只生成没出来的套",
+    body: [
+      `上次有 ${failed.length} 组没生成成功，这次只重跑这 ${failed.length} 组、共 ${want} 套。`,
+      `已有的 ${keep} 套结构和已经出好的片都不会动，新套接在后面。`,
+      `会用到 ${failed.length} 次今日生成机会，预计约 ${planEta(failed.length)} 分钟。`,
+      "没生成成功多是因为等太久，也可以先在「生成设置」里把套数或单套时长调小再试。",
+    ],
+    okText: `重新生成这 ${want} 套`,
+  });
+  if (!ok) return;
+  shortfallPending = true;
+  renderPlanShortfall();
+  try {
+    const grant = await aiGrant(p.id, "plan");
+    await api(`/api/projects/${p.id}/plan`, {
+      method: "POST",
+      headers: { "X-AI-Grant": grant },
+      body: JSON.stringify({ jobs, order: FIXED_ORDER, append: true }),
+    });
+    ST.proj.task = { kind: "plan", pct: 0,
+      msg: `正在生成没出来的 ${want} 套`, error: "" };
+    render();
+    startPoll();
+    toast(`正在生成没出来的 ${want} 套，已有的 ${keep} 套不动`);
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    shortfallPending = false;
+    renderPlanShortfall();
+  }
+});
 
 /* 一套结构 = 一张卡片：头部一行概览 + 可展开的表 */
 function planCard(pl, i) {
@@ -1798,9 +2173,11 @@ $("#edl").addEventListener("input", updateStat);
 function startPoll() {
   stopPoll();
   let idle = 0;
+  let fails = 0;
   ST.timer = setInterval(async () => {
     try {
       ST.proj = await api("/api/projects/" + ST.proj.id);
+      fails = 0;
       render();
       // 三条产线任一在跑就要继续轮询；全都停了才算空闲
       const busyNow = taskBusy(ST.proj.task) || taskBusy(ST.proj.task_nosub)
@@ -1811,7 +2188,12 @@ function startPoll() {
       } else {
         idle = 0;
       }
-    } catch (e) { /* 忽略瞬时失败 */ }
+    } catch (e) {
+      // 以前这里静默吞掉：服务退出 / 接口连续失败时，状态条会一直停在旧进度，
+      // 用户只会觉得「点了没反应」。连续 3 拍失败说一次，恢复后自动清零。
+      fails += 1;
+      if (fails === 3) toast("状态暂时刷不出来，看看程序窗口是不是还开着；恢复后会自动接上");
+    }
   }, 1500);
 }
 function stopPoll() {
@@ -2691,8 +3073,8 @@ function fxPanelHTML(p) {
   <div class="fx-group fx-g1">
     <div class="fx-group-h"><i class="fx-gno">1</i>出片增强<span class="hint">决定成片怎么包装：标题、片头卡、去重、指纹、配乐。不改剧情顺序和时长</span></div>
     <div class="fx-checks">
-      <label class="chk" title="每块画面顶部烧一行「看点：XXX」，写这一段在演什么（取自 AI 给这块的标签）。位置在顶部，跟素材下方的台词字幕不打架；想连素材自带的字幕一起去掉，先做第 2 步备好已处理的视频，再在第 ⑤ 组选它。嫌抢戏可以关，但观众就不知道下一块要演什么。"><input type="checkbox" id="${p}title"> 看点字幕</label>
-      <label class="chk" title="整幅放大 3% 再居中裁回原尺寸：画面指纹跟原片不一样，边缘一圈（含黑边、水印带）被切掉，平台比对原片时对不上——混剪去重最省事的一招。103% 是稳妥值，再大会切到下方的台词字幕；构图很满、切到人脸时也可以关。想彻底去掉字幕，先做第 2 步备好已处理的视频，再在第 ⑤ 组选它。"><input type="checkbox" id="${p}zoom"> 画面放大 103%（去重）</label>
+      <label class="chk" title="每块画面顶部烧一行「看点：XXX」，写这一段在演什么（取自 AI 给这块的标签）。位置在顶部，跟素材下方的台词字幕不打架；想连素材自带的字幕一起去掉，想换成自己的字幕，就把上面改成「干净底片 + 出片时加字幕」。嫌抢戏可以关，但观众就不知道下一块要演什么。"><input type="checkbox" id="${p}title"> 看点字幕</label>
+      <label class="chk" title="整幅放大 3% 再居中裁回原尺寸：画面指纹跟原片不一样，边缘一圈（含黑边、水印带）被切掉，平台比对原片时对不上——混剪去重最省事的一招。103% 是稳妥值，再大会切到下方的台词字幕；构图很满、切到人脸时也可以关。想彻底去掉字幕，想换成自己的字幕，就把上面改成「干净底片 + 出片时加字幕」。"><input type="checkbox" id="${p}zoom"> 画面放大 103%（去重）</label>
       <label class="chk" title="这套片子最前面加 1.8 秒纯黑底 + 一句大字（文案来自每套的「开场钩子」，可展开改）。观众判断要不要看只看开头一两秒，先用一句话把矛盾摆出来；关掉就直接从第一段开始。"><input type="checkbox" id="${p}hook"> 开场钩子卡 1.8s</label>
       <label class="chk" title="评分 5-6 的缓冲段（反应、沉默、过场）放快 1.15 倍，音调不变；爆点段保持原速。关掉就全片原速。"><input type="checkbox" id="${p}speed"> 缓冲段加速 1.15×</label>
       <label class="chk" title="出片时自动挑一首合适的音乐循环铺满全片：音量很低、台词一响再自动压低（闪避），不盖对白；结尾 2.5 秒淡出。想用自己电脑里的歌，展开后选「用我自己的音乐」。"><input type="checkbox" id="${p}bgm"> 配乐 BGM</label>
@@ -2784,24 +3166,38 @@ function fxPanelHTML(p) {
   </div>
 
   <div class="fx-group fx-g5 fx-src">
-    <div class="fx-group-h"><i class="fx-gno">5</i>用哪份视频 / 要不要镜像<span class="hint">单独一组：从哪份素材切段、要不要整幅翻转，和上面四组互不影响</span></div>
+    <div class="fx-group-h"><i class="fx-gno">5</i>用哪份视频 / 要不要镜像 / 字幕长什么样<span class="hint">单独一组：素材、整幅翻转、字幕样式，和上面四组互不影响</span></div>
     <label class="fx-f">素材版本
       <select id="${p}srcver">
-        <option value="">原始视频 · 保留原来的字幕</option>
-        <option value="nosub">已处理 · 原字幕换成自己的台词</option>
-        <option value="live">原片 · 出片时现场做（可镜像）</option>
+        <option value="nosub">干净底片 + 出片时加字幕（可镜像）</option>
+        <option value="">原始视频 · 保留原来的字幕（不能镜像）</option>
       </select>
     </label>
     <div class="fx-checks">
-      <label class="chk" id="${p}mirrorbox" title="整幅画面左右翻转，等于换了一个画面指纹，去重最彻底。能不能开取决于上面选的素材：已处理那份的字幕已烧进画面，翻了就是反字，所以那一档锁住。"><input type="checkbox" id="${p}mirror"> 左右镜像（整幅翻转，去重最彻底）</label>
+      <label class="chk" id="${p}mirrorbox" title="整幅画面左右翻转，等于换了一个画面指纹，去重最彻底。用「干净底片」时字是翻转之后才画上去的，所以可以开。"><input type="checkbox" id="${p}mirror"> 左右镜像（整幅翻转，去重最彻底）</label>
     </div>
     <p class="fx-tip" id="${p}mirrortip"></p>
     <p class="fx-tip" id="${p}srcvertip"></p>
-    <details class="fold"><summary>三份素材分别是什么</summary>
+    <div class="fx-grid2" style="margin-top:12px">
+      <label class="fx-f">字幕出场动效
+        <select id="${p}nstyle">
+          <option value="rise">上浮落位 · 推荐</option>
+          <option value="fade">淡入淡出 · 最稳</option>
+          <option value="pop">缩放弹出 · 有劲</option>
+          <option value="float">缓缓漂浮 · 有呼吸感</option>
+          <option value="type">逐字打出 · 口播感</option>
+        </select>
+      </label>
+      <label class="fx-slider"><span>动效幅度 <b id="${p}nmotionv">推荐</b></span>
+        <input type="range" id="${p}nmotion" min="0" max="100" step="10" value="50">
+        <span class="fx-scale"><i>0 几乎不动</i><i>50 推荐</i><i>100 明显</i></span>
+      </label>
+    </div>
+    <p class="fx-tip">字幕样式只在「干净底片」这一档生效：底片本身没有字，字是出片时才画上去的，所以改样式不用重新生成底片。</p>
+    <details class="fold"><summary>两份素材分别是什么</summary>
       <div class="fold-body">
-        <p><b>原始视频</b>：导入的那份，字幕还是原来的。</p>
-        <p><b>已处理</b>：第 2 步另外做的一份视频——原字幕抹掉、按台词换成你自己的字幕，原始视频原封不动留着。选了它但这一集还没备好，出片时会先拦下来告诉你缺哪几集，不会悄悄用回带字幕的原片。字幕已经烧在那份画面里，所以这一套不能开镜像（会翻反，出片时拦）。</p>
-        <p><b>出片时现场做</b>：不占第 2 步那份副本，直接从原片切，出片这一趟顺手把原字幕抹掉、再按台词烧回自己的字幕。顺序是「抹字幕 → 镜像/调色 → 烧字幕」，字是翻转之后才画上去的，所以<b>可以同时开镜像</b>。代价是每段多跑一道抹除、第一次要先扫一遍字幕区域（会多等一会儿，之后走缓存）。</p>
+        <p><b>干净底片</b>：第 2 步做的那份——原片上的字幕已经抹干净，没有任何字。出片时从它切段，按第 1 步整理好的台词把字幕烧回去（位置和字号跟着每集原字幕走）。一份底片所有套共用，所以做一次就够。</p>
+        <p><b>原始视频</b>：导入的那份，画面上还带着原来的字幕。用它出片等于原样搬运，字幕改不了、也不能镜像（整幅翻转会把字翻反）。</p>
       </div>
     </details>
   </div>
@@ -2855,8 +3251,12 @@ function readFx(p) {
     rand_min: Math.min(15, Math.max(0.5, num("randmin") || 2)) * 60,
     rand_max: Math.min(15, Math.max(0.5, num("randmax") || 5)) * 60,
     lut: (val("lut") || "").trim(),
-    // 镜像跟素材绑定：已处理那份的字幕已经烧进画面，翻了就是反字，所以这档恒为 false
-    mirror: srcVer === "nosub" ? false : on("mirror"),
+    // 镜像：干净底片上的字是出片时才画的，翻不到，所以两档都可以开。
+    // 用原始视频开镜像会把原字幕一起翻反——面板上已经写明，不再拦。
+    mirror: on("mirror"),
+    // 字幕样式（2026-11-16 从第 2 步搬过来）：底片没有字，字是出片时按这两项画的
+    newsub_style: NS_STYLES.indexOf(val("nstyle")) >= 0 ? val("nstyle") : "rise",
+    newsub_motion: Math.min(1, Math.max(0, (num("nmotion") || 50) / 100)),
     // 开头镜像是独立一组，跟用哪份素材无关；方向下拉只在勾上时才可见
     first_mirror: on("fmirror"),
     first_mirror_dir: val("fmirrordir") === "v" ? "v" : "h",
@@ -2910,8 +3310,13 @@ function writeFx(p, fx) {
   put("glow", Math.round((fx.glow == null ? FDEF.glow : fx.glow) * 100));
   put("grain", Math.round((fx.grain == null ? FDEF.grain : fx.grain) * 100));
   put("vig", Math.round((fx.vignette == null ? FDEF.vignette : fx.vignette) * 100));
-  // 用哪份视频：老项目没有这个字段 → 原始视频，不悄悄改掉已出好的片子
-  put("srcver", fx.src_ver === "nosub" || fx.src_ver === "live" ? fx.src_ver : "");
+  // 用哪份视频（2026-11-16 收成两档）：老项目存的 "live" 就是「出片时烧自己的
+  // 字幕」，和现在的「干净底片 + 现场加字幕」是同一件事（后者更快），映射过去；
+  // 没有这个字段的老项目仍按原始视频显示，不悄悄改掉已经出好的片子。
+  put("srcver", fx.src_ver === "nosub" || fx.src_ver === "live" ? "nosub" : "");
+  // 字幕样式（从第 2 步搬过来）：老项目没有这两个字段 → 用同一套出厂默认
+  put("nstyle", NS_STYLES.indexOf(fx.newsub_style) >= 0 ? fx.newsub_style : "rise");
+  put("nmotion", Math.round((fx.newsub_motion == null ? 0.5 : fx.newsub_motion) * 100));
   // 指纹强度：老项目没有这个字段 → 标准档（新抽的画面参数，观感和老片一致）
   put("fp", ["soft", "std", "strong"].includes(fx.fp_level) ? fx.fp_level : "std");
   fxSync(p);
@@ -2958,20 +3363,24 @@ function fxSync(p) {
   if (manualBox) manualBox.classList.toggle("hidden", !bgmManual);
   const autoTip = el("bgmautotip");
   if (autoTip) autoTip.classList.toggle("hidden", bgmManual);
-  // 第 ⑤ 组：素材 + 镜像绑在一起（镜像能不能开，取决于字幕在哪一步画上去）
+  // 第 ⑤ 组：素材 + 镜像 + 字幕样式。两档都能开镜像，区别只在字会不会被翻反
   const pickv = el("srcver") ? String(el("srcver").value) : "";
   const mv = el("mirror"), mbox = el("mirrorbox"), mtip = el("mirrortip");
   if (mv && mbox) {
-    const blocked = pickv === "nosub";
-    mv.disabled = blocked;
-    mbox.classList.toggle("disabled", blocked);
+    mbox.classList.remove("disabled");
+    mv.disabled = false;
     if (mtip) {
-      mtip.innerHTML = blocked
-        ? "这一档<b>锁住镜像</b>：这份素材里的字幕已经烧进画面，整幅翻转会把字翻反。想镜像就改选「原始视频」或「出片时现场做」。"
-        : pickv === "live"
-          ? "可以放心开：顺序是<b>抹字幕 → 镜像 → 烧字幕</b>，字是翻转之后才画上去的，翻了还是正的。"
-          : "镜像是整幅翻转，去重最彻底；代价是原片自带的字幕会跟着翻反。想翻又不想字幕翻反，把上面改成「出片时现场做」。";
+      mtip.innerHTML = pickv === "nosub"
+        ? "可以放心开：底片本来就没有字，顺序是<b>切段 → 镜像 → 烧字幕</b>，字是翻转之后才画上去的。"
+        : "这一档是原片直切，画面上的原字幕会<b>跟着翻反</b>。想翻又不想字幕翻反，把上面改成「干净底片 + 出片时加字幕」。";
     }
+  }
+  // 字幕样式的幅度标签：0 = 几乎不动，100 = 明显
+  const nmv = el("nmotionv"), nm = el("nmotion");
+  if (nmv && nm) {
+    const n = Number(nm.value) || 0;
+    nmv.textContent = n <= 0 ? "几乎不动" : n >= 90 ? "明显"
+      : n < 30 ? "很轻" : n < 70 ? "推荐" : "偏明显";
   }
   // 第 ⑥ 组：开头镜像独立成组，勾上才展开方向选择和说明；不勾就是原样出片
   const fm = el("fmirror"), fmline = el("fmirrorline"),
@@ -2990,21 +3399,20 @@ function fxSync(p) {
   // 用哪份视频：只改一行说明，不需要展开子区
   const vtip = el("srcvertip");
   if (vtip) {
-    const picking = pickv === "nosub";
     // 第 2 步已经备好了、这一套却还在用原片时，提醒一句（默认值不动，免得把老项目悄悄改掉）
     const proj = ST.proj || {};
     const nsf = Object.keys(((proj.nosub || {}).files) || {}).length;
     const epsN = (proj.episodes || []).length;
     const nsReady = epsN > 0 && nsf >= epsN;
-    vtip.textContent = pickv === "live"
-      ? "不用先做第 2 步：从原片切段，出片这一趟顺手抹掉原字幕、再按台词烧回自己的字幕。"
-        + "因为字幕是在左右镜像之后才画上去的，这一套可以同时开镜像。"
-        + (nsReady ? "（已经有了第 2 步的成品，这条路只是省掉那份副本。）" : "")
-      : picking
-        ? "从第 2 步「重做字幕」做好的视频里切段（原字幕已抹掉，换成你整理好的台词）。每一套都能单独改回原始视频。"
-        : nsReady
-        ? "从导入的原始视频里切段，画面还是原样（带着原来的字幕）。第 2 步已经备好了处理好的视频，要换成它就在上面改选。"
-        : "从导入的原始视频里切段，画面保持原样。";
+    const burned = (proj.nosub || {}).burned !== false;
+    vtip.textContent = pickv === "nosub"
+      ? (burned && nsReady
+        ? "第 2 步的底片还是旧版（字幕已经烧进画面），先回第 2 步重新生成一次，不然会叠出两层字。"
+        : "从第 2 步做好的干净底片里切段：底片上一行字都没有，出片时按台词把字幕烧上去。"
+          + (nsReady ? "" : "（这一集还没生成底片，出片前会拦下来说缺哪几集。）"))
+      : nsReady
+        ? "从导入的原始视频里切段，画面还是原样（带着原来的字幕）。第 2 步已经有干净底片，要用它就在上面改选。"
+        : "从导入的原始视频里切段，画面保持原样（带着原来的字幕），字幕改不了、也不能镜像。";
   }
 }
 
@@ -3025,7 +3433,9 @@ function fxWire(p) {
   if (lutBtn) lutBtn.addEventListener("click", async () => {
     toast("已弹出选择框，选一个 .cube 调色文件…");
     try {
-      const r = await api("/api/pick-file", { method: "POST" });
+      const cur = (document.getElementById(p + "lut") || {}).value || "";
+      const r = await api(`/api/pick-file?initial=${encodeURIComponent(cur)}&key=lut`,
+        { method: "POST" });
       if (r && r.path) {
         const e = document.getElementById(p + "lut");
         if (e) e.value = r.path;
@@ -3040,7 +3450,9 @@ function fxWire(p) {
   if (bgmBtn) bgmBtn.addEventListener("click", async () => {
     toast("已弹出选择框，选一首自己电脑上的音乐…");
     try {
-      const r = await api("/api/pick-file", { method: "POST" });
+      const cur = (document.getElementById(p + "bgmpath") || {}).value || "";
+      const r = await api(`/api/pick-file?initial=${encodeURIComponent(cur)}&key=bgm`,
+        { method: "POST" });
       if (r && r.path) {
         const e = document.getElementById(p + "bgmpath");
         if (e) e.value = r.path;
@@ -3082,7 +3494,7 @@ function fxShort(fx) {
     parts.push(lo >= hi ? `随机${lo}分` : `随机${lo}–${hi}分`);
   } else if (fx.grade) parts.push(`${GRADE_CN[fx.grade] || fx.grade} ${Math.round((fx.grade_int == null ? 0.65 : fx.grade_int) * 100)}%`);
   // 镜像跟素材绑定：已处理那一档的字幕烧在画面里，镜像无效（后端也会拦），不写进摘要
-  if (fx.mirror && fx.src_ver !== "nosub") parts.push("镜像");
+  if (fx.mirror) parts.push("镜像");
   // 开头镜像默认关，勾了才进徽标（和「用哪份素材」无关，单独一列）
   if (fx.first_mirror) parts.push(fx.first_mirror_dir === "v" ? "开头上下翻" : "开头左右翻");
   // 质感四项：出厂默认就开着（无感档），只有**偏离默认**才写进徽标，
@@ -3106,8 +3518,7 @@ function fxShort(fx) {
   if (fx.buffer_speed === false) parts.push("缓冲原速");
   if (fx.bgm) parts.push(fx.bgm_auto === false ? "配乐·自选" : "自动配乐");
   // 用哪份视频是独立一项，排在最前面；默认「原始视频」不刷屏
-  if (fx.src_ver === "nosub") parts.unshift("已处理素材");
-  if (fx.src_ver === "live") parts.unshift("现场做字幕");
+  if (fx.src_ver === "nosub" || fx.src_ver === "live") parts.unshift("干净底片");
   return parts.join("·") || "默认";
 }
 
@@ -3138,7 +3549,7 @@ function saveFxDefault() {
 }
 ["title", "zoom", "hook", "speed", "bgm", "bgmauto", "bgmmanual", "bgmpath", "bvol",
  "grade", "gint", "randmin", "randmax", "lut", "mirror", "stretch", "glow", "grain", "vig",
- "srcver", "fmirror", "fmirrordir", "fp"]
+ "srcver", "nstyle", "nmotion", "fmirror", "fmirrordir", "fp"]
   .forEach((id) => {
     const el = $("#fx-" + id);
     if (!el) return;
@@ -3226,8 +3637,8 @@ $("#btn-render-plans").addEventListener("click", async () => {
     fx.bgm ? (fx.bgm_auto === false
       ? `配乐 BGM（自己的音乐，音量 ${Math.round(fx.bgm_vol * 100)}%，台词响时自动压低）`
       : `自动配乐（音量 ${Math.round(fx.bgm_vol * 100)}%，按每套建议挑曲，台词响时自动压低）`) : "不加 BGM",
-    fx.src_ver === "nosub" ? "素材：已处理（原字幕换成了自己的台词）"
-      : fx.src_ver === "live" ? "素材：原片 + 现场做字幕（可镜像）" : "素材：原始视频",
+    fx.src_ver === "nosub" || fx.src_ver === "live"
+      ? "素材：干净底片 + 出片时加字幕" : "素材：原始视频（带原字幕）",
     fx.first_mirror ? `开头 0.3 秒${fx.first_mirror_dir === "v" ? "上下" : "左右"}镜像` : "开头不翻",
     (() => { const f = readFx("fx-"); delete f.src_ver;
       const pic = fxShort(f);
@@ -3257,16 +3668,30 @@ $("#btn-save-dir-pick").addEventListener("click", async () => {
   const cur = ($("#save-dir").value || "").trim();
   toast("已弹出选择框，请在桌面上选一个文件夹…");
   try {
-    const r = await api(`/api/pick-folder?initial=${encodeURIComponent(cur)}`, { method: "POST" });
+    const r = await api(`/api/pick-folder?initial=${encodeURIComponent(cur)}&key=proj_out`,
+      { method: "POST" });
     if (r && r.path) {
       $("#save-dir").value = r.path;
       updateSaveDirNote();
+      loadSaveDirHist();
       toast(`保存位置：${joinDir(r.path, ST.proj && ST.proj.name)}`);
     }
   } catch (e) {
     toast(`${e.message}（可以直接手动输入路径）`);
   }
 });
+
+/* 成片保存位置：同一台机器往往就那几个盘反复用，摆出最近用过的三个，
+   点一下直接填进输入框（不弹框）。 */
+function loadSaveDirHist() {
+  return loadHistChips("hist-proj-out", "proj_out", (path) => {
+    const box = $("#save-dir");
+    if (!box) return;
+    box.value = path;
+    updateSaveDirNote();
+    toast(`保存位置：${joinDir(path, ST.proj && ST.proj.name)}`);
+  });
+}
 
 $("#btn-save-edl").addEventListener("click", async () => {
   try {
@@ -3519,10 +3944,7 @@ $("#btn-save-settings").addEventListener("click", async () => {
     toast("已保存");
     const st = await api("/api/status");
     ST.status = st;
-    $("#pills").innerHTML = [
-      `<span class="pill ${st.llm_key ? "ok" : "bad"}">AI 生成 ${st.llm_key ? "已就绪" : "暂不可用"}</span>`,
-      `<span class="pill ${st.whisper_model ? "ok" : "bad"}">台词识别 ${st.whisper_model ? "已就绪" : "需检查"}</span>`,
-    ].join("");
+    paintPills(st);
   } catch (e) {
     toast("保存失败：" + e.message);
   }
@@ -3641,7 +4063,8 @@ async function whoLogout() {
 
   async function pick(cur) {
     try {
-      const r = await api(`/api/pick-folder?initial=${encodeURIComponent(cur || "")}`, { method: "POST" });
+      const r = await api(`/api/pick-folder?initial=${encodeURIComponent(cur || "")}&key=merge`,
+        { method: "POST" });
       return (r && r.path) || "";
     } catch (e) {
       toast(`${e.message}（可以直接手动输入路径）`);
@@ -3747,8 +4170,12 @@ async function whoLogout() {
   });
 
   bCancel.addEventListener("click", async () => {
-    try { await api("/api/merge/cancel", { method: "POST" }); toast("正在取消，等当前这一对编完…"); }
-    catch (e) { toast(e.message); }
+    try {
+      await api("/api/merge/cancel", { method: "POST" });
+      toast("正在取消，等当前这一对编完…");
+      // 立刻把当前状态画出来，别只等下一次 1.5 秒轮询（同类问题：点了没反应）
+      await refresh(false);
+    } catch (e) { toast(e.message); }
   });
 
   bOpen.addEventListener("click", async () => {

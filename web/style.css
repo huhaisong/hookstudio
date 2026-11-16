@@ -31,6 +31,19 @@ h1 { font-size: 17px; font-weight: 500; margin: 0 0 6px; }
 .hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 10px; }
 .hidden { display: none !important; }
 
+/* 「最近用过」快捷项：补系统对话框记不住位置这件事——
+   点一下直接选中，不用再翻一遍目录。空的时候整块不占位。 */
+.hist-chips { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+.hist-chips:empty { display: none; }
+.hist-l { font-size: 11.5px; color: var(--muted); }
+.hist-chip {
+  max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 2px 9px; border-radius: 99px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg);
+  color: var(--text); font-family: inherit; font-size: 11.5px;
+}
+.hist-chip:hover { border-color: var(--accent); color: var(--accent); }
+
 .top {
   height: 52px; display: flex; align-items: center; gap: 16px;
   padding: 0 20px; background: var(--surface); border-bottom: 1px solid var(--line);
@@ -77,6 +90,12 @@ h1 { font-size: 17px; font-weight: 500; margin: 0 0 6px; }
 }
 .pill.ok { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .pill.bad { color: var(--danger); border-color: var(--danger); }
+/* 异常提示是可点的（点开设置去修），所以它得像个按钮而不是个死标签 */
+button.pill {
+  background: transparent; font-family: inherit; cursor: pointer;
+  transition: background .15s ease;
+}
+button.pill:hover { background: var(--danger-soft, rgba(200, 60, 60, .08)); }
 
 .shell { display: flex; height: calc(100vh - 52px); }
 .rail {
@@ -281,6 +300,23 @@ a.ghost:hover { border-color: var(--accent); color: var(--accent); }
 .edl-foot { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
 .edl-foot .hint { margin: 0; flex: 1; }
 .note { font-size: 12.5px; color: var(--muted); margin-top: 8px; }
+
+/* 生成结果缺套提示（2026-11-16 A 档）：只在有组没生成成功时出现。
+   走琥珀色而不是红色——这不是故障，已有的套照样能挑、照样能出片。 */
+.shortfall {
+  margin: 10px 0 12px; padding: 12px 14px;
+  border: 1px solid rgba(196, 140, 30, .38);
+  border-left: 3px solid #c48c1e;
+  border-radius: var(--radius);
+  background: rgba(196, 140, 30, .09);
+}
+:root[data-theme="dark"] .shortfall { background: rgba(196, 140, 30, .15); }
+.shortfall h4 { margin: 0 0 4px; font-size: 14px; font-weight: 600; color: var(--text); }
+.shortfall .sf-why { margin: 0; font-size: 12.5px; color: var(--muted); }
+.shortfall ul { margin: 8px 0 10px; padding-left: 18px; }
+.shortfall li { margin: 3px 0; font-size: 12.5px; color: var(--muted); line-height: 1.55; }
+.shortfall li b { color: var(--text); font-weight: 600; }
+.shortfall .sf-act { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 
 .out-wrap { margin-top: 14px; display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
 video { width: 100%; max-width: 380px; border-radius: 10px; background: #000; }
@@ -872,6 +908,17 @@ button.wx-top:hover { filter: brightness(1.07); }
 }
 .fx-lines3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 18px; }
 @media (max-width: 760px) { .fx-lines3 { grid-template-columns: 1fr; } }
+/* 两列对齐：第 2 步（重做字幕）的两个分组各放「下拉 + 滑杆」。
+   用 grid 而不是 fx-line 的 flex-wrap，是为了让同一行两项的标签顶端、滑杆
+   轨道都落在同一条线上；fx-line 在窄容器里会一高一低地错位。
+   列宽用 minmax(0,1fr) + 子项 min-width:0，长选项（「照这一段干净画面补」）
+   不会把列撑破。 */
+.fx-grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 20px; align-items: start; }
+@media (max-width: 760px) { .fx-grid2 { grid-template-columns: 1fr; } }
+.fx-grid2 > label { min-width: 0; }
+.fx-grid2 .fx-f select { min-width: 0; width: 100%; box-sizing: border-box; }
+/* 同一块里的分组之间留一口气，不靠每处手写 margin */
+.fx-group + .fx-group { margin-top: 10px; }
 /* 单套弹窗里是同一套六组面板，比一般弹窗宽一点才不挤 */
 #modal-planfx .modal-card { width: min(720px, 94vw); }
 @media (max-width: 760px) { #modal-planfx .modal-card { width: 94vw; } }
@@ -1478,15 +1525,25 @@ select:focus, input:focus, textarea:focus {
   background: var(--bg); color: var(--text); font: inherit; font-size: 12.5px;
   cursor: pointer;
 }
-/* 账号卡两行：第一行备注名，第二行「视频号名称 · ID sph...」。
- * 只显示备注名时，加了几个号就分不清谁是谁（2026-11-13 用户要求）。 */
-.pub-acc .who { display: flex; flex-direction: column; gap: 1px; min-width: 0; line-height: 1.3; }
-.pub-acc .who .sub {
-  font-size: 11px; color: var(--muted); max-width: 210px;
+/* 账号卡字段分行：别名 / 视频号 / 视频号ID 各占一行，前面带标签。
+ * 只显示备注名时，加了几个号就分不清谁是谁（2026-11-13 用户要求）；
+ * 之前把「视频号名 · ID」挤成一行，客户容易看混，改为分行加标签（2026-11-16）。 */
+.pub-acc .who { display: flex; flex-direction: column; gap: 2px; min-width: 0; line-height: 1.35; }
+.pub-acc .who .frow {
+  display: flex; align-items: baseline; gap: 6px; min-width: 0;
+  font-size: 11px;
+}
+.pub-acc .who .frow i {
+  flex: 0 0 auto; font-style: normal; color: var(--muted); font-size: 10.5px;
+  letter-spacing: .03em;
+}
+.pub-acc .who .frow em {
+  font-style: normal; color: var(--text); min-width: 0; max-width: 200px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
-.pub-acc.on .who .sub { color: inherit; opacity: .78; }
+.pub-acc.on .who .frow i { color: inherit; opacity: .62; }
+.pub-acc.on .who .frow em { color: inherit; }
 .pub-acc.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .pub-acc .dot {
   width: 7px; height: 7px; border-radius: 50%; background: var(--muted); opacity: .5;
@@ -1514,17 +1571,10 @@ select:focus, input:focus, textarea:focus {
 .pub-acc .mini:hover { background: var(--line); color: var(--text); }
 .pub-acc .mini.del:hover { background: #fdecec; color: #c0392b; }
 
-/* 扫码登录面板 */
+/* 登录面板：登录本身在程序弹出的浏览器窗口里做，这里只说明 + 显示结果 */
 .pub-scan {
-  display: grid; grid-template-columns: 208px 1fr; gap: 16px; align-items: start;
-  padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
+  padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
 }
-.pub-scan-qr {
-  width: 208px; height: 208px; border-radius: 8px; overflow: hidden;
-  background: #1c1c1e; display: flex; align-items: center; justify-content: center;
-}
-.pub-scan-qr img { width: 100%; height: 100%; display: block; }
-.pub-scan-wait { color: #9aa0a6; font-size: 12px; }
 .pub-scan-side b { display: block; margin-bottom: 6px; font-size: 13px; }
 .pub-scan-side p { margin: 0 0 7px; font-size: 12.5px; color: var(--muted); line-height: 1.6; }
 .pub-scan-side .mini-note { font-size: 12px; }
@@ -1729,9 +1779,43 @@ select:focus, input:focus, textarea:focus {
 
 /* 扩展链接：类型下拉 + 选条目 */
 /* ③ 的候选归属：剧集/标注都是「某个号里的」，不写清楚会以为选了没生效 */
-.pub-opts-from { grid-column: 1 / -1; font-size: 11.5px; color: var(--muted); padding-bottom: 2px; }
+.pub-opts-from { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); padding-bottom: 2px; }
 .pub-opts-from b { color: var(--text); font-weight: 600; }
+.pub-opts-from .pub-reread { flex: 0 0 auto; }
+.pub-opt-note { font-style: normal; color: var(--muted); }
+/* 读候选时只挂一行小字，不再用禁用按钮占住整格 */
+.pub-reading { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.pub-reading i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pub-pulse 1.2s ease-in-out infinite; }
+@keyframes pub-pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
 .pub-from { font-style: normal; font-weight: 400; font-size: 11px; color: var(--muted); margin-left: 6px; }
+
+/* ② 读取状态：一行小字随阶段换文案；没话说的时候不占位 */
+.pub-opt-state:empty { display: none; }
+.pub-opt-fresh { color: var(--muted); }
+.pub-opt-fresh::before { content: "· "; }
+/* 已提交列表：状态摘要 + 筛选。20+ 条时不用一条条滚着找要管的 */
+.pub-qfilters { display: flex; gap: 6px; flex-wrap: wrap; padding: 2px 0 8px; }
+.pub-qf {
+  border: 1px solid var(--line); background: var(--surface); color: var(--muted);
+  border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.pub-qf:hover { border-color: var(--accent); color: var(--accent); }
+.pub-qf.on {
+  background: var(--accent-soft); border-color: var(--accent);
+  color: var(--accent); font-weight: 600;
+}
+/* 队列行：次要信息单独一行，别把时间/账号/大小/话题横着挤成一条 */
+.pub-meta { display: flex; flex-direction: column; gap: 1px; }
+.pub-meta2 { opacity: .82; }
+/* 排期警告挪到「开始上传」旁边，别只藏在右侧预览里 */
+.pub-start-warn {
+  font-size: 11.5px; line-height: 1.5; color: #a8741a;
+  background: rgba(196, 140, 30, .1); border-radius: 8px;
+  padding: 7px 9px; margin-bottom: 6px;
+}
+@media (prefers-color-scheme: dark) {
+  .pub-start-warn { color: #e3b871; }
+}
 
 .pub-link { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 /* 在 .pub-link 里按钮不能占满一行，否则「类型下拉 / 选条目」会上下堆成两行 */

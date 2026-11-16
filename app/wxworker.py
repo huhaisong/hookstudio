@@ -15,7 +15,6 @@
 """
 from __future__ import annotations
 
-import os
 import threading
 import time
 
@@ -33,12 +32,18 @@ def _next_queued() -> dict | None:
 
     不再看计划时间：排到即上传，时间只交给平台的定时发表去守。
     """
-    for j in publisher.queue().get("jobs", []):
+    jobs = publisher.queue().get("jobs", [])
+    # 结果待核实的号先停手：上一条可能已经发出去了，接着传下一条只会更乱。
+    # 人点完「后台已有这条 / 核实没发出去」才继续。
+    held = {j.get("account_id") for j in jobs if j.get("status") == "uncertain"}
+    for j in jobs:
         if j.get("status") != "queued":
             continue
         aid = j.get("account_id") or ""
         if not aid:
             publisher.set_status(j["id"], "failed", "这条没指定发布账号。")
+            continue
+        if aid in held:
             continue
         return j
     return None
@@ -75,9 +80,22 @@ def run_job(job: dict, dry_run: bool = False) -> dict:
         except Exception:  # noqa: BLE001  进度显示坏了不能拖累发布
             pass
 
+    def _before_publish():
+        # 点「发表」之前必须落盘成功；写不进去就抛，整条中断（还没点，安全）
+        publisher.mark_submit_started(job["id"])
+
     try:
         res = wxpost.publish_one(wxbot.session(aid), publisher.job_full(job), tpl,
-                                  media, dry_run=dry_run, progress=_step)
+                                  media, dry_run=dry_run, progress=_step,
+                                  on_before_publish=_before_publish)
+    except wxpost.IdentityMismatchError as exc:
+        # 重试一百次也还是那个号：直接标失败、清候选缓存，让人去重新登录
+        try:
+            publishapi.invalidate_opts_cache(aid)
+        except Exception:  # noqa: BLE001
+            pass
+        publisher.set_status(job["id"], "failed", str(exc)[:200])
+        return {"ok": False, "error": str(exc)}
     except wxpost.PostError as exc:
         attempts = int(job.get("attempts") or 0) + 1
         if attempts < MAX_ATTEMPTS and not dry_run:
@@ -107,16 +125,30 @@ def run_job(job: dict, dry_run: bool = False) -> dict:
         return {"ok": True, "dry_run": True, "form": res.get("form")}
 
     verified = bool((res.get("verified") or {}).get("found"))
+    v = res.get("verified") or {}
+    evidence = {
+        "type": "scheduled_list" if verified else "not_found",
+        "found": verified,
+        "scheduled_at": str(res.get("scheduled_at") or ""),
+        "title_found": bool(v.get("title_found")),
+        "time_found": bool(v.get("time_found")),
+        "after_click": str(res.get("after_click") or "")[:300],
+        "at": publisher.fmt(publisher.now()),
+    }
     if verified:
         publisher.set_status(job["id"], "scheduled", "",
                              {"scheduled_at": res.get("scheduled_at"),
-                              "verified_at": publisher.fmt(publisher.now())})
+                              "verified_at": evidence["at"],
+                              "submit_evidence": evidence})
         return {"ok": True, "scheduled_at": res.get("scheduled_at")}
 
-    # 点完发表但没在「待发布」里找到 —— 不当成成功。
-    publisher.set_status(job["id"], "failed", "点完发表，但在「待发布」里没找到这条。"
-                                             "去视频号助手确认一下。")
-    return {"ok": False, "error": "回读没核对上"}
+    # 点完发表但没核对上：**可能已经发出去了**。绝不能标 failed 让人点
+    # 「重试」，那会再发一条。落到「结果待核实」，等人去后台确认。
+    publisher.set_status(job["id"], "uncertain",
+                         "点完发表，没在「待发布」里核到这条。可能已经发出去了，"
+                         "先去视频号助手核对，别直接重试。",
+                         {"submit_evidence": evidence})
+    return {"ok": False, "error": "结果待核实"}
 
 
 def loop() -> None:
