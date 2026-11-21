@@ -472,11 +472,27 @@ def ensure_spans(pid: str, on_msg=None) -> dict:
     return {"cfg": cfg, "detect": detect, "by_ep": by_ep, "fail": fails}
 
 
-def run(pid: str) -> None:
+def run(pid: str, task_kind: str = "nosub", on_progress=None) -> None:
     """后台任务：逐集「去掉原字幕 + 在原位置加回整理好的台词」，产出独立视频。
 
     单集失败只记录、继续下一集。参数没变且文件还在的集直接跳过（续跑靠这个）。
+
+    task_kind / on_progress：这个函数既独立跑（第 2 步「重做字幕」，注册在
+    nosub 组），也会被别的任务当一段子步骤调用（一键全自动、追加视频，都跑在
+    cuts 组）。内嵌时必须由调用方接管进度：
+      · task_kind 换成调用方的 kind，进度才会落进它那一格；
+      · 调用方还要把 0~100 映射到自己的刻度（全自动 ②/④ 是 32%~54%）。
+    on_progress(pct, msg) 只要给了，本函数就完全不碰 core.set_task——连收尾也
+    不碰，由调用方自己收尾。不给 on_progress 就退回独立跑的默认行为。
     """
+    def _tick(pct: float, msg: str) -> None:
+        # 内嵌调用时进度和收尾都归调用方：这里写 nosub 槽会让两条产线的进度
+        # 分家，末尾 set_task(pid, None) 还会把调用方那一组清掉（2026-11-21）。
+        if on_progress is not None:
+            on_progress(min(100.0, max(0.0, float(pct))), msg)
+        else:
+            core.set_task(pid, task_kind, pct, msg)
+
     p = core.load(pid)
     if not p:
         return
@@ -492,8 +508,7 @@ def run(pid: str) -> None:
     # 所以「一次识别、一直稳定」，不会每点一次生成就换一组数字导致全量重做。
     detect = {}
     if cfg["auto"]:
-        detect = _detect(p, episodes,
-                         on_msg=lambda m: core.set_task(pid, "nosub", 0.5, m))
+        detect = _detect(p, episodes, on_msg=lambda m: _tick(0.5, m))
         if detect.get("pos"):
             if cfg["mode"] == "crop":
                 # 裁掉：保留到「字的上沿再上一点」，切得比写死的 0.75 更贴
@@ -514,8 +529,7 @@ def run(pid: str) -> None:
         band = detect if detect.get("pos") else {
             "pos": cfg["pos"], "size": cfg["size"], "fill": cfg["fill"]}
         spans_by_ep, span_fails = _spans(
-            p, episodes, band,
-            on_msg=lambda m: core.set_task(pid, "nosub", 0.5, m))
+            p, episodes, band, on_msg=lambda m: _tick(0.5, m))
         if span_fails:
             print(f"[nosub] 字幕区域识别失败 {len(span_fails)} 集："
                   f"{'；'.join(span_fails[:5])}", flush=True)
@@ -576,8 +590,7 @@ def run(pid: str) -> None:
             fname = str(ep.get("file") or "")
             src = os.path.join(p["src_dir"], fname)
             dst = os.path.join(dest, _out_name(ep))
-            core.set_task(pid, "nosub", _pct(i),
-                          f"第 {i + 1}/{total} 集：{fname}")
+            _tick(_pct(i), f"第 {i + 1}/{total} 集：{fname}")
             # 参数没变且文件还在 = 上次已经做完，直接跳过（中断续跑就靠这个）
             if same and files.get(fname) and os.path.isfile(dst):
                 continue
@@ -607,8 +620,8 @@ def run(pid: str) -> None:
                         from . import nosubfill
                         nosubfill.encode(
                             src, dst, cfg, sd_ep["spans"], sub_tail, dur,
-                            lambda pct, i=i: core.set_task(
-                                pid, "nosub", _pct(i, pct),
+                            lambda pct, i=i: _tick(
+                                _pct(i, pct),
                                 f"第 {i + 1}/{total} 集：借干净背景 {int(pct)}%"))
                         done = True
                     except Exception as exc:  # noqa: BLE001
@@ -622,8 +635,8 @@ def run(pid: str) -> None:
                     else:
                         graph = _graph(cfg, "", *_patch_span(cfg, sd_ep))
                     _encode(src, dst, graph, dur,
-                            lambda pct, i=i, total=total: core.set_task(
-                                pid, "nosub", _pct(i, pct),
+                            lambda pct, i=i, total=total: _tick(
+                                _pct(i, pct),
                                 f"第 {i + 1}/{total} 集：正在处理 {int(pct)}%"))
                 files[fname] = os.path.basename(dst)
                 errors.pop(fname, None)
@@ -638,9 +651,11 @@ def run(pid: str) -> None:
     if ok >= total and not errors:
         state["burned"] = False
         core.save_merge(p, ["nosub"])
-    core.set_task(pid, "nosub", 100,
-                  f"完成 {ok}/{total} 集" + (f"，{len(errors)} 集失败" if errors else ""))
+    _tick(100, f"完成 {ok}/{total} 集" + (f"，{len(errors)} 集失败" if errors else ""))
     # 显式收尾：清掉 task.json 的「中断续跑」标记。只靠 pct=100 不够——
     # 要等前端轮询 get_task() 才会清，用户关掉页面就留了个假中断标记。
     # 同组只有本任务在跑（cuts 槽互斥），不会误伤别的产线。
-    core.set_task(pid, None)
+    # 内嵌调用（on_progress 由调用方接管）时绝不能清：清的会是调用方那一组，
+    # 全自动刚跑到 ②/④ 就会被这里把 cuts 槽清空、task.json 续跑标记一起抹掉。
+    if on_progress is None:
+        core.set_task(pid, None)

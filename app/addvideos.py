@@ -4,7 +4,9 @@
 - 只碰新增的集：旧集的 index / 台词 / 校对结果 / 已出成片一律不动。
 - 转写走 transcribe.run(pid, force=False) —— 它本来就只转「没有台词」的集，
   正好只跑新集；对时/校对在转写末尾自动跟着走，且按台词指纹缓存，旧集不重算。
-- 抹字幕走 nosub.run(pid) —— 副本指纹不含剧集列表、逐集按文件名跳过，旧副本不重编。
+- 抹字幕走 nosub.run(pid, on_progress=…) —— 副本指纹不含剧集列表、逐集按文件名跳过，
+  旧副本不重编；on_progress 把它的 0~100 接到本任务 92%~100% 的刻度上
+  （不接管的话进度会落到 nosub 槽、收尾还会把本任务的 cuts 槽清掉）。
 - 视频路径：src_dir 里（含子目录扫描来源在本模块外处理）记相对文件名；外部选来的
   记绝对路径。读取处统一 os.path.join(src_dir, file)，绝对路径会被原样采用。
 """
@@ -106,4 +108,7 @@ def run(pid: str) -> None:
     if core.is_cancelled(pid, "cuts"):
         return
     core.set_task(pid, "addvideos", 92, "台词整理好了，正在给新集抹掉原字幕…")
-    nosub.run(pid)
+    # 内嵌调用要接管进度：默认写 nosub 槽的话，本任务在 cuts 的进度会停在 92%，
+    # 而 nosub.run 末尾的 set_task(None) 又会把 cuts 槽清掉（2026-11-21）。
+    nosub.run(pid, on_progress=lambda pct, msg: core.set_task(
+        pid, "addvideos", 92 + pct * 0.08, f"抹字幕 · {msg}"))

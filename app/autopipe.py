@@ -35,7 +35,11 @@ DEFAULT_FX = {
 
 
 def _check_cancel(pid: str) -> None:
-    """转写/生成在 cuts 组、抹字幕在 nosub 组，两边任一被中止都要停。"""
+    """本流程所有步骤都跑在 cuts 组，中止按 cuts 打标就停。
+
+    nosub 那一组也查一下：抹字幕**独立**跑时在 nosub 组（第 2 步「重做字幕」），
+    用户可能单独点了那一步的中止，标记留着就该一起停。
+    """
     if core.is_cancelled(pid, "cuts") or core.is_cancelled(pid, "nosub"):
         raise core.TaskCancelled()
 
@@ -100,7 +104,13 @@ def run(pid: str, cfg: dict | None = None) -> None:
         # ② 干净底片（nosub.run 自带按指纹跳过已完成集；底片齐就直接跳过）
         core.set_task(pid, "autopipe", 32, "全自动 ②/④ 正在做干净底片…")
         if not _nosub_ready(p, len(eps)):
-            nosub.run(pid)
+            # 内嵌调用：nosub.run 默认往 nosub 槽写进度、末尾还会 set_task(None)，
+            # 那会把全自动自己的 cuts 进度撂在 32% 不动、跑完一格还被清空
+            # （2026-11-21）。这里接管进度，把抹字幕的 0~100 映射到 ②/④ 的
+            # 32%→54%，收尾仍由本函数负责。
+            nosub.run(pid, on_progress=lambda pct, msg: core.set_task(
+                pid, "autopipe", 32 + pct * 0.22,
+                f"全自动 ②/④ 抹字幕 · {msg}"))
             _check_cancel(pid)
             p = core.load(pid)
         _stage(pid, "nosub")
