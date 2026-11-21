@@ -356,7 +356,11 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
             return analyze.build_plans(
                 p, it["count"], it["mn"], it["mx"], model=it["label"] or None,
                 progress=False if multi else (it["base"], it["span"] * 0.92, it["prefix"]),
-                timeout=PLAN_JOB_TIMEOUT if multi else None, eps=scope_eps)
+                timeout=PLAN_JOB_TIMEOUT if multi else None, eps=scope_eps,
+                # 进度必须落在本任务真正的组里（planadd / cuts）：写死 "plan"
+                # 会让追加任务的进度跑到 cuts 槽，收尾清不掉 → 状态条卡死、
+                # 中止按 cuts 发出去谁也停不了（2026-11-21）。
+                task_kind=task_kind)
         except Exception as exc:  # noqa: BLE001
             return exc
         finally:

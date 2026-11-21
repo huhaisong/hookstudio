@@ -783,7 +783,8 @@ async function openProject(id) {
   }
   const p = ST.proj;
   // 任一产线在跑就要轮询：只判断 cuts 会漏掉「只开了分镜」的项目的进度刷新
-  if (p.task || p.task_nosub || p.task_shots) startPoll(); else stopPoll();
+  // planadd（出片中追加新套）是独立组，漏了它状态条会停在上一拍不动
+  if (p.task || p.task_nosub || p.task_shots || p.task_planadd) startPoll(); else stopPoll();
 }
 
 /* 静默开跑：不弹提示；409（已有任务在跑）或项目刚被删都直接忽略 */
@@ -912,7 +913,8 @@ $("#btn-task-cancel").addEventListener("click", async () => {
     danger: true,
   });
   if (!ok) return;
-  const curTask = { cuts: p.task, nosub: p.task_nosub, shots: p.task_shots }[key];
+  const curTask = { cuts: p.task, nosub: p.task_nosub, shots: p.task_shots,
+    planadd: p.task_planadd }[key];
   _cancelSent[key] = true;
   btn.disabled = true;
   btn.textContent = "中止中…";

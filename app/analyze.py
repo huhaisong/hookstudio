@@ -1725,7 +1725,8 @@ def _clean_bgm(raw) -> str:
 
 def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
                 model: str | None = None, progress: tuple | bool | None = None,
-                timeout: int | None = None, eps=None) -> list[dict]:
+                timeout: int | None = None, eps=None,
+                task_kind: str = "plan") -> list[dict]:
     """调一次 API，直接从**全剧台词**生成 count 套互相不同的剪辑结构。
 
     eps 给定 = 本批只在这些集里排（2026-11-19 用户定）。台词块只拼选中的集、
@@ -1734,6 +1735,12 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
 
     progress=False = 静默：多组并发时各组不能自己写同一个项目的进度条
     （会来回跳），由 batch.ai_plan_multi 统一按「已完成 N/M 组」推进。
+
+    task_kind：这一趟属于哪种任务，进度按它落到对应的组。**不能写死 "plan"**
+    （2026-11-21 事故）：追加新套走独立组 planadd，进度却按 "plan"（= cuts 组）
+    落槽，收尾时只清自己的 planadd 槽 → cuts 那格永远停在最后一个进度点上，
+    界面显示「AI 正在编排 6%」却点不动中止（_RUNNING 里只有 planadd，按 cuts
+    发起的中止找不到任何任务，只能回「这一步刚好已经结束了」）。
 
     这是批量混剪唯一的出结构方式（第 2 步「片段池」已整体移除，2026-11-02）：
     AI 一次看完整部剧，直接排出 N 套。它看得见因果链，排得出「这套讲讨债线、
@@ -1762,9 +1769,9 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
         # 全程的一截，否则每换一个模型进度都会从 6% 重新跳回去。
         if progress:
             base, span, prefix = progress
-            core.set_task(pid, "plan", base + local_pct / 100.0 * span, f"{prefix}{msg}")
+            core.set_task(pid, task_kind, base + local_pct / 100.0 * span, f"{prefix}{msg}")
         else:
-            core.set_task(pid, "plan", local_pct, msg)
+            core.set_task(pid, task_kind, local_pct, msg)
     avg = (min_minutes + max_minutes) / 2 * 60
     need = avg * count
     # 2026-11-21：plans.txt 删掉了「每套给约 N 块备选」（用户不再挑高光，块数由模型

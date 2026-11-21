@@ -1041,6 +1041,27 @@ def get_task(pid: str, group: str = "cuts") -> dict | None:
     """取某一组的任务状态。默认 cuts，第 3 步用 group="shots"。"""
     with _TASKS_LOCK:
         t = (_TASKS.get(pid) or {}).get(group)
+        # 放错组的槽位（2026-11-21）：kind→group 是纯函数，槽位里的 kind 跟
+        # 自己所在的组对不上，说明写进来的时候就把组写错了（planadd 的进度
+        # 曾经按 "plan" 落进 cuts 槽）。这种槽位永远等不到收尾清理——任务退出
+        # 只清它自己那一组，于是这格停在中途的百分比上，界面显示「还在跑」，
+        # 中止却按对不上的组去找任务、一个也找不到。直接丢掉，自愈。
+        if t and _group_of(str(t.get("kind") or "")) != group:
+            slots = _TASKS.get(pid) or {}
+            slots.pop(group, None)
+            if not slots:
+                _TASKS.pop(pid, None)
+            t = None
+        # 组没在跑、槽位却还在（2026-11-21）：同一个坑的另一半——一条任务顺手把
+        # 进度写进了别的组（全自动里的 nosub.run 会写 nosub 槽），任务退出只清
+        # 自己那组，被顺带写的那格就停在中途，界面那条产线永远显示「在跑」。
+        # 报错槽位保留：那是失败原因，由前端展示给用户。
+        if t and not t.get("error") and not task_running(pid, group):
+            slots = _TASKS.get(pid) or {}
+            slots.pop(group, None)
+            if not slots:
+                _TASKS.pop(pid, None)
+            t = None
         done = bool(t) and not t.get("error") and float(t.get("pct") or 0) >= 100
         if t and not done:
             out = dict(t)
@@ -1178,6 +1199,17 @@ def start_task(pid: str, kind: str, fn) -> bool:
                 with _CANCEL_LOCK:
                     _CANCEL.pop(key, None)
                     _PROCS.pop(key, None)
+            # 兜底清掉本任务自己的进度槽（2026-11-21）：任务函数忘了 set_task(None)、
+            # 或者只把进度写到别的组，槽位就会永远停在那个百分比上——状态条一直
+            # 显示「在跑」、按钮全灰，点中止又因为 _RUNNING 已空而回「已经结束了」。
+            # 有 error 的槽位保留：那是失败原因，要留在界面上给人看。
+            with _TASKS_LOCK:
+                slots = _TASKS.get(pid) or {}
+                cur = slots.get(group)
+                if cur and not cur.get("error"):
+                    slots.pop(group, None)
+                    if not slots:
+                        _TASKS.pop(pid, None)
             _run_cleanups(key)
             _CUR.pid = _CUR.group = _CUR.kind = None
             bind_call_ctx(None, None)
