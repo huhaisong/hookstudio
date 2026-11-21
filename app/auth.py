@@ -230,7 +230,7 @@ def require_admin_request(request: Request | None) -> dict:
     request 为空说明调用姿势不对（比如单测直接调函数）——直接 401，别静默放行。
     """
     if request is None:
-        raise HTTPException(401, "缺少请求上下文")
+        raise HTTPException(401, "登录状态失效，请重新登录")
     return require_admin(request)
 
 

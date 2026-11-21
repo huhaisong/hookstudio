@@ -4,7 +4,7 @@
   · payload.7z —— 整个运行目录（exe + _internal + models + web + prompts + bin）
   · 7zr.exe    —— 7-Zip 独立解压器（589 KB，只用来解 payload）
 
-安装到 `%LOCALAPPDATA%\\HookStudio`，然后建桌面图标、启动程序、退出。
+安装到 D 盘 `D:\\HookStudio`（不占系统盘），然后建桌面图标、启动程序、退出。
 为什么不把程序本身做成单文件：见 docs/交付形态说明.md（900MB 每次启动解压到 temp，
 启动要一两分钟，还会被杀软反复扫）。
 
@@ -17,7 +17,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 APP_NAME = "钩子工坊"
@@ -50,6 +49,12 @@ def _base() -> str:
 
 
 def _target() -> str:
+    """安装目标：优先 D 盘（不占系统盘），可用环境变量覆盖；无 D 盘才退回用户目录。"""
+    custom = os.environ.get("HOOKSTUDIO_INSTALL_DIR")
+    if custom:
+        return custom
+    if os.path.isdir("D:\\"):
+        return os.path.join("D:\\", "HookStudio")
     root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(root, "HookStudio")
 
@@ -105,11 +110,13 @@ def main() -> int:
         _pause()
         return 3
 
-    # 1) 保住老数据：整个 data 目录挪到临时位置
+    # 1) 保住老数据：整个 data 目录挪到临时位置（D 盘，不写 C 盘系统临时目录）
     old_data = os.path.join(target, "data")
     saved = None
     if os.path.isdir(old_data):
-        saved = os.path.join(tempfile.gettempdir(), f"hs_data_{int(time.time())}")
+        backup_root = os.path.join(os.path.dirname(target), "hs_backup")
+        os.makedirs(backup_root, exist_ok=True)
+        saved = os.path.join(backup_root, f"hs_data_{int(time.time())}")
         print("\n[1/3] 备份原有数据…")
         try:
             shutil.move(old_data, saved)

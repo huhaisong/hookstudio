@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import re
 import time
 import uuid
@@ -129,6 +130,7 @@ ACTION_RULES: dict[tuple[str, str], str] = {
     # 数据与体检（2026-11-13）：都是「用户主动去号里读一次」，有动作含义。
     # stat 的 GET 走 noisy 列表（切 Tab 就会读一次缓存），采样品和诊断才记。
     ("POST", "/api/publish/stat/sample"): "hookcut.publish.stat",
+    ("POST", "/api/publish/stat/clear"): "hookcut.publish.stat_clear",
     ("POST", "/api/publish/diag/{id}"): "hookcut.publish.diag",
     # 开/关流速监控：会改本机后台是否持续去号里采，算配置变更
     ("POST", "/api/publish/monitor"): "hookcut.publish.monitor",
@@ -371,6 +373,56 @@ def target_of(pid: str) -> str:
     return f"project:{name}" if name else f"project:{pid}"
 
 
+def purge_project(pid: str, name: str = "") -> int:
+    """删项目时清掉它在操作日志里的痕迹。返回删掉的条数。
+
+    审计表没有 project_id 列（route 还被归一化成 {id}），只能靠这几处线索：
+      · path 里的精确 pid —— 最可靠，绝大多数记录都带；
+      · target = project:<pid> —— 当时取不到剧名的兜底写法；
+      · payload / query 里出现的 pid —— body 埋点带 project_id 的那种；
+      · target = project:<剧名> —— 只有剧名**没被其他现存项目占用**时才敢用，
+        否则同名剧会互相误删。读不到项目目录时按「可能重名」处理，宁可少删。
+
+    注意：本次「删除项目」自己的日志是路由执行完才由中间件写的，不在这批里，
+    所以「谁在什么时候删了哪个项目」这条证据会保留。
+    """
+    pid = str(pid or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", pid):
+        return 0
+    name = str(name or "").strip()[:60]
+    conds = ["path LIKE ?", "target = ?", "payload LIKE ?", "query LIKE ?"]
+    args: list[str] = [f"/api/projects/{pid}%", f"project:{pid}",
+                       f"%{pid}%", f"%{pid}%"]
+    if name:
+        shared = False
+        try:
+            for d in os.listdir(core.PROJECTS):
+                if d == pid:
+                    continue
+                other = core.load(d) or {}
+                if str(other.get("name") or "").strip()[:60] == name:
+                    shared = True
+                    break
+        except OSError:
+            shared = True
+        if not shared:
+            conds.append("target = ?")
+            args.append(f"project:{name}")
+    try:
+        with db.db() as c:
+            ids = [r["id"] for r in c.execute(
+                "SELECT id FROM audit_logs WHERE " + " OR ".join(conds), args).fetchall()]
+            for i in range(0, len(ids), 400):
+                chunk = ids[i:i + 400]
+                c.execute("DELETE FROM audit_logs WHERE id IN (" +
+                          ",".join("?" * len(chunk)) + ")", chunk)
+        _NAME_CACHE.pop(pid, None)
+        return len(ids)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[audit] 清项目日志失败（已忽略）：{exc}")
+        return 0
+
+
 def _target_from_body(body) -> str:
     """路径里没有 id 时，从请求体里找项目 id（`POST /api/ai/grant` 就是这种）。
 
@@ -606,7 +658,7 @@ def _worth_logging_get(route: str) -> bool:
         "/api/publish/accounts/{id}/login-state",
         # 数据页 / 诊断页一进去就读上一次的缓存（2026-11-13）：
         # 纯读本地文件，无副作用；真去号里采一次是 POST，那些记日志
-        "/api/publish/stat", "/api/publish/diag",
+        "/api/publish/stat", "/api/publish/diag", "/api/publish/notify",
         # 流速监控的状态：数据页一进去就问一次，纯读内存
         "/api/publish/monitor",
         # 选好号后自动预取候选（2026-11-13）：一进页面就发，没动作含义。

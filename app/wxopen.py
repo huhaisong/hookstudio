@@ -18,11 +18,14 @@ Chromium（新进程、临时 profile）。两者完全隔离：
 """
 from __future__ import annotations
 
+import os
 import queue
+import shutil
 import threading
 import time
+import uuid
 
-from . import wxbot
+from . import core, wxbot
 
 # Playwright `add_cookies()` 认得的字段。context.cookies() 在新版 Chromium 上
 # 会多出 partitionKey / sourceScheme 之类，原样塞回去会直接抛参数错误。
@@ -75,22 +78,31 @@ def _grab_cookies(sess):
 
 def _viewer(aid: str, cookies: list[dict], ready: queue.Queue, rec: dict) -> None:
     """持有可见窗口，直到用户关掉。ready 只回一次（打开 + 判完登录）。"""
-    pw = browser = None
+    pw = ctx = None
+    prof_dir = None
     sent = False
     try:
         from playwright.sync_api import sync_playwright
 
         pw = sync_playwright().start()
-        browser = pw.chromium.launch(
+        # 临时 profile 必须落在 D 盘（core.DATA_DIR），不再让 Playwright 在
+        # 系统 %TEMP%（C 盘）里建 playwright_chromiumdev_profile-* 目录。
+        # 每次开窗用一个唯一名字，关窗后在 finally 里删掉。
+        prof_dir = os.path.join(core.DATA_DIR, "_tmp_browser",
+                                "viewer_" + uuid.uuid4().hex)
+        os.makedirs(prof_dir, exist_ok=True)
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=prof_dir,
             executable_path=wxbot.find_browser(),
             headless=False,
+            viewport={"width": 1360, "height": 900},
+            locale="zh-CN",
             args=["--disable-blink-features=AutomationControlled"],
         )
-        ctx = browser.new_context(locale="zh-CN",
-                                  viewport={"width": 1360, "height": 900})
         if cookies:
             ctx.add_cookies(cookies)
-        page = ctx.new_page()
+        # persistent context 自带一个空白页，直接用，避免多开一个空标签
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(wxbot.PLATFORM, wait_until="domcontentloaded", timeout=30000)
         # 只拿刚 domcontentloaded 的 URL 当结论会假阳性：cookie 不够时 SPA
         # 是过几秒才把二维码弹出来。给页面一点稳定时间，再双判据核对。
@@ -127,8 +139,8 @@ def _viewer(aid: str, cookies: list[dict], ready: queue.Queue, rec: dict) -> Non
             ready.put({"ok": False, "note": _human(exc)})
     finally:
         try:
-            if browser is not None:
-                browser.close()
+            if ctx is not None:
+                ctx.close()
         except Exception:  # noqa: BLE001  用户先把窗口关了，close 会抛，正常
             pass
         try:
@@ -136,6 +148,9 @@ def _viewer(aid: str, cookies: list[dict], ready: queue.Queue, rec: dict) -> Non
                 pw.stop()
         except Exception:  # noqa: BLE001
             pass
+        # 浏览器进程退出后再删临时 profile，避免占着文件删不掉
+        if prof_dir:
+            shutil.rmtree(prof_dir, ignore_errors=True)
         rec["closed"].set()
         with _MU:
             if _VIEWERS.get(aid) is rec:

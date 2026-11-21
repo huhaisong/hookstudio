@@ -84,14 +84,20 @@ def _word_list() -> list[tuple[str, str]]:
 
 
 def enabled() -> bool:
-    """开关默认开：默认关等于用户每次都要先去勾一下，这个功能本来就是「默认该对」。"""
-    v = core.load_config().get(CFG_KEY, True)
-    return bool(v)
+    """恒为自动（2026-11-18 用户定：默认执行，不需要用户操作）。
+
+    以前这里读 config 的 zh_t2s 开关，界面上还有个勾选框。用户明确说这两层
+    （繁简、人名）就该自动做、不要让他每次去点。繁转简只改字、字表排除了会
+    改错的那些字（乾隆/著名等），没有需要用户关掉的场面，所以不再给关的选项。
+    老配置里即使存过 false 也一律当开，set_enabled 保留只为接口兼容。
+    """
+    return True
 
 
 def set_enabled(on: bool) -> bool:
+    # 接口向后兼容：写下去但不生效（enabled 恒 True）。界面已收起勾选框。
     core.save_config({CFG_KEY: bool(on)})
-    return bool(on)
+    return True
 
 
 def prompt() -> str:

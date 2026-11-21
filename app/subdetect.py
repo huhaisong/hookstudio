@@ -23,7 +23,7 @@ import subprocess
 
 from . import core
 
-VERSION = 6
+VERSION = 10
 # 识别算法的版本号，进 nosub 的缓存键。改了判据就必须 bump，
 # 否则老项目里「用旧算法量出来的位置」会被当成新鲜结果直接复用
 # （v1 用 320 宽 + 邻域对比，v2 改成 640 宽 + 纯白&邻域双判据，位置差 8%；
@@ -34,7 +34,24 @@ VERSION = 6
 #   v5 行密度改为「优先跨帧平均、不够再退回第二高」——短片段项目（15 秒 3 句）
 #   被空档摊薄到 0.0539，整集被判成没字幕；
 #   v6 _frame_box 不再把「行段被画面运动打碎」当没字——碎段 + 高密度仍算一句，
-#   否则掩码留洞、原字幕在成片里闪一下）。
+#   否则掩码留洞、原字幕在成片里闪一下；
+#   v7 _box_mean 按帧分块——长片+大分辨率时整摞建积分图要 2.44GiB 直接 OOM，
+#   被上层吞掉后 by_ep 永远空、抹字退回固定位置（判据没变，但实现变了，
+#   bump 强制有「部分集 OOM」的老项目全部重量一遍）。
+#   v8 双行字幕：跨帧平均把只在少数帧出现的第二行摊薄到阈值下，band 只框一行、
+#   逐句搜索窗下沿截断，成片第二行下半截抹不掉。改用逐行最大密度连通扩展出
+#   双行带 + 搜索窗上沿按文字顶收敛（不按膨胀的 size，免得框进人物）；
+#   白字掩膜也分块（900 帧整摞减法同样 2.44GiB）。
+#   v9 修 v8 的过度扩展：连通门槛 0.03 太低，白衬衫/下巴在个别帧的 row_max
+#   有 0.05-0.10，会顺着连续达标一路缝到 0.79（重生八零 ep02 band 高 0.22、
+#   逐句框 0.36），镜像补出一块嘴。改成「只合并够强的字行段、允许行间小空档」：
+#   强段门槛 max(0.12, 主行峰值×0.45)，两段间隔 <= 0.5 字高才并。真双行第二行
+#   峰值 0.21+ 能并进来，白衬衫/下巴峰值 <0.10 进不来。合成测试两种都过。
+#   v10 修 v9 漏掉的一类：字幕空档帧，搜索窗下沿按膨胀后的 size 开到 0.82，
+#   罩住浅色桌面/手（白月光 ep36 25s），逐帧框把桌面反光当字顶到窗底，
+#   经 pad+兜底放大到 0.856，整条下半屏被镜像抹掉。改：① 窗下沿按真实字高
+#   只留 SPAN_DOWN_ROOM；② 单帧框优先只认 band 文字带核心区内的强段
+#   （真字行密度 0.29+，桌面假段 0.03）；③ SPAN_PAD_Y 0.22→0.10。
 
 DETECT_W = 640          # 检测分辨率宽。
 # **不能降到 320**：白字缩小时被抗锯齿拉灰，纯白阈值直接失效；
@@ -60,14 +77,38 @@ PAD = 0.40              # 上下各留字高的 40% 做余量（描边、阴影�
 SPAN_FPS = 4.0          # 逐句检测抽帧频率（句均 1-3 秒，4fps 够抓住边界）
 SPAN_MAX_FRAMES = 900   # 单集最多抽这么多帧，长片自动降频
 SPAN_PAD_X = 0.55       # 左右各留「字高 × 0.55」的余量（描边、句末标点）
-SPAN_PAD_Y = 0.22       # 上下各留「字高 × 0.22」（0.35 时抹除带将近字高的 1.7 倍，白衬衫上补出来的块更显眼）
+SPAN_PAD_Y = 0.10       # 上下各留「字高 × 0.10」（v10 从 0.22 收窄：0.22 时假段经 pad 再放大 0.086 个画面高）
+SPAN_DOWN_ROOM = 0.60   # 搜索窗下沿 = text_bottom + 真实字高×此值（容双行第二行，不再用膨胀的 size×1.35）
 SPAN_MIN_W = 0.035      # 比这还窄的检出（反光点、边角碎片）不是一句字幕
 SPAN_MERGE = 0.020      # 相邻帧四边差异都小于此 → 视为同一句，合并取并集
 SPAN_HOLE = 0.90        # 相邻两句隔得比这还近，中间的空洞按连续处理（换句淡入会漏检）
 
 
 def _box_mean(a, k: int = 4):
-    """邻域均值（积分图实现，比逐点循环快两个数量级）。"""
+    """邻域均值（积分图实现，比逐点循环快两个数量级）。
+
+    2026-11-18 内存修复：整摞帧一次性建积分图，长片（383s）+ 大分辨率
+    （720×1280 → 检测尺寸 1138×640，最多 900 帧）时单个数组就 2.44GiB，
+    积分图 + 四个高级索引中间量同时活着直接 ArrayMemoryError；上层把它
+    当成「这集没字幕」吞掉，于是逐句 spans 永远是空、抹字退回固定位置。
+    积分图是沿空间轴（1/2）算的，按帧（轴 0）分块结果逐位一致——分块跑，
+    峰值内存与帧数无关。判据没变，但 bump VERSION 让曾部分成功的老项目
+    全部重量一遍（有的集 OOM、有的集成功的项目，靠空 by_ep 判断不到）。
+    """
+    import numpy as np
+    CHUNK = 24  # 24×1138×640×4 ≈ 70MB/数组，几个中间量峰值 <0.5GB
+    n = int(a.shape[0])
+    if n <= CHUNK:
+        return _box_mean_block(a, k)
+    out = np.empty((n, a.shape[1], a.shape[2]), dtype="float32")
+    for s in range(0, n, CHUNK):
+        e = min(n, s + CHUNK)
+        out[s:e] = _box_mean_block(a[s:e], k)
+    return out
+
+
+def _box_mean_block(a, k: int = 4):
+    """单块积分图邻域均值。调用方保证块足够小，不会 OOM。"""
     import numpy as np
 
     ii = np.pad(a, ((0, 0), (1, 0), (1, 0))).cumsum(1).cumsum(2)
@@ -80,6 +121,25 @@ def _box_mean(a, k: int = 4):
          - ii[:, y1][:, :, x0] + ii[:, y0][:, :, x0])
     c = ((y1 - y0)[:, None] * (x1 - x0)[None, :]).astype("float64")
     return (s / c).astype("float32")
+
+
+def _white_mask(fr) -> "np.ndarray":
+    """「纯白且显著亮于邻域」的逐帧掩膜，判据与 detect() 完全一致。
+
+    detect_spans 原来整摞算 `fr - _box_mean(fr,5)`：900 帧 ×1138×640 的
+    float32 中间量就是 2.44GiB。邻域均值就算分块了，这个减法仍是一次性整摞。
+    按帧分块算 bool 掩膜再拼回去，峰值与帧数无关，结果与整摞逐位一致。
+    """
+    import numpy as np
+
+    CHUNK = 24
+    n = int(fr.shape[0])
+    out = np.empty(fr.shape, dtype=bool)
+    for s in range(0, n, CHUNK):
+        e = min(n, s + CHUNK)
+        blk = fr[s:e]
+        out[s:e] = (blk >= WHITE_MIN) & ((blk - _box_mean_block(blk, 5)) > WHITE_DIFF)
+    return out
 
 
 def _frames(src: str, dur: float, want: int = 12, fps: float | None = None):
@@ -217,6 +277,64 @@ def detect(src: str, dur: float, want: int = 24) -> dict | None:
     text_top, text_bot = top_i / h, bot_i / h
     text_h = text_bot - text_top
 
+    # **双行字幕连通扩展**（2026-11-18 项目 74ac63113705「八万八」）：
+    # 短剧一句台词常占上下两行，但双行只在部分帧出现（以上视频 24 帧里只有 4 帧
+    # 双行）。跨帧平均（cands[0]）把第二行摊薄到阈值以下，best 只框住中间一行
+    # （实测 0.770~0.787，真字 0.748~0.831）→ 逐句搜索窗下沿 0.814 截断，
+    # 成片第二行下半截抹不掉。这里用「逐行跨帧最大密度」把被摊薄的字行捞回来，
+    # 再把 best 上下**连续**达标的行并进来——只连通扩展，碰到空档就停，
+    # 免得把字幕上方的人物/下方道具也缝进带里。
+    # 用「逐行跨帧最大密度」把被摊薄的字行捞回来。
+    #
+    # 2026-11-20 修（v9）：原来是 row_max >= 0.03 就「连续」往上下吃。0.03 只压得住
+    # 噪点（max<0.02），压不住白衬衫/下巴——这些在个别帧的 row_max 有 0.05-0.10，
+    # 一帧达标就接着下一帧，连成 113 行，text_bottom 从 0.698 被撑到 0.79
+    # （重生八零 ep02：band 高 0.22、逐句框 0.36，镜像补出一块嘴）。
+    # 试过「加跨帧平均门槛」：真双行第二行只在 4/24 帧出现，平均被摊薄到 0.019，
+    # 跟误判的 0.004 拉不开，会把真双行也砍掉（合成测试 FAIL，不能用）。
+    # 正解是分两段判：**先看每行够不够强（像字），再看段间空档够不够小（像两行）**。
+    # 真字行 row_max 0.21+，白衬衫/下巴 <0.10，中间有干净的缝；两行字幕之间
+    # 的空档通常 <0.5 个行高。只合并「强段 + 小空档」，弱亮物连强段的边都摸不到。
+    # 门槛取 max(0.12, 主行峰值×0.45)：绝对下限挡衬衫，相对项自适应淡字幕。
+    try:
+        row_max = per.max(axis=0)
+        row_max = np.where(row_max > COVER_MAX, 0.0, row_max)
+        main_peak = float(row_max[top_i:bot_i].max())
+        barrier = max(0.12, main_peak * 0.45)
+        # 只在 best 上下 3 倍字高的窗口里找强段，别摸到更远的画面
+        lo, hi = int(text_top * h) - max(2, int(text_h * h) * 3), int(text_bot * h) + max(2, int(text_h * h) * 3)
+        lo, hi = max(y0, lo), min(y1, hi)
+        strong = row_max[lo:hi] >= barrier
+        # 连续的强行先成段
+        runs: list[list[int]] = []
+        inrun = False
+        for yy in range(lo, hi):
+            if strong[yy - lo] and not inrun:
+                st, inrun = yy, True
+            elif not strong[yy - lo] and inrun:
+                runs.append([st, yy])
+                inrun = False
+        if inrun:
+            runs.append([st, hi])
+        # 段间空档 <= 0.5 字高才并（两行字幕的间距）；大空档是画面亮物，停手
+        gap_tol = max(2, int(text_h * h * 0.5))
+        merged: list[list[int]] = []
+        for rr in runs:
+            if merged and rr[0] - merged[-1][1] <= gap_tol:
+                merged[-1][1] = rr[1]
+            else:
+                merged.append(list(rr))
+        # 只取跟 best 行段重叠的那一条合并段
+        for m in merged:
+            if not (m[1] <= top_i or m[0] >= bot_i):
+                top_i, bot_i = m[0], m[1]
+                break
+    except Exception:  # noqa: BLE001 —— 扩展只是优化，失败就用原来的单行带
+        pass
+    # 扩展后重新算 text_top/bot，后续填充条、逐句搜索窗全部跟着放大（一处改、全局生效）
+    text_top, text_bot = top_i / h, bot_i / h
+    text_h = text_bot - text_top
+
     # 上下各留余量；带上沿不能顶到画面一半以上（否则等于又抹一大条）
     top = max(Y_MIN, text_top - text_h * PAD)
     bot = min(0.995, text_bot + text_h * PAD)
@@ -270,11 +388,22 @@ def detect(src: str, dur: float, want: int = 24) -> dict | None:
             "conf": round(min(1.0, peak / 0.10), 3), "frames": int(fr.shape[0])}
 
 
-def _frame_box(mask, y0: int, y1: int, h: int, w: int):
+def _frame_box(mask, y0: int, y1: int, h: int, w: int,
+               core0: int | None = None, core1: int | None = None):
     """单帧在搜索窗里找字幕包围盒（像素 l,r,t,b）；这帧没字返回 None。
 
     跟整片 detect 的区别：这里只能靠**单帧**密度，没有「跨帧累积」可用，
     所以门槛要放松（跨帧平均会被「字幕时有时无」摊薄，单帧峰值高得多）。
+
+    **v10 浅背景误判修复**：搜索窗下沿为了容双行字幕开到 pos+size*1.35，
+    但 size 是被 PAD 撑大的整条带高，窗底常常伸到画面 0.82（浅色桌面/手）。
+    真字幕行密度 0.29-0.44、且落在 band 的 text_top/text_bottom 核心区内；
+    桌面反光只有 0.03、落在核心区下方。原来纯按「密度总量」选段会选中桌面
+    那条假段（它更宽更靠下），框被顶到窗底 0.82，再经 span 的 pad/兜底放大
+    到 0.856 —— 整条下半屏被镜像抹掉（白月光 ep36 25s）。
+    传入 core0/core1（band 文字带核心区的像素 y）后：核心区内有达标段就只认
+    核心区内的段；核心区密度 <0.12（真字带连一行强字都没有）直接判这帧无字，
+    不退回全窗——否则窗外的浅色背景段会被当字、放大成半屏抹除带。
     """
     import numpy as np
 
@@ -295,6 +424,28 @@ def _frame_box(mask, y0: int, y1: int, h: int, w: int):
             segs.append(cur)
             cur = [int(v)]
     segs.append(cur)
+
+    # v10：核心区（真字幕带）里有达标段就只在核心区里选，挡掉窗外浅色背景。
+    # 门槛用「真字行密度下限」而非相对峰值：真字幕段峰 0.29+，桌面假段 0.03，
+    # 中间隔着一个数量级，0.12 足够分开又不会误伤淡字幕。
+    if core0 is not None and core1 is not None and core1 > core0:
+        c_lo, c_hi = max(0, core0 - y0), min(len(rows), core1 - y0)
+        core_segs = []
+        for s in segs:
+            if not s or s[-1] < c_lo or s[0] >= c_hi:
+                continue
+            a, b = max(c_lo, s[0]), min(c_hi, s[-1] + 1)
+            if b > a and float(rows[a:b].max()) >= 0.12:
+                core_segs.append(s)
+        c_peak = float(rows[c_lo:c_hi].max()) if c_hi > c_lo else 0.0
+        if core_segs:
+            segs = core_segs
+        elif c_peak < 0.12:
+            # 核心区（band 量出的真字带）连一行强字都没有 → 这一帧没有字幕。
+            # 实测量级：真字幕行密度 0.29-0.44，浅色桌面/衣服反光 0.028-0.03，
+            # 隔一个数量级。此时窗外若还有弱段（桌面白边、下巴），那是背景不是字，
+            # 判无字。否则那块会被当字幕框、经 pad 放大成半屏镜像抹除带。
+            return None
     # 按「密度总量」选段：一行稀疏的点不该赢过两行密字
     seg = max(segs, key=lambda s: float(rows[s].sum()))
     ti, bi = y0 + seg[0], y0 + seg[-1] + 1
@@ -338,13 +489,23 @@ def detect_spans(src: str, dur: float, band: dict | None = None,
     if n < 2:
         return None
     step = float(dur) / n
-    white = (fr >= WHITE_MIN) & ((fr - _box_mean(fr, 5)) > WHITE_DIFF)
+    white = _white_mask(fr)
+    # 搜索窗：字幕永远在带里、双行只会向下多一行。上沿按「文字顶再往上一点」
+    # 就够（不能按膨胀后的 size 放宽，否则冲到画面 0.59 把人物脸框进来——
+    # 实测 202/224s 帧），下沿才按整个 size 放宽容下第二行。
     pos, size = float(band["pos"]), float(band["size"])
-    # 搜索窗：上下各放开一些容得下两行字幕，但不许越出画面
-    y0 = max(0, int((pos - size * 0.7) * h))
-    y1 = min(h, int((pos + size * 1.7) * h))
+    text_top = float(band.get("text_top") or pos)
+    text_bot = float(band.get("text_bottom") or (pos + size))
+    up_room = max(0.012, (text_bot - text_top) * 0.35)  # 上沿只留约 1/3 带高的余量
+    y0 = max(0, int((text_top - up_room) * h))
+    # v10：下沿不再用 pos + size*1.35。size 含 PAD 膨胀（实测这集 0.1424），
+    # 1.35 倍直接把窗底顶到 0.82，正好罩住浅色桌面。双行字幕第二行最多再低
+    # 「一个字高」，用 (text_bot-text_top) 这个真实字高去留余量即可。
+    text_h = max(0.001, text_bot - text_top)
+    y1 = min(h, int((text_bot + text_h * SPAN_DOWN_ROOM) * h))
 
-    boxes = [_frame_box(white[i], y0, y1, h, w) for i in range(n)]
+    core0, core1 = int(text_top * h), int(text_bot * h)
+    boxes = [_frame_box(white[i], y0, y1, h, w, core0, core1) for i in range(n)]
 
     def close(a, b) -> bool:
         return (abs(a[0] - b[0]) <= SPAN_MERGE * w

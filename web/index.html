@@ -97,6 +97,13 @@
       </div>
       <p class="hint" id="mode-hint">批量混剪：AI 通读全剧台词，一次排出 N 套不同主线的剪法，你勾选后只给选中的套出片。</p>
 
+      <!-- 一键全自动（2026-11-21）：建项目时勾上，配一次参数，建完自动跑完整条链。
+           不勾就走原来的手动分步流程，界面完全不变。参数面板由 app.js 渲染（和项目页共用一套）。 -->
+      <div class="card" id="auto-new-card">
+        <label class="chk"><input type="checkbox" id="in-autopipe"> <b>全自动一条龙</b><span class="hint"> · 建好项目后自动整理台词、抹字幕、生成剪辑、出片，一次跑完不用管</span></label>
+        <div id="auto-new-params" class="hidden"></div>
+      </div>
+
       <div class="card" id="pick-card">
         <div class="drives" id="drives"></div>
         <div class="browse-head">
@@ -121,17 +128,34 @@
         <button class="ghost danger" id="btn-del">删除</button>
       </div>
 
+      <!-- 一键全自动（2026-11-21）：已有项目随时补跑整条链。进度走顶部状态条，
+           失败在这里显示人话原因 + 重试按钮，不用翻日志。批量模式才显示。 -->
+      <div class="card" id="auto-proj-card">
+        <div class="fx-head">
+          <b>⚡ 一键全自动</b>
+          <span class="hint">配一次，自动整理台词 → 抹字幕 → 生成剪辑 → 出片，不用一步步点</span>
+          <button class="ghost sm" id="auto-proj-toggle">设置 ▾</button>
+        </div>
+        <div id="auto-proj-params" class="hidden"></div>
+        <div class="action-bar">
+          <button class="primary" id="btn-autopipe">一键全自动</button>
+          <span class="hint" id="auto-proj-state"></span>
+        </div>
+        <div class="step-error hidden" id="auto-proj-error" role="alert"></div>
+      </div>
+
       <!-- 步骤导航：一次只展示一步，状态一眼可见。长卷平铺时用户要一直滚、也分不清
            自己做到哪了；这里把「现在该做哪一步」放到视线动线上。 -->
       <nav class="step-nav" id="step-nav" aria-label="制作步骤"></nav>
 
       <!-- 台词整理之后的一步：把每集画面上的原字幕抹掉，产出「没有字幕的底片」。
            2026-11-16 改成只抹不烧：台词在出片时才烧上去（那样才能和左右镜像共存），
-           所以底片一份多套共用，面板只留「抹得干不干净」和「时间对齐」两块，
-           字幕样式（动效/幅度）已经搬到出片第 5 组。
+           所以底片一份多套共用，面板只留「抹得干不干净」；
+           字幕样式搬到出片第 5 组，时间对齐搬到第 1 步转写末尾（2026-11-19）。
            不做也能出片（选「原始视频」），只是没法镜像、也换不掉原字幕。 -->
       <div class="step" id="step-nosub" data-step="2">
         <div class="step-h"><span class="idx">2</span>抹掉原字幕<span class="tag soft">做一次 · 所有套共用</span><em id="s0-state"></em></div>
+        <div class="step-error hidden" id="s0-error" role="alert"></div>
         <p class="lead">把每集画面上的原字幕抹干净，产出每集一条<b>没有字幕的底片</b>。剪辑出片时再从底片切段、按第 1 步整理好的台词把字幕加回去——所以底片只做一次，后面十几套都用它，镜像也不受影响。</p>
 
         <section class="adv-open">
@@ -161,21 +185,8 @@
               </div>
               <p class="hint" style="margin:8px 0 0">默认用第一个。如果某集字幕正好压在衬衫、腰带这类深浅分明的画面上，补出来能看出被换过，就换第二个（要多花一倍时间）。</p>
             </div>
-            <!-- 3 时间也和画面一样会自动对齐，不需要单独点按钮（2026-11-16 用户定）。
-                 以前这块是两个按钮，还得「先校正、再回来点生成」两步才生效；
-                 现在并进生成流程：量字幕位置时顺手就能量出真实出现时刻。 -->
-            <div class="fx-group fx-g2">
-              <div class="fx-group-h"><i class="fx-gno">2</i>字幕时间自动对齐
-                <span class="hint">只改时间，不动字</span></div>
-              <div class="fx-checks">
-                <label class="chk"><input type="checkbox" id="ns-retime" checked>生成时按原片字幕重排时间</label>
-              </div>
-              <p class="hint" style="margin:8px 0 0">原片带字幕才有效：拿每句字幕真实出现、消失的时刻当尺子，把台词挪到该出现的位置，<b>越到后面越串位</b>的片子靠这个。原片没字幕的（AI 生成那种）自动跳过；第一次每集多花半分钟左右，之后走缓存。</p>
-              <div class="fx-line">
-                <span class="hint" id="retime-state">生成时自动对齐一次，不用管</span>
-                <button class="ghost hidden" id="btn-retime-undo">撤销，回到识别出来的时间</button>
-              </div>
-            </div>
+            <!-- 字幕时间对齐已挪到第 1 步：转写完紧接着自动对齐，台词一出来时间就是准的。
+                 第 2 步只抹画面，不再有对时的控件和说明（2026-11-19 用户定）。 -->
           </div>
         </section>
 
@@ -189,88 +200,60 @@
         <details class="fold">
           <summary>这一步会做什么？</summary>
           <div class="fold-body">
-            <p>会把每一集都做成一份「原字幕换成你自己台词」的视频，和原来的视频一起放着，互不影响。做一次就能反复用；出片时在「出片设置 → 用哪份视频」里挑，不想用随时换回原始视频。</p>
+            <p>会把每一集都做成一份<b>没有原字幕的干净底片</b>，和原来的视频一起放着，互不影响。做一次就能反复用；出片时从第 3 步挑这份底片，按你的台词把字幕烧上去，不想用随时换回原始视频。</p>
             <p>字幕在画面哪儿、每一句有多宽多高，都不用你填：点生成时程序先逐集扫一遍，量出<b>每一句字幕自己的矩形</b>——长句宽到八成，短句只有两三成，单行和多行的高度也不一样。抹的时候只动这些块，画面其余部分一个像素都不碰，没有字幕的时段完全不处理。</p>
             <p>块里的内容两种补法。<b>照旁边画面补</b>（默认）是把紧挨着它的画面上下各取一段翻转回来，中间渐变过渡，快，一集十几秒；缺点是字幕正好压在衬衫、腰带这类深浅分明的竖结构上时，翻过来的那块会偏亮。<b>照这一段干净画面补</b>是从同一镜头里这一块没被字挡住的那些帧里抄回来——同一部剧里字幕长短不一，短句时这块是露出来的，抄来的就是真背景；它要逐帧处理，一集多花一倍时间。普通画面下两种看起来差不多，默认那档更快；只有字幕正好压在衬衫、腰带这类深浅分明的地方，才值得换第二档。镜头切换的瞬间如果正好在说话，会退回第一种补法，不会抄到上一个镜头的画面。</p>
             <p>字幕什么时候出现也不是把识别出来的时间直接拿来用：点生成时先按原片每条字幕真实出现、消失的时刻把每句台词排准（原片本来没字幕的片子跳过），再开始烧，所以不会出现「越到后面越比说话早」。这一步只改时间、不改一个字。新字幕就落在原来那行字幕的位置上，句子跟着台词一句一换。烧到画面上的字不带标点——一行就那么几个字，标点占位置还挺扎眼；台词原文（上面「查看 / 修改台词」、下载的 .txt）标点都还在，只是不上画面。原来整理好的台词不用重做，剪片子的时间点也不变——这一步只动画面，声音原样保留。</p>
-            <p>这份视频里的字幕已经烧进画面了，出片时不能再左右镜像（字会翻反）。</p>
+            <p>这份底片上没有字幕，出片时才按你的台词烧字，所以<b>可以整幅左右镜像</b>（先翻画面、后烧字，字不会反）。要用原始视频出片就不能整幅翻——原字幕在画面里，翻了字会反。</p>
           </div>
         </details>
       </div>
 
       <div class="step" id="step-transcribe" data-step="1">
         <div class="step-h"><span class="idx">1</span>台词整理<em id="s1-state"></em></div>
-        <p class="lead">把每集里说的每句话连同出现时间整理出来，后面的剪辑都要靠它定位。</p>
+        <p class="lead">把每集里说的每句话连同出现时间整理出来，后面的剪辑都要靠它定位。建好项目后会自动开始，不用手动点按钮；中途关掉再进来会接着做。</p>
         <div class="action-bar">
-          <button class="primary" id="btn-transcribe">开始整理台词</button>
+          <button class="primary" id="btn-addvideos" title="给这个项目追加新视频：可以扫描原素材目录，也可以选视频文件或文件夹。已导入的视频会自动跳过。加完自动只给新集整理台词、对时间、校对、抹掉原字幕，旧集和已出的成片都不动">添加视频</button>
+          <button class="ghost" id="btn-transcribe" title="台词会自动整理；整理失败或想整部剧重来时点这里——已有台词会全部重新识别一遍，转简体、对时间、AI 校对（自动改人名、错字和病句）一并做">重新整理台词</button>
           <button class="ghost" id="btn-reuse" title="同一批素材按文件名直接把台词搬过来">用其他项目的台词</button>
           <button class="ghost" id="btn-paste" title="粘贴本工具导出的台词文本，或带时间码的字幕">粘贴台词</button>
           <span id="transcript-links" class="hidden">
             <button class="primary" id="btn-lines-view">查看 / 修改台词</button>
+            <button class="ghost" id="btn-proof"
+              title="让 AI 通读全部集，列出人名写法不一致、错的字、只有杂音的行；勾选后写回，说话时间不动">校对台词</button>
             <a class="ghost" id="btn-transcript-dl">下载台词 .txt</a>
           </span>
+        </div>
+
+        <!-- 整剧台词校对（2026-11-19 用户定）：这是「整部剧」的事，放第 1 步；
+             单集编辑弹窗只负责改这一集的字，不再挂整剧校对入口。 -->
+        <div class="proof-box hidden" id="s1-proof">
+          <div class="proof-bar">
+            <b data-pr="title">整部剧的台词校对</b>
+            <span class="hint" data-pr="hint">通读全部集，列出人名写法、错的字、只有杂音的行；勾选后写回，说话时间不动。</span>
+            <span style="flex:1"></span>
+            <button class="ghost sm" data-pr="run">开始校对</button>
+          </div>
+          <p class="hint hidden" data-pr="auto" style="margin:6px 0 0"></p>
+          <div class="proof-list hidden" data-pr="list"></div>
+          <div class="proof-actions hidden" data-pr="actions">
+            <button class="primary sm" data-pr="apply">应用勾选的改到台词里</button>
+            <button class="ghost sm" data-pr="clear">收起清单</button>
+          </div>
+          <!-- 结果 / 失败留一行在下方：收起清单后仍能看到「已保存几处」 -->
+          <p class="hint" data-pr="state" style="margin:8px 0 0"></p>
         </div>
         <details class="fold">
           <summary>这一步会做什么？</summary>
           <div class="fold-body">
-            <p>建好项目后会自动开始，中途关掉再进来会接着做，不用重来。同一批素材重建项目时，可以把已整理好的台词直接搬过来；从别处拿到的字幕也能粘贴导入。</p>
+            <p>同一批素材重建项目时，可以把已整理好的台词直接搬过来；从别处拿到的字幕也能粘贴导入。整理失败或想重来时，点上面的按钮再跑一次。</p>
             <p>整理结果可以随时逐集查看、改错字或下载留档；改完只影响这一集。</p>
+            <p>转写是听音写下来的，人名同音不同字、错字、只有杂音的行都会有。整理台词时（含整部剧重来）它会顺带跑一遍 AI 校对：<b>同一个人的几种写法、错字乱码、漏字多字、断句病句都直接改好</b>，不用你动手，改完在「校对台词」里能逐条查看改了什么；只有整行都是杂音的句子会留在清单里，勾哪条才删哪条——它只改字、不动每一句的起止时间，也不改剪辑点。</p>
           </div>
         </details>
 
-        <!-- 人名写法统一（2026-11-16）：转写会把同一个人名写成好几种同音字，
-             换模型也治不了，所以用一张对照表在转写后统一。只改字，时间码不动。 -->
-        <section class="adv-open">
-          <div class="adv-title">
-            <span class="adv-badge">① 人名写法不统一时用</span>
-            <b>统一人名写法</b>
-            <span class="hint">比如把「清唐」统一成「清棠」</span>
-          </div>
-          <div class="adv-body">
-            <p class="hint">识别台词时人名常被写成同音字，同一部剧里可能同时出现好几种写法。这里放一张对照表，程序按表把错写法统一成你定的名字；之后每次整理台词都会自动套用。只改字，说话时间一点不动。</p>
-            <div class="action-bar">
-              <button class="ghost" id="btn-names-apply">现在统一一次</button>
-              <span class="hint" id="names-state"></span>
-            </div>
-            <details class="fold">
-              <summary>改对照表</summary>
-              <div class="fold-body">
-                <p>一行一个名字：左边写正确写法，右边写识别出来的各种错写法，用逗号分开。<code>#</code> 开头是注释。</p>
-                <textarea id="names-text" rows="9" spellcheck="false"
-                  style="width:100%;font-family:Consolas,monospace;font-size:12px"></textarea>
-                <div class="action-bar">
-                  <button class="primary" id="btn-names-save">保存对照表</button>
-                  <span class="hint" id="names-save-state"></span>
-                </div>
-              </div>
-            </details>
-          </div>
-        </section>
-
-        <!-- 繁转简（2026-11-16）：whisper 偶尔整段输出繁体，一集简一集繁。
-             开关开 = 转写时提示模型用简体 + 转完按字表兜底；关掉只影响以后新转的。 -->
-        <section class="adv-open">
-          <div class="adv-title">
-            <span class="adv-badge">② 字幕一会儿简一会儿繁时用</span>
-            <b>繁体转简体</b>
-            <span class="hint">比如把「會員」换成「会员」</span>
-          </div>
-          <div class="adv-body">
-            <p class="hint">识别台词偶尔会整段出繁体，同一部剧有的集是简体、有的集是繁体。开着这一项，整理台词时会先让模型用简体，转完再按字表兜一遍；已经在项目里的台词，点「现在转一次」立刻换。只换字，说话时间一点不动。</p>
-            <div class="action-bar">
-              <span><input type="checkbox" id="zh-on" style="width:auto;height:auto;margin:0 7px 0 0;vertical-align:-2px">以后整理台词时自动转</span>
-              <button class="ghost" id="btn-zh-apply">现在转一次</button>
-              <span class="hint" id="zh-state"></span>
-            </div>
-            <details class="fold">
-              <summary>会不会把对的字改错？</summary>
-              <div class="fold-body">
-                <p>按字表逐字换，只换繁简、不改句子。像「乾隆」「著名」「慰藉」这种——一个繁体对应好几个简体、写在词里本来就对的字，字表里已经排除了，不会被改成「干隆」「着名」「慰借」。</p>
-                <p>改完第 2 步的成品要重新生成一次，字幕才会跟着变。</p>
-              </div>
-            </details>
-          </div>
-        </section>
+        <!-- 人名统一交给上面的「校对台词」（整剧级）；繁转简静默自动执行，
+             两者都不再有单独的设置卡片和解释文案（2026-11-19 用户定）。 -->
       </div>
 
       <!-- 单片导流模式：剪辑表与出片已合并成一步（2026-11-07） -->
@@ -327,6 +310,107 @@
       <div id="batch-steps" class="hidden">
         <div class="step" id="batch-step2" data-step="2">
           <div class="step-h"><span class="idx">3</span>剪辑与出片<em id="b2-state"></em></div>
+
+          <!-- 两条并列的路：进来先选走哪条（2026-11-17）。
+               这是一级切换，只管「直接出片还是 AI 剪辑」；AI 剪辑内部的
+               多套混剪 / 单集钩子是下一级，别和它混在同一排。 -->
+          <div class="route-mode" id="route-mode">
+            <button class="rt-btn" data-route="direct">
+              <b>选视频直接出片</b><span>已有视频，每条换个字幕直接出</span></button>
+            <button class="rt-btn on" data-route="ai">
+              <b>AI 剪辑</b><span>从台词排剪辑表，AI 生成多套</span></button>
+          </div>
+
+          <div id="pane-direct" class="hidden">
+          <!-- 选视频直接出片：不排剪辑表，一个视频一条成片。 -->
+          <section class="direct-panel" id="direct-panel">
+            <div class="dp-head">
+              <div class="dp-title"><span class="dp-badge">快捷</span><b>选视频直接出片</b></div>
+              <span class="dp-sub">不用排剪辑表，每个视频出一条，把原字幕换成你的台词</span>
+            </div>
+            <div class="dp-body" id="dp-body">
+              <div class="dp-step"><i>1</i><div class="dp-step-main">
+                <div class="dp-step-row">
+                  <button class="primary sm" id="dp-pick-files">选择视频</button>
+                  <button class="ghost sm" id="dp-pick-folder">选择文件夹</button>
+                  <button class="ghost sm hidden" id="dp-reselect" title="清掉当前台词和成片，重新选一批视频">重选</button>
+                  <span class="hint" id="dp-src-note">支持 mp4 / mov / mkv，可多选；文件夹自动取里面的视频</span>
+                </div>
+                <div class="dp-files" id="dp-files"></div>
+              </div></div>
+
+              <div class="dp-step"><i>2</i><div class="dp-step-main">
+                <div class="dp-step-row"><b class="dp-step-t">整理台词</b></div>
+                <!-- 选完视频就自动开始整理，这里是常驻主路径：一眼看到"不用你粘贴"和当前进度 -->
+                <div class="dp-auto" id="dp-auto">
+                  <p class="dp-auto-lead">选完视频就自动开始整理台词，不用你粘贴。</p>
+                  <div class="dp-auto-state" id="dp-auto-state"></div>
+                  <div class="dp-auto-bar hidden" id="dp-auto-bar"><i class="dp-auto-bar-fill" id="dp-auto-bar-fill"></i></div>
+                  <div class="dp-auto-actions">
+                    <button class="ghost sm danger hidden" id="dp-transcribe-stop" title="停掉正在进行的整理台词，已经整理好的会保留">中止整理</button>
+                    <button class="primary sm hidden" id="dp-transcribe">重新整理没整理好的</button>
+                  </div>
+                </div>
+                <div class="dp-eps" id="dp-eps"></div>
+                <!-- 字幕时间对齐已随转写自动串行完成，不需要手动按钮（2026-11-18） -->
+                <!-- 个别视频要换成自己的台词，才展开这里 -->
+                <details class="fold dp-more" id="dp-more">
+                  <summary>个别视频的台词要自己改？（修改 / 粘贴 / 重新整理）</summary>
+                  <div class="fold-body">
+                    <p class="hint">大多数视频直接用自动整理好的就行。要改错字、调时间、增删句子，用「修改台词」；手上另有整集台词要换，用「粘贴台词」。</p>
+                    <div class="dp-step-row">
+                      <button class="ghost sm" id="dp-edit">修改选中的台词…</button>
+                      <button class="ghost sm" id="dp-import">给选中的视频粘贴台词…</button>
+                    </div>
+                  </div>
+                </details>
+              </div></div>
+
+              <div class="dp-step"><i>3</i><div class="dp-step-main">
+                <div class="dp-step-row"><b class="dp-step-t">出片设置</b>
+                  <span class="hint">成片存哪、画面怎么调——和下面混剪用的是同一套设置</span></div>
+                <div class="row" style="margin:6px 0">
+                  <label style="flex:1">成片保存到
+                    <input id="dp-save-dir" type="text" spellcheck="false" placeholder="例如 F:/钩子工坊_成片" />
+                  </label>
+                  <button class="ghost sm" id="dp-pick-outdir">选择文件夹…</button>
+                </div>
+                <div class="row" style="margin:6px 0">
+                  <label style="flex:0 0 auto">每个视频出几份
+                    <select id="dp-copies">
+                      <option value="1">1 份</option>
+                      <option value="2">2 份</option>
+                      <option value="3">3 份</option>
+                      <option value="4">4 份</option>
+                      <option value="5">5 份</option>
+                    </select>
+                  </label>
+                  <span class="hint" id="dp-copies-note">出几份就是几个版本：画面裁剪、镜像、调色、字幕动效各自随机，内容还是同一个视频。每多一份就要多等一遍出片时间。</span>
+                </div>
+                <details class="dp-settings" id="dp-fx-wrap">
+                  <summary>画面设置（调色 / 镜像 / 配乐 / 字幕样式等）</summary>
+                  <div class="dp-fx" id="dp-fx"></div>
+                </details>
+                <div class="action-bar" style="margin-top:10px">
+                  <button class="primary" id="dp-render">开始出片</button>
+                  <button class="ghost sm danger hidden" id="dp-stop" title="停掉正在进行的这批出片，已经做好的成片会保留">中止出片</button>
+                  <span class="hint" id="dp-render-note"></span>
+                </div>
+                <!-- 出片进度放这里（第 3 步出片区），不再挤在「整理台词」卡里 -->
+                <div class="dp-auto-state hidden" id="dp-render-state"></div>
+                <div class="dp-auto-bar hidden" id="dp-render-bar"><i class="dp-auto-bar-fill" id="dp-render-bar-fill"></i></div>
+              </div></div>
+
+              <div class="dp-result hidden" id="dp-result">
+                <div class="dp-step-row"><b class="dp-step-t">成片</b>
+                  <button class="ghost sm" id="dp-open-dir" title="在文件夹里打开成片">打开文件夹</button></div>
+                <div class="dp-sets" id="dp-sets"></div>
+              </div>
+            </div>
+          </section>
+          </div><!-- /pane-direct -->
+
+          <div id="pane-ai">
           <!-- 编排方式：同一个项目、同一份转写结果，换一种产物形态。
                不做成新建项目时的第三种模式——那得把同一批剧再转写一遍。 -->
           <div class="cut-mode" id="cut-mode">
@@ -370,6 +454,23 @@
                     <button class="ghost" id="btn-prompt-cancel">收起</button>
                   </div>
                 </div>
+                <!-- 这批只在这些集里排（2026-11-19）。同一部剧可以反复分批生成：
+                     这次勾 1-8 出 3 套、下次勾 5-11 再出 3 套，套全部攒着，
+                     每套记着自己属于第几批。字太多会让 AI 引用编号时串号，
+                     选集把编号空间压小，引用错的概率跟着降。 -->
+                <div class="card" id="plan-eps-card" style="margin:0 0 10px">
+                  <div class="row" style="align-items:center">
+                    <b>这批用哪些集</b>
+                    <span class="hint" id="plan-ep-stat"></span>
+                    <span style="flex:1"></span>
+                    <input id="plan-range" placeholder="例如 1-8 或 1,3,5" style="width:150px" spellcheck="false">
+                    <button class="ghost sm" id="btn-plan-range">按范围选</button>
+                    <button class="ghost sm" id="btn-plan-eps-all">全选</button>
+                    <button class="ghost sm" id="btn-plan-eps-none">全不选</button>
+                  </div>
+                  <div class="ep-chips" id="plan-ep-chips"></div>
+                  <p class="hint" id="plan-ep-note" style="margin:8px 0 0"></p>
+                </div>
                 <div id="plan-models">
                   <div class="pm-thead">
                     <span class="pm-grp-h">组</span>
@@ -390,6 +491,9 @@
             <div class="action-bar">
               <button class="primary" id="btn-plan">生成 3 套结构</button>
               <button class="ghost" id="btn-plan-auto" title="按素材总时长自动填好套数和每套时长">按素材推荐</button>
+              <label class="chk" id="plan-append-wrap" title="勾上：新生成的套加在已有套后面，已有套和已出的片都不动。不勾：清掉已有套重新生成。">
+                <input type="checkbox" id="plan-append" checked>
+                <span>保留已有套，新的接在后面</span></label>
             </div>
             <p class="hint" id="plan-feasible"></p>
             <details class="fold">
@@ -491,6 +595,7 @@
                     <input id="save-dir" type="text" spellcheck="false" placeholder="例如 F:/钩子工坊_成片" />
                   </label>
                   <button class="ghost" id="btn-save-dir-pick">选择文件夹…</button>
+                  <button class="ghost" id="btn-save-dir-open" title="在文件夹里打开成片（出片中途也能点）">📂 打开文件夹</button>
                 </div>
                 <p class="hint" id="save-dir-note" style="margin:6px 0 0"></p>
                 <div class="hist-chips" id="hist-proj-out"></div>
@@ -514,13 +619,16 @@
 
           <!-- 出片进度原本单独占一步，现在并到同一步末尾：点完出片就地看进度 -->
           <div class="section-label">④ 出片进度</div>
+          <div class="hint" id="b3-tally"></div>
           <div class="hint" id="b3-state"></div>
-          <p class="lead">按勾选的结构逐条出片；中断后重新打开会接着做没完成的部分。</p>
+          <p class="lead">上面是这一批的进度：已出片的、这一趟在排队和在渲的、还没出片的都在下面。
+            勾选只决定下一趟出哪些，改勾选不影响已经在跑的这一趟。</p>
           <div class="row" id="sets-actions" style="display:none">
             <button class="ghost" id="btn-open-folder">📂 打开成片文件夹</button>
             <span class="hint" id="sets-folder-note"></span>
           </div>
           <div id="sets-list" class="sets-list"></div>
+          </div><!-- /pane-ai -->
         </div>
 
       </div>
@@ -746,12 +854,13 @@
           <label class="fld" id="fld-model">生成方式
             <input id="in-model" list="model-list" placeholder="留空则用默认" autocomplete="off" spellcheck="false">
             <datalist id="model-list">
-              <option value="qwen3.5-plus">默认（稳定）</option>
-              <option value="ZHIPU/GLM-5.2">快速（需开通）</option>
-              <option value="ZHIPU/GLM-5.3">快速 · 长剧本（需开通）</option>
-              <option value="deepseek-v4-pro">精细（较慢）</option>
-              <option value="deepseek-flash">轻快</option>
-              <option value="qwen-max">备用</option>
+              <option value="qwen3.5-plus">qwen3.5-plus</option>
+              <option value="ZHIPU/GLM-5.2">ZHIPU/GLM-5.2</option>
+              <option value="ZHIPU/GLM-5.3">ZHIPU/GLM-5.3</option>
+              <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+              <option value="deepseek-v4.1-flash">deepseek-v4.1-flash</option>
+              <option value="deepseek-flash">deepseek-flash</option>
+              <option value="qwen-max">qwen-max</option>
             </datalist>
             <span class="hint" id="model-hint"></span>
           </label>
@@ -795,6 +904,10 @@
             <span>台词识别</span>
             <div class="fld-note" id="tier-hint"></div>
           </div>
+          <label class="fld hidden" id="fld-asr-denoise">
+            <span><input type="checkbox" id="in-asr-denoise" style="width:auto;height:auto;margin:0 7px 0 0;vertical-align:-2px">台词总被背景音盖住、识别不全时打开</span>
+            <span class="hint">整理台词前先把人声和背景音乐分开，只听清人声。原片音乐很响时才需要；每集会多花一点时间，同一集只分离一次。</span>
+          </label>
           <label class="fld" id="fld-report">
             <span><input type="checkbox" id="in-report" style="width:auto;height:auto;margin:0 7px 0 0;vertical-align:-2px">把本机操作日志上报到后台</span>
             <span class="hint" id="report-hint"></span>
@@ -849,6 +962,22 @@
   </div>
 </div>
 
+<!-- 添加视频：选来源（扫描原目录 / 选视频 / 选文件夹）。三选一，复用弹窗样式 -->
+<div class="modal hidden" id="modal-addvideos" role="dialog" aria-modal="true">
+  <div class="modal-card cfm-card">
+    <div class="modal-head"><b>给这个项目添加视频</b></div>
+    <div class="modal-body cfm-body">
+      <p>新视频会接到现有剧集后面；已经导入过的会自动跳过。加完自动只给新集整理台词、对时间、校对、抹掉原字幕，旧集和已出的成片都不动。</p>
+    </div>
+    <div class="modal-foot cfm-foot" style="flex-wrap:wrap">
+      <button class="ghost" id="av-cancel">取消</button>
+      <button class="ghost" id="av-folder">选文件夹</button>
+      <button class="ghost" id="av-files">选视频文件</button>
+      <button class="primary" id="av-scan">扫描原素材目录</button>
+    </div>
+  </div>
+</div>
+
 <!-- 台词复用 / 粘贴：第 1 步的两个入口共用一个弹窗 -->
 <div class="modal hidden" id="modal-lines">
   <div class="modal-card lines-card">
@@ -879,6 +1008,29 @@
   </div>
 </div>
 
+<!-- 选视频直接出片：专用台词粘贴弹窗（导入到直出项目，不碰当前主项目） -->
+<div class="modal hidden" id="modal-dp-lines">
+  <div class="modal-card lines-card">
+    <div class="modal-head">
+      <b>给这个视频粘贴台词</b>
+      <button class="ghost sm" id="dp-ln-close">关闭</button>
+    </div>
+    <div class="modal-body">
+      <label class="fld">台词给哪个视频
+        <select id="dp-ln-ep"></select>
+      </label>
+      <label class="fld">台词内容（每句要带出现时间）
+        <textarea id="dp-ln-text" rows="9" spellcheck="false"
+          placeholder="可以粘这两种：&#10;· 本工具「下载台词 .txt」里的原样内容（1. (2.7-4.9) 台词…）&#10;· 带时间轴的字幕（00:00:02,700 --> 00:00:04,940 下一行是台词）&#10;每句都要有时间，只有文字没时间不能用来定位字幕。"></textarea>
+      </label>
+      <div class="row" style="justify-content:flex-end">
+        <button class="primary" id="dp-ln-import">导入台词</button>
+      </div>
+      <p class="hint" id="dp-ln-stat"></p>
+    </div>
+  </div>
+</div>
+
 <!-- 第 1 步：台词查看 / 修改。一次取回全部集，逐集编辑，保存只覆盖这一集 -->
 <div class="modal hidden" id="modal-view-lines">
   <div class="modal-card lines-card" style="width:min(860px,94vw)">
@@ -899,7 +1051,26 @@
       <textarea id="vl-text" rows="17" spellcheck="false"
         style="width:100%;font-family:Consolas,monospace;font-size:12.5px;line-height:1.7"></textarea>
       <p class="hint">每行一句，格式 <code>1. (2.7-4.9) 台词</code>：括号里是这句在本集里的起止秒数。
-        可以直接改错字、删掉整行、改时间码；保存只影响这一集。<b>改完，之前生成的结构和分镜不会自动更新，需要重新生成。</b></p>
+        可以直接改错字、删掉整行、改时间码；保存只影响这一集。<b id="vl-tip">改完，之前生成的结构和分镜不会自动更新，需要重新生成。</b></p>
+
+      <!-- 直出的每个视频各有一份校对清单（互相独立，不能合并），所以这份清单
+           跟着视频走、留在这个弹窗里；整部剧的校对在第 1 步「校对台词」，不在这。 -->
+      <div class="proof-box hidden" id="vl-proof">
+        <div class="proof-bar">
+          <b data-pr="title">这个视频的台词校对</b>
+          <span class="hint" data-pr="hint">只看当前这个视频（各视频互相独立）；列出人名写法、错的字、只有杂音的行，勾选后写回，说话时间不动。</span>
+          <span style="flex:1"></span>
+          <button class="ghost sm" data-pr="run">检查这个视频</button>
+        </div>
+        <p class="hint hidden" data-pr="auto" style="margin:6px 0 0"></p>
+        <div class="proof-list hidden" data-pr="list"></div>
+        <div class="proof-actions hidden" data-pr="actions">
+          <button class="primary sm" data-pr="apply">应用勾选的改到台词里</button>
+          <button class="ghost sm" data-pr="clear">收起清单</button>
+          <span class="hint" data-pr="state"></span>
+        </div>
+      </div>
+
       <p class="hint" id="vl-msg"></p>
     </div>
     <div class="modal-foot">

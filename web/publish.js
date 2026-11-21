@@ -34,6 +34,10 @@
     // 当前选中的号只由 /api/publish/queue 下发（current_account_id），前端不存：
     // 刷新、多开页面都只会看到服务端那一份，避免界面显示 A、实际发到 B。
     tab: "pub", aid: "", stat: null, diag: null, mon: null,
+    // 数据页视图状态（小v猫式）：筛选词 / 只看有增量 / 剧集 / 排序 / 双列 / 通知面板。
+    // 都只影响「怎么显示本地已采到的数据」，不改后端、不重新采样。
+    statFilter: "", statIncOnly: false, statColl: "", statSort: "time",
+    statCols: 1, statNotice: null, statNoticeOpen: false,
     statBusy: false, diagBusy: false, abn: null, delBusy: false, openBusy: false,
     // 登录会话：null＝没在登录。添加账号/重登/失效兜底全走这一个状态，
     // 后端负责弹出可见浏览器窗口，前端只提示 + 轮询登录态（2026-11-14 用户定：
@@ -189,6 +193,14 @@
     return `${Math.floor(v / 60)}:${pad(v % 60)}`;
   }
 
+  // 数字显示口径：完播率/平均时长平台可能没给（老数据）→ 一律「—」，绝不补 0
+  function rateText(v) { return v == null ? "—" : Number(v).toFixed(1) + "%"; }
+  function avgText(v) {
+    if (v == null) return "—";
+    const s = Math.round(Number(v));
+    return s >= 60 ? `${Math.floor(s / 60)}分${pad(s % 60)}秒` : `${s}秒`;
+  }
+
   async function renderStat(force) {
     const box = document.querySelector("#pub-stat");
     if (!box) return;
@@ -208,7 +220,27 @@
     const d = S.stat || {};
     const mon = S.mon || {};
     const acc = d.account || {};
-    const posts = d.posts || [];
+    const allPosts = d.posts || [];
+    const sum = d.summary || {};
+    // 剧集下拉：从作品里出现过的合集名去重
+    const colls = [...new Set(allPosts.map((p) => p.collection).filter(Boolean))];
+
+    // ── 筛选 / 排序：只动本地显示，不重新采样 ────────────────────────────
+    let posts = allPosts.filter((p) => {
+      if (S.statIncOnly && !(p.inc > 0)) return false;
+      if (S.statColl && p.collection !== S.statColl) return false;
+      if (S.statFilter) {
+        const q = S.statFilter.toLowerCase();
+        if (!String(p.title || "").toLowerCase().includes(q)
+          && !String(p.collection || "").toLowerCase().includes(q)) return false;
+      }
+      return true;
+    });
+    if (S.statSort === "play") posts = [...posts].sort((a, b) => b.play - a.play);
+    else if (S.statSort === "inc") posts = [...posts].sort((a, b) => (b.inc || 0) - (a.inc || 0));
+    else if (S.statSort === "finish") posts = [...posts].sort((a, b) => (b.finish_rate || 0) - (a.finish_rate || 0));
+    // 默认 time：后端已按发布时间倒序
+
     box.innerHTML = `
       <div class="mon-bar${mon.on ? " on" : ""}">
         <span class="mon-dot"></span>
@@ -218,6 +250,7 @@
           : "开着才会记下每次的变化。关了就少一段记录，之前读到的不会丢。"}</span>
         <button class="ghost sm" data-act="monToggle">${mon.on ? "停止" : "开始自动记录"}</button>
       </div>
+
       <div class="stat-head">
         <div class="stat-acc">
           <span class="av">${acc.avatar
@@ -226,60 +259,132 @@
           <div>
             <b>${esc(acc.nick || "还没读过")}</b>
             <span>${acc.nick
-              ? `${esc(String(acc.fans || 0))} 粉丝 · ${esc(String(acc.feeds || 0))} 个作品`
+              ? `${esc(String(acc.fans || 0))} 粉丝 · ${esc(String(sum.count ?? acc.feeds ?? 0))} 个作品`
               : "点右边「采一次」，程序去号里读一遍"}</span>
           </div>
         </div>
         <div class="stat-ops">
           <span class="hint">${d.at ? `上次 ${esc(showTime(d.at))}` : ""}</span>
+          <button class="ghost sm" data-act="statNotice">通知记录${d.notify_unread ? ` ${esc(String(d.notify_unread))}` : ""}</button>
+          <button class="ghost sm" data-act="statClear"${allPosts.length ? "" : " disabled"}>清空数据</button>
           <button class="primary sm" data-act="statSample"${S.statBusy ? " disabled" : ""}>
             ${S.statBusy ? "正在读…" : d.at ? "再采一次" : "采一次"}</button>
         </div>
       </div>
-      ${posts.length ? `
-        <div class="stat-card">
-          <div class="stat-card-head">
-            <h3>作品数据</h3>
-            <span class="hint">播放量是平台给的总数；「这段时间涨了」要至少采样两次才看得出来。</span>
-          </div>
-          <div class="stat-tbl-wrap"><table class="stat-tbl">
-            <thead><tr>
-              <th>作品</th><th>发布时间</th><th class="num">播放数</th><th class="num">这段时间涨了</th>
-              <th class="num">点赞</th><th class="num">评论</th><th class="num">转发</th><th class="num">收藏</th>
-            </tr></thead>
-            <tbody>${posts.map(statRow).join("")}</tbody>
-          </table></div>
-        </div>`
+
+      ${allPosts.length ? `
+        <div class="stat-summary">
+          <div><span>作品数</span><b>${esc(String(sum.count ?? allPosts.length))}</b></div>
+          <div><span>最高播放</span><b>${esc(String(sum.max_play ?? 0))}</b></div>
+          <div><span>最低播放</span><b>${esc(String(sum.min_play ?? 0))}</b></div>
+          <div><span>合计播放</span><b>${esc(String(sum.total_play ?? 0))}</b></div>
+        </div>
+
+        <div class="stat-filter">
+          <input type="search" class="stat-search" data-stat-input="filter"
+            placeholder="作品标题 / 剧集" value="${esc(S.statFilter)}">
+          <select class="stat-sel" data-stat-input="coll">
+            <option value="">全部剧集</option>
+            ${colls.map((c) => `<option value="${esc(c)}"${S.statColl === c ? " selected" : ""}>${esc(c)}</option>`).join("")}
+          </select>
+          <select class="stat-sel" data-stat-input="sort">
+            <option value="time"${S.statSort === "time" ? " selected" : ""}>按发布时间</option>
+            <option value="play"${S.statSort === "play" ? " selected" : ""}>按播放数</option>
+            <option value="inc"${S.statSort === "inc" ? " selected" : ""}>按这段时间涨了</option>
+            <option value="finish"${S.statSort === "finish" ? " selected" : ""}>按完播率</option>
+          </select>
+          <label class="stat-chk"><input type="checkbox" data-stat-input="incOnly"${S.statIncOnly ? " checked" : ""}> 只看涨了的</label>
+          <button class="ghost sm stat-col-btn" data-act="statCols">${S.statCols === 2 ? "单列" : "双列"}</button>
+        </div>
+
+        <div class="stat-grid${S.statCols === 2 ? " two" : ""}">
+          ${posts.length ? posts.map(statCard).join("")
+            : `<div class="pub-empty">没有符合筛选条件的作品。</div>`}
+        </div>
+        <p class="stat-tip">播放量、完播率、平均时长都是平台给的数；「这段时间涨了」要采过两次才看得出来，只采过一次的作品显示「—」。这些数读到哪算哪，不猜。</p>`
         : `<div class="pub-empty">${esc(d.note
           || "还没有数据。点右上「采一次」，程序会去号里读一遍（大约 10 秒）。")}</div>`}`;
+
+    if (S.statNoticeOpen) paintStatNotice();
   }
 
-  function statRow(p) {
-    const bars = p.series || [];
-    // 柱子 = 相邻两点的差。第一次采样时只有一个点，画不出柱，这是对的，不是 bug
-    const diffs = bars.slice(1).map((v, i) => Math.max(0, v - bars[i]));
-    const max = Math.max(1, ...diffs);
-    const cols = diffs.map((dv) => `<i style="height:${Math.max(1, Math.round(dv / max * 14))}px"
-      title="+${dv}"></i>`).join("");
+  function statCard(p) {
     const inc = p.inc == null ? "—" : (p.inc > 0 ? "+" + p.inc : String(p.inc));
-    // 合集名只在和标题不一样时才显示，否则同一行字会出现两遍
-    const col = p.collection && p.collection !== p.title ? `<em>${esc(p.collection)}</em>` : "";
-    return `<tr>
-      <td><div class="stat-w">
-        <span class="stat-cov">${p.cover
-          ? `<img src="${esc(p.cover)}" alt="" loading="lazy">` : ""}</span>
-        <div class="stat-wt"><b>${esc(p.title || "（无标题）")}</b>${col}</div>
-      </div></td>
-      <td class="muted">${esc(tsText(p.ts))} · ${durText(p.dur)}</td>
-      <td class="num"><b>${esc(String(p.play))}</b></td>
-      <td class="num"><b class="${p.inc > 0 ? "up" : "muted"}">${esc(inc)}</b>${
-        cols ? `<span class="stat-bars">${cols}</span>`
-             : `<span class="mini muted">再采一次可见</span>`}</td>
-      <td class="num">${esc(String(p.like))}</td>
-      <td class="num">${esc(String(p.comment))}</td>
-      <td class="num">${esc(String(p.forward))}</td>
-      <td class="num">${esc(String(p.fav))}</td>
-    </tr>`;
+    const incCls = p.inc > 0 ? "up" : (p.inc < 0 ? "down" : "muted");
+    const col = p.collection && p.collection !== p.title
+      ? `<span class="st-collection">${esc(p.collection)}</span>` : "";
+    return `<div class="st-card">
+      <div class="st-cover">${p.cover
+        ? `<img src="${esc(p.cover)}" alt="" loading="lazy">`
+        : `<i>无封面</i>`}</div>
+      <div class="st-body">
+        <div class="st-title" title="${esc(p.title || "")}">${esc(p.title || "（无标题）")}</div>
+        <div class="st-sub">${col}<span>${esc(tsText(p.ts))}</span></div>
+        <div class="st-metrics">
+          <div><span>播放</span><b>${esc(String(p.play))}</b></div>
+          <div><span>完播率</span><b>${esc(rateText(p.finish_rate))}</b></div>
+          <div><span>平均时长</span><b>${esc(avgText(p.avg_play_sec))}</b></div>
+          <div><span>起始播放</span><b>${esc(String(p.base ?? 0))}</b></div>
+          <div><span>这段时间涨了</span><b class="${incCls}">${esc(inc)}</b></div>
+        </div>
+        <div class="st-social">
+          <span title="点赞">♡ ${esc(String(p.like))}</span>
+          <span title="评论">💬 ${esc(String(p.comment))}</span>
+          <span title="转发">↗ ${esc(String(p.forward))}</span>
+          <span title="收藏">☆ ${esc(String(p.fav))}</span>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  // 通知记录：独立面板，覆盖在数据页上；纯读上次采样缓存
+  async function openStatNotice() {
+    S.statNoticeOpen = true;
+    S.statNotice = null;
+    const box = document.querySelector("#pub-stat");
+    if (box) paintStatNoticeLoading();
+    try {
+      const aid = encodeURIComponent(currentAid() || "");
+      S.statNotice = await api(`/api/publish/notify?aid=${aid}`);
+    } catch (e) {
+      S.statNotice = { items: [], note: e.message };
+    }
+    paintStatNotice();
+  }
+  function paintStatNoticeLoading() {
+    const old = document.querySelector("#stat-notice-panel");
+    if (old) old.remove();
+    const host = document.querySelector("#pub-stat");
+    if (!host) return;
+    host.insertAdjacentHTML("beforeend",
+      `<div class="st-notice-mask" id="stat-notice-panel" data-act="statNoticeClose">
+        <div class="st-notice" data-stop="1"><div class="pub-loading">正在读取…</div></div>
+      </div>`);
+  }
+  function paintStatNotice() {
+    const old = document.querySelector("#stat-notice-panel");
+    if (old) old.remove();
+    const host = document.querySelector("#pub-stat");
+    if (!host) return;
+    const nd = S.statNotice || {};
+    const items = nd.items || [];
+    host.insertAdjacentHTML("beforeend", `
+      <div class="st-notice-mask" id="stat-notice-panel" data-act="statNoticeClose">
+        <div class="st-notice" data-stop="1">
+          <div class="st-notice-head">
+            <b>通知记录</b>
+            <span class="hint">${nd.unread ? `未读 ${esc(String(nd.unread))} 条` : ""}</span>
+            <button class="mini" data-act="statNoticeClose">关闭</button>
+          </div>
+          ${items.length ? `<div class="st-notice-list">${items.map((it) => `
+            <div class="st-notice-item">
+              <div><b>${esc(it.title || "通知")}</b><span>${esc(tsText(it.ts))}</span></div>
+              ${it.text ? `<p>${esc(it.text)}</p>` : ""}
+            </div>`).join("")}</div>`
+            : `<div class="pub-empty">${esc(nd.note || "这个号最近没读到通知。")}</div>`}
+          <p class="stat-tip">这里只列平台真发过的通知；要处理违规/申诉，还得本人到视频号助手的通知中心办。</p>
+        </div>
+      </div>`);
   }
 
   // ── 诊断 Tab（账号体检）─────────────────────────────────────────────────
@@ -427,6 +532,31 @@
           + `&aid=${encodeURIComponent(currentAid())}`,
           { method: "POST", body: JSON.stringify({}) });
         toast(want ? "开始自动记录了，会定时去看一次播放量" : "已停止，之前读到的还在");
+        renderStat(true);
+      } catch (e) { toast(e.message); }
+      return;
+    }
+    if (name === "statCols") {
+      S.statCols = S.statCols === 2 ? 1 : 2;
+      renderStat(false);
+      return;
+    }
+    if (name === "statNotice") { openStatNotice(); return; }
+    if (name === "statNoticeClose") {
+      S.statNoticeOpen = false;
+      const p = document.querySelector("#stat-notice-panel");
+      if (p) p.remove();
+      return;
+    }
+    if (name === "statClear") {
+      if (S.statBusy) return;
+      if (!window.confirm("清空这个号所有已记录的数据？\n只清记录，不影响平台上的作品。删了找不回来。")) return;
+      try {
+        const r = await api(`/api/publish/stat/clear?aid=${encodeURIComponent(currentAid() || "")}`,
+          { method: "POST", body: JSON.stringify({}) });
+        S.stat = null;
+        S.mon = null;
+        toast(r.removed ? "已清空这个号的数据记录" : "这个号本来就没有记录");
         renderStat(true);
       } catch (e) { toast(e.message); }
       return;
@@ -828,7 +958,7 @@
     if (!g.ok) {
       const tips = {
         offline: ["网络异常，暂时用不了",
-          "现在连不上服务器，确认不了你的版本权限。等网络恢复再打开这一页就行，已经排好的不会丢。"],
+          "现在连不上服务器，确认不了你的版本权限。等网络恢复再打开这一页就行，已定时的不会丢。"],
         stale: ["登录状态已失效",
           "服务器那边这张登录凭证已经作废了（换过机器登录或改过密码都会这样）。退出账号重新登录一次再进来。"],
         need_pro: ["此功能需要专业版",
@@ -1077,9 +1207,9 @@
       <div class="pub-scan-side">
         <b>${title}</b>
         <p>${L.opening ? "正在打开浏览器窗口…" : "浏览器窗口已经打开了。"}
-          在里面点 <b>「微信快捷登录」</b>，<b>手机上确认一下</b>，这边就自动往下走。</p>
-        <p class="mini-note">登录成功会自动重读这个号的选项，不用刷新页面。
-          那个窗口留着别关，之后上传视频还要用它。</p>
+          在弹出的窗口里<b>扫码</b>，或点 <b>「微信快捷登录」</b>，手机确认后这边就会自动继续。</p>
+        <p class="mini-note">登录成功会自动重新加载这个号的选项，不用刷新页面。
+          那个窗口用完后可以自己关掉，不用留着。</p>
         ${L.err ? `<p class="bad">${esc(L.err)}</p>` : ""}
         <div class="pub-acts">
           <button class="ghost sm" data-act="loginRetry">再开一次窗口</button>
@@ -1124,7 +1254,7 @@
   }
 
   /** 开一个登录会话：后端在**可见浏览器窗口**里打开视频号助手的登录页，
-   *  这边只提示 + 每 2.5 秒问一次登录态（不再截码塞进界面）。
+   *  这边只提示 + 每 10 秒问一次登录态（不再截码塞进界面）。
    *  force=true（重登）＝后端先清掉旧登录态，保证换一个微信登录。
    *  auto=true＝失效号自动弹的，用户没点任何按钮，取消后本轮不再纠缠。
    *  label 只在「已知是哪个号」时给（重登/失效），新加的号不猜名字。 */
@@ -1133,8 +1263,12 @@
     if (!aid) aid = currentAid();
     if (!aid) { toast("先在上面账号条选号"); return; }
     endLogin();
+    // fresh=1 只有「添加账号」这条入口会给：这次会话刚刚 add 出来的空壳号，
+    // 取消登录时才可以删。重登/自动兜底都不是 fresh（哪怕号被清成 pending），
+    // 取消时只收面板、绝不删号——否则老号会被当成空壳抹掉（2026-11-18 用户报）。
     S.login = { aid: aid, label: o.label || "", err: "", opening: true,
-                busy: false, fails: 0, timer: null, auto: !!o.auto };
+                busy: false, fails: 0, timer: null, auto: !!o.auto,
+                fresh: !!o.fresh };
     paintLogin();
     try {
       const r = await apiT(`/api/publish/accounts/${aid}/login${o.force ? "?force=1" : ""}`,
@@ -1153,14 +1287,16 @@
     }
   }
 
-  /** 窗口被关了/没弹出来 → 再开一次（同一个号，沿用当前会话的 label/auto）。 */
+  /** 窗口被关了/没弹出来 → 再开一次（同一个号，沿用当前会话的 label/auto）。
+   *  `?reopen=1`：明确告诉后端「上一个窗口没了，起一个全新可见窗口」，
+   *  别复用残留的空白标签页（否则点了没反应，2026-11-16 修复）。 */
   async function reopenLogin() {
     if (!S.login) return;
     const aid = S.login.aid;
     S.login.err = ""; S.login.opening = true;
     paintLogin();
     try {
-      const r = await apiT(`/api/publish/accounts/${aid}/login`,
+      const r = await apiT(`/api/publish/accounts/${aid}/login?reopen=1`,
         { method: "POST" }, 170000);
       if (!S.login || S.login.aid !== aid) return;
       if (r.logged_in) { await loginDone(); return; }
@@ -1187,12 +1323,22 @@
       if (S.login.busy) return;
       S.login.busy = true;
       try {
-        // hard=1：死会话残留的旧标签页会把这里误报成「已登录」，登录面板刚摆出来
-        // 就被自动收掉，用户根本没机会登录。后端对「登录确认进行中」会放行。
-        const r = await api(`/api/publish/accounts/${S.login.aid}/login-state?hard=1`);
+        // 不传 hard：探测强度由后端按账号当前 state 决定——正在扫码坐实的号
+        // （pending/unknown/expired）走轻量，别让真导航把刚进后台的登录态判丢；
+        // 只有 online 号（切号验号）才 hard 识破假登录。传死 hard=1 会让刚扫码
+        // 成功的新号一直显示「待登录」（2026-11-18 用户报）。
+        const r = await api(`/api/publish/accounts/${S.login.aid}/login-state`);
         if (!S.login) return;
         if (r.error) { S.login.err = r.error; paintLogin(); return; }
-        if (!r.logged_in) return;
+        // 后端可能在「探测这一刻」没判到登录（残留标签页/SPA 冷加载），但它
+        // 每次都会用写库后的全量 accounts 回传。以库里的真实 state 为准：
+        // 只要这个号已经被任何一条路径坐实成 online，就收面板重画，别让界面
+        // 停在「扫成功了还显示待登录」（2026-11-18 用户报）。
+        const accNow = (r.accounts || []).find((x) => x.id === S.login.aid);
+        if (!r.logged_in && !(accNow && accNow.state === "online")) return;
+        // 先把后端刚写库的账号状态落进本地，loginDone 里 selectAccount/load
+        // 之前账号条就能立刻显示成「已登录」，不用等下一轮队列轮询。
+        if (r.accounts && S.d) S.d.accounts = r.accounts;
         await loginDone();
       } catch (e) {
         // 不静默吞掉：登录完「没反应」最常见的原因就是这里连着报错却一个字不说。
@@ -1216,15 +1362,21 @@
     S.opts = {}; S.optFor = ""; S.optState = ""; S.optFailAt = 0; S.optSeq++;
     await selectAccount(aid, true);
     const acc = ((S.d && S.d.accounts) || []).find((x) => x.id === aid);
-    toast(acc ? `已登录：${acc.label || acc.name || aid}` : "登录成功，正在重读这个号的选项");
+    toast(acc ? `已登录：${acc.label || acc.name || aid}` : "登录成功，正在重新加载这个号的选项");
     await load();
     // load() 里的 ensureOpts() 已经会读：后端在登录成功那一刻清掉了该号
     // 缓存，所以这一次必然真读一遍并写回新缓存。这里再调一次只会让同一个
     // 号排两个 18 秒的浏览器任务（以前就重复，加缓存后更明显）。
   }
 
-  /** 取消登录。新加的号还停在「待登录」→ 连这个空壳一起删掉，
-   *  别在账号条里留一个永远登不上的号。
+  /** 取消登录。
+   *  只有「本次会话刚 add 出来的空壳号」（fresh=1）还停在 pending 时才删掉它，
+   *  别在账号条里留一个永远登不上的号。**重登/失效兜底一律不删**：那些号本来
+   *  就登录过，重登时状态被清成 pending 只是中间态，删掉等于抹掉用户的真实
+   *  账号（2026-11-18 用户报「重登后没反应，原来的号全没了」）。删不删以
+   *  `L.fresh` 为准，**不再只看 state===pending**——pending 有「新空壳」和
+   *  「重登中间态」两个来源，光看状态必误伤。后端 del_account?fresh=1 还会
+   *  按账号履历再兜一层，双重保险。
    *  quiet=true：跟号走的自动收面板（号已恢复 / 已切走），不用打扰用户。 */
   async function cancelLogin(quiet) {
     const L = S.login;
@@ -1234,11 +1386,12 @@
       S.loginOffered[L.aid] = true;
     }
     const aid = L.aid;
+    const mayDrop = !!L.fresh;   // 先记下来：endLogin 会把 L 置空
     endLogin();
     paintLogin();
     const a = ((S.d && S.d.accounts) || []).find((x) => x.id === aid);
-    if (a && a.state === "pending") {
-      try { await api(`/api/publish/accounts/${aid}`, { method: "DELETE" }); }
+    if (mayDrop && a && a.state === "pending") {
+      try { await api(`/api/publish/accounts/${aid}?fresh=1`, { method: "DELETE" }); }
       catch (e) { /* 删不掉就留着，下次还能重登 */ }
       await load();
     } else if (!quiet) {
@@ -1735,8 +1888,8 @@
     return `<div class="pub-row st-${st[1]}${due ? " due" : ""}" data-job="${esc(j.id)}">
       <div class="pub-rhead">
         <span class="pub-ep">${esc(ep)}</span>
-        <div class="pub-st ${st[1]}">${due ? "该发了"
-          : past ? "已提交"
+        <div class="pub-st ${st[1]}">${due ? "马上发"
+          : past ? "到点了，正在上传"
           : (j.status === "publishing" && j.step) ? `正在上传 · ${esc(j.step)}` : st[0]}</div>
       </div>
       <div class="pub-main">
@@ -1831,7 +1984,7 @@
     if (!drafts) {
       // 空队列时下面已经有一句「队列是空的」，这里别再重复一遍
       box.innerHTML = (S.d.jobs || []).length
-        ? `<div class="hint">都已经安排好了，没有还没安排的。</div>` : "";
+        ? `<div class="hint">没有还没安排的条目了。</div>` : "";
       if (tbox) tbox.innerHTML = "";
       paintStartWarn(null);
       return;
@@ -1942,9 +2095,11 @@
         if (!(body.sets.length || body.files.length)) { toast("先勾几条"); return; }
         const r = await api("/api/publish/add", { method: "POST", body: JSON.stringify(body) });
         const dup = (r.dup || []).length;
-        const rep = (r.repost || []).length;
+        const repost = r.repost || [];
+        const rep = repost.length;
+        const byContent = repost.filter((x) => x.kind === "content").length;
         toast(`加了 ${(r.added || []).length} 条` + (dup ? `，${dup} 条已经在队列里` : "")
-          + (rep ? `；其中 ${rep} 条以前发过，提交前会再提醒一次` : ""));
+          + (rep ? `；其中 ${rep} 条内容重复${byContent ? `（${byContent} 条跟其他条或已发过的内容重复，换了文件名也认得出，可能是整条也可能是其中一段）` : ""}，提交前会再提醒一次` : ""));
         resetCand();
         await load();
         return;
@@ -1955,7 +2110,8 @@
         toast("正在打开视频号助手，稍等一下…");
         const r = await api("/api/publish/accounts", { method: "POST", body: JSON.stringify({}) });
         // 新加的号还没有名字，title 就不猜；后端刚才已经把它弹出来了。
-        await openLogin(r.account.id, {});
+        // fresh=1：这是唯一一个「取消时可删空壳」的入口（2026-11-18）。
+        await openLogin(r.account.id, { fresh: true });
         return;
       }
       if (name === "loginRetry") { await reopenLogin(); return; }
@@ -2102,9 +2258,15 @@
           `发给：【${who}】 · ${n} 条`,
           `首条 ${showTime(S.first)} · 间隔 ${Number(S.gap) || 30} 分钟`,
         ];
-        if (rep.length) body.push(
-          `其中 ${rep.length} 条以前发过或交过平台（${rep.slice(0, 3).map((x) => x.file).join("、")}${rep.length > 3 ? " 等" : ""}）。`
-          + "确认是有意再发一次；不确定就点「再看看」，先去「已提交」里核对。");
+        if (rep.length) {
+          const byContent = rep.filter((x) => x.kind === "content").length;
+          const sameFile = rep.length - byContent;
+          const lines = [];
+          if (sameFile) lines.push(`${sameFile} 条以前发过或交过平台`);
+          if (byContent) lines.push(`${byContent} 条内容跟其他条或已发过的重复（换了文件名也认得出，可能是整条也可能是其中一段）`);
+          body.push(`其中 ${lines.join("，")}：${rep.slice(0, 3).map((x) => x.file + (x.overlap ? `（重合 ${Math.round(x.overlap)} 秒）` : "")).join("、")}${rep.length > 3 ? " 等" : ""}。`,
+            "确认是有意再发一次；不确定就点「再看看」，先去「已提交」里核对。");
+        }
         if (warn) body.push(warn.replace(/^\n+/, "").trim());
         body.push(
           "确认后立刻逐条上传，并按上面的时间在平台定时；发出去就收不回来了。",
@@ -2141,8 +2303,8 @@
         // 原计划时间已过时后端会顺延并回传 moved_to；不说出来，用户会以为
         // 还按原来那个点发（平台也不接受过去的定时）。
         toast(r && r.moved_to
-          ? `已重新排队：原定时间已经过了，改到 ${showTime(r.moved_to)} 发`
-          : "已重新排队，接着上传");
+          ? `已经接着上传：原定时间已经过了，改到 ${showTime(r.moved_to)} 发`
+          : "已加入等待上传，接着传");
         await load();
         return;
       }
@@ -2161,7 +2323,7 @@
           if (r && r.moved_to) moved++;
         }
         toast(ids.length
-          ? `已重新排队 ${ids.length} 条，接着上传`
+          ? `${ids.length} 条已加入等待上传，接着传`
             + (moved ? `（其中 ${moved} 条原定时间已过，已往后顺延）` : "")
           : "这个号没有失败的条目");
         await load();
@@ -2187,7 +2349,7 @@
         const ok = await askConfirm({
           title: "删掉还没安排的条目？",
           body: [
-            "只删「还没安排」的；已经排好、已经发出去的都不动。",
+            "只删「还没安排」的；已定时、已发布的都不动。",
             "删了以后想发，要重新勾一次。",
           ],
           okText: "删掉这些条目",
@@ -2321,8 +2483,48 @@
     if (statBox) {
       statBox.addEventListener("click", (e) => {
         const b = e.target.closest("[data-act]");
+        // 通知面板：点遮罩关闭，点面板内部不关（data-stop）
+        if (b && b.dataset.act === "statNoticeClose"
+          && e.target.closest("[data-stop]") && e.target.closest("[data-stop]") !== b) return;
         if (b) actStat(b.dataset.act, b);
       });
+      // 筛选控件：只改显示状态，不重新采数据、不打浏览器
+      const onStatInput = (e) => {
+        const t = e.target.closest("[data-stat-input]");
+        if (!t) return;
+        const k = t.dataset.statInput;
+        if (k === "incOnly") S.statIncOnly = !!t.checked;
+        else if (k === "filter") S.statFilter = t.value.trim();
+        else if (k === "coll") S.statColl = t.value;
+        else if (k === "sort") S.statSort = t.value;
+        else return;
+        // 搜索框不能整块重画（会丢焦点），只重画作品网格
+        if (k === "filter") {
+          const grid = document.querySelector(".stat-grid");
+          if (grid && S.stat) {
+            const all = S.stat.posts || [];
+            let posts = all.filter((p) => {
+              if (S.statIncOnly && !(p.inc > 0)) return false;
+              if (S.statColl && p.collection !== S.statColl) return false;
+              if (S.statFilter) {
+                const q = S.statFilter.toLowerCase();
+                if (!String(p.title || "").toLowerCase().includes(q)
+                  && !String(p.collection || "").toLowerCase().includes(q)) return false;
+              }
+              return true;
+            });
+            if (S.statSort === "play") posts = [...posts].sort((a, b) => b.play - a.play);
+            else if (S.statSort === "inc") posts = [...posts].sort((a, b) => (b.inc || 0) - (a.inc || 0));
+            else if (S.statSort === "finish") posts = [...posts].sort((a, b) => (b.finish_rate || 0) - (a.finish_rate || 0));
+            grid.innerHTML = posts.length ? posts.map(statCard).join("")
+              : `<div class="pub-empty">没有符合筛选条件的作品。</div>`;
+            return;
+          }
+        }
+        renderStat(false);
+      };
+      statBox.addEventListener("input", onStatInput);
+      statBox.addEventListener("change", onStatInput);
     }
     const diagBox = document.querySelector("#pub-diag");
     if (diagBox) {
@@ -2362,7 +2564,7 @@
       if (del) {
         const aid = del.dataset.accDel;
         const cur = ((S.d && S.d.accounts) || []).find((x) => x.id === aid) || {};
-        if (!confirm(`删掉「${cur.name || "这个号"}」？\n登录状态会一起清掉，之后要重新登录。已经排好的发布计划不受影响。`)) return;
+        if (!confirm(`删掉「${cur.name || "这个号"}」？\n登录状态会一起清掉，之后要重新登录。已定时的发布不受影响。`)) return;
         api(`/api/publish/accounts/${aid}`, { method: "DELETE" })
           .then(() => { toast("已删除"); return load(); })
           .catch((err) => toast(err.message));

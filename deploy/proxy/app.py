@@ -451,7 +451,6 @@ def handle_quota(token: str) -> dict:
 
 
 def handle_chat(token: str, ip: str, body: dict) -> dict:
-    _check_ip_rate(ip)
     if body.get("stream"):
         raise ApiError(400, "不支持流式调用")
     model = body.get("model") or "qwen-plus"
@@ -467,7 +466,12 @@ def handle_chat(token: str, ip: str, body: dict) -> dict:
                             "也可以联系管理员调整等级，或在设置里填自己的 Key 继续用"
                             % (LEVELS[level]["label"], _level_calls(level)))
 
-    _mark_ip(ip)
+    # IP 桶只拦匿名白嫖和异常流量，**内部账号不适用**（2026-11-19 用户要求：
+    # internal 就是「无上限」，同一网络每小时 30 次这条也不该把管理员自己卡住）。
+    # 顺带把检查挪到取账号之后：没登录的请求上一行已经 401，不必再走 IP 桶。
+    if level != "internal":
+        _check_ip_rate(ip)
+        _mark_ip(ip)
     t0 = time.time()
     payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(

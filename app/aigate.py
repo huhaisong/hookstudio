@@ -84,7 +84,7 @@ def issue(user: dict, project_id: str, purpose: str) -> dict:
         raise HTTPException(400, f"未知的用途：{purpose}")
     project_id = (project_id or "").strip()
     if not project_id:
-        raise HTTPException(400, "缺少项目 id")
+        raise HTTPException(400, "没找到当前项目，请重新打开")
     project = core.load(project_id)
     if not project:
         raise HTTPException(404, "项目不存在")

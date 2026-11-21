@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import traceback
 import time
 import uuid
 
@@ -46,10 +47,17 @@ def _writable(d: str) -> bool:
 
 
 def _default_data_dir() -> str:
-    """优先程序目录下的 data（绿色版能整体拷走）；只读安装位置则退回用户目录。"""
+    """优先程序目录下的 data（绿色版能整体拷走）；只读安装位置则退回 D 盘。"""
     local = os.path.join(BASE, "data")
     if _writable(local):
         return local
+    # 不写 C 盘：可用 HOOKSTUDIO_DATA_DIR 覆盖；默认 D 盘固定位置。
+    custom = os.environ.get("HOOKSTUDIO_DATA_DIR")
+    if custom:
+        return custom
+    if os.path.isdir("D:\\"):
+        return os.path.join("D:\\", "HookStudio", "data")
+    # 没有 D 盘的机器才退回用户目录（通用安装包兜底）
     fallback = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(fallback, "HookStudio", "data")
 
@@ -58,6 +66,12 @@ DATA_DIR = os.environ.get("DATA_DIR") or _default_data_dir()
 PROJECTS = os.path.join(DATA_DIR, "projects")
 OUTPUT = os.path.join(DATA_DIR, "output")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+# 上次异常中断、等用户确认要不要续跑的任务表（C 档：不再开机自动跑）。
+RESUME_PENDING = os.path.join(DATA_DIR, "resume_pending.json")
+# 已删项目墓碑：中止只是给 worker 打标记，它收尾时仍可能走到 save() 写回
+# project.json，把刚删的项目又「复活」。save/save_merge 开头认这道闸，直接吞掉写回。
+# pid 是 uuid 前 12 位，碰撞概率可忽略；只留最近 5000 条，文件几百 KB 封顶。
+DELETED_FILE = os.path.join(DATA_DIR, "deleted_pids.json")
 os.makedirs(PROJECTS, exist_ok=True)
 os.makedirs(OUTPUT, exist_ok=True)
 
@@ -209,6 +223,19 @@ DEFAULT_CONFIG = {
     # 「默认就对」比「让用户自己发现再勾一个框」合理。关掉后新转写不转、事后按钮也不转。
     # 必须在这里声明：save_config 只认 DEFAULT_CONFIG 里已有的键（同 publish_auto 那个坑）。
     "zh_t2s": True,
+    # ── 台词整理前先去背景音（2026-11-19）────────────────────────────────
+    # 开 = 转写前用 MDX-Net 人声分离把背景音乐/环境音去掉，再送 Whisper。
+    # 原片背景音重时，Whisper 会把有台词的一段当成「没人说话」整段跳过，
+    # 或者被背景音骗得断句错乱。默认**关**：正常素材没必要多花分离时间，
+    # 且分离模型（models/mdx/Kim_Vocal_2.onnx）缺失时自动跳过、不影响转写。
+    # 短剧切片约 1 分钟/集，分离约 1 分钟且按内容哈希缓存，复跑秒过。
+    # 必须在这里声明：save_config 只认 DEFAULT_CONFIG 里已有的键（同上）。
+    "asr_denoise": False,
+    # ── 一键全自动：记住用户上次的参数（2026-11-21）────────────────────────
+    # 新建项目勾「全自动」或已有项目点「一键全自动」时用。整套配置存成一个字典，
+    # save_config 只认 DEFAULT_CONFIG 里已有的键，所以这里必须声明，否则静默丢掉
+    # （同 device_token / publish_auto 那个坑）。前端改完写到这个键，下次自动回填。
+    "autopipe_cfg": {},
 }
 
 CONCURRENT_MIN = 1
@@ -517,6 +544,126 @@ def rmtree(path: str, chunk: int = 8) -> None:
         pass
 
 
+# ── 已删项目墓碑（配合删项目自动中止任务）───────────────────────────────────
+_DELETED: set[str] = set()
+_DELETED_LOCK = threading.Lock()
+
+
+def _load_deleted() -> None:
+    global _DELETED
+    try:
+        with open(DELETED_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        _DELETED = {str(x) for x in (raw or []) if isinstance(x, str)}
+    except Exception:  # noqa: BLE001
+        _DELETED = set()
+
+
+_load_deleted()
+
+
+def is_deleted(pid: str) -> bool:
+    """这个项目是否已删。write 路径用它挡住迟到写回，读路径不用。"""
+    with _DELETED_LOCK:
+        return str(pid or "") in _DELETED
+
+
+def mark_deleted(pid: str) -> None:
+    """永久记一笔。删项目时先打墓碑，再中止任务、再删目录，顺序不能反。"""
+    key = str(pid or "")
+    if not key:
+        return
+    with _DELETED_LOCK:
+        _DELETED.add(key)
+        keep = sorted(_DELETED)[-5000:]
+        _DELETED.clear()
+        _DELETED.update(keep)
+        try:
+            tmp = DELETED_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(keep, f)
+            os.replace(tmp, DELETED_FILE)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def purge_project_files(pid: str, p: dict | None = None) -> dict:
+    """删项目时同步清掉「按 pid 隔离」的磁盘数据，返回清过哪些（给接口回话用）。
+
+    铁律：只认精确 pid 目录，绝不按内容/通配去删共享缓存。voice_cache 是按
+    音频内容哈希跨项目共享的，bgm_cache / models / app.db 是全局的，删了会拖累
+    别的项目。成片 mp4 按视频名存、不带 pid，无法可靠归属，一律不动。
+    """
+    res: dict = {"project": False, "render_tmp": [], "stage": False,
+                 "resume": False, "log_backups": []}
+    # pid 来自 URL，先挡住路径穿越（`..` 拼进 os.path.join 会删到别的目录）
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(pid or "")):
+        return res
+    p = p if isinstance(p, dict) else {}
+
+    d = os.path.join(PROJECTS, pid)
+    res["project"] = os.path.isdir(d)
+    rmtree(d)
+
+    # 渲染分段临时坐在「出片盘」上，不在项目目录里。同一项目可能换过几次
+    # 保存目录，所以把项目记下的 / 全局配置的 / 默认输出盘 / logs 散落样本
+    # 都扫一遍，只删各自的 _render_tmp/<pid> 精确子目录。
+    roots: list[str] = []
+    for r in ((p.get("batch") or {}).get("save_dir"), output_dir(),
+              os.path.join(DATA_DIR, "output"), os.path.join(BASE, "logs")):
+        s = str(r or "").strip()
+        if not s:
+            continue
+        s = os.path.abspath(os.path.expanduser(s))
+        if s not in roots and os.path.isdir(s):
+            roots.append(s)
+    for r in roots:
+        t = os.path.join(r, "_render_tmp", pid)
+        if os.path.isdir(t):
+            rmtree(t)
+            res["render_tmp"].append(t)
+    t = os.path.join(DATA_DIR, "_render_tmp", pid)
+    if os.path.isdir(t):
+        rmtree(t)
+        res["render_tmp"].append(t)
+
+    # 受保护盘走中转：整个 _render_stage/<pid> 都是这一个项目的
+    stg = os.path.join(DATA_DIR, "_render_stage", pid)
+    if os.path.isdir(stg):
+        rmtree(stg)
+        res["stage"] = True
+
+    # 待确认续跑：以 pid 为 key 的全局表，不删的话前端还会列出「续跑」
+    if pid in load_resume_pending():
+        drop_resume_pending(pid)
+        res["resume"] = True
+
+    # 排障备份快照：文件名里带精确 pid，按前缀认，不碰别的项目的备份
+    logs = os.path.join(BASE, "logs")
+    prefixes = (f"backup_project_{pid}_", f"pool_backup_{pid}_",
+                f"project_{pid}_before_")
+    if os.path.isdir(logs):
+        for fn in os.listdir(logs):
+            if fn.endswith(".json") and fn.startswith(prefixes):
+                try:
+                    os.remove(os.path.join(logs, fn))
+                    res["log_backups"].append(fn)
+                except OSError:
+                    pass
+        for sub in os.listdir(logs):
+            pdir = os.path.join(logs, sub, "proj")
+            if not os.path.isdir(pdir):
+                continue
+            for fn in os.listdir(pdir):
+                if fn.startswith(pid + ".") and fn.endswith(".json"):
+                    try:
+                        os.remove(os.path.join(pdir, fn))
+                        res["log_backups"].append(fn)
+                    except OSError:
+                        pass
+    return res
+
+
 def check_space(path: str, need_mb: float, what: str = "这一集") -> None:
     """空间预检：不够就直接给人话错误，不要把 ffmpeg 的 ENOSPC 甩给用户。"""
     free = free_gb(path)
@@ -550,9 +697,15 @@ _TASK_LOCK = threading.Lock()
 # 第 2 步的产物，那种情况在接口层拦（main._nosub_busy_conflict）。
 _TASK_GROUP = {
     "transcribe": "cuts", "analyze": "cuts", "plan": "cuts",
+    # 追加结构（往现有结构加套，2026-11-21）：只读前两步已定好的台词、写 plans 尾部，
+    # 不 bump gen、不碰 batch 运行时字段（见 batch.ai_plan_multi），可与出片并行。
+    "planadd": "planadd",
     "batch": "cuts", "render": "cuts", "hookcut": "cuts",
     # 校正字幕时间也要用 whisper 模型，跟转写同一组排队，免得两个推理撞在一起
     "retime": "cuts",
+    "analyze_direct": "cuts",  # 选视频直接出片：识别字幕+对时，与转写/出片同组排队
+    "addvideos": "cuts",      # 追加视频后的一键任务（转写+校对+抹字幕），与转写互斥
+    "autopipe": "cuts",       # 一键全自动（转写→抹字幕→生成N套→出片），与转写/出片互斥
     "nosub": "nosub",         # 独立组：与第 3 步可并行
     "shots": "shots",
 }
@@ -673,6 +826,8 @@ def load(pid: str) -> dict | None:
 
 
 def save(p: dict) -> None:
+    if is_deleted(p.get("id")):
+        return   # 已删项目的迟到写回：吞掉，绝不能把项目又建回来
     with _LOCK:
         d = os.path.join(PROJECTS, p["id"])
         os.makedirs(d, exist_ok=True)
@@ -691,8 +846,10 @@ def save_merge(p: dict, keys) -> None:
     改成「重读最新 → 只覆盖自己拥有的一组字段」后，各条产线各写各的，互不擦除。
     写入仍是原子替换，且与 save() 共用 _LOCK，不会写出半份文件。
     """
+    pid = p["id"]
+    if is_deleted(pid):
+        return   # 同上：并行产线的迟到写回也不能复活已删项目
     with _LOCK:
-        pid = p["id"]
         d = os.path.join(PROJECTS, pid)
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "project.json")
@@ -746,6 +903,9 @@ def list_projects() -> list[dict]:
         p = load(pid)
         if not p:
             continue
+        # 选视频直接出片的临时项目只在它自己的面板里管，不混进正常项目列表
+        if p.get("direct"):
+            continue
         rows.append({
             "id": p["id"], "name": p["name"], "stage": p.get("stage"),
             "mode": p.get("mode") or "funnel",
@@ -790,8 +950,40 @@ def clear_task_flag(pid: str) -> None:
         pass
 
 
+# ── 待确认续跑表（C 档：异常中断只登记、不自动跑，等用户点头）──────────────
+def load_resume_pending() -> dict:
+    """读「上次没做完、等用户确认」的任务表。损坏就当空，绝不影响启动。"""
+    try:
+        with open(RESUME_PENDING, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def save_resume_pending(d: dict) -> None:
+    try:
+        tmp = RESUME_PENDING + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, RESUME_PENDING)
+    except OSError:
+        pass
+
+
+def set_resume_pending(pid: str, info: dict) -> None:
+    d = load_resume_pending()
+    d[pid] = info
+    save_resume_pending(d)
+
+
+def drop_resume_pending(pid: str) -> None:
+    d = load_resume_pending()
+    if d.pop(pid, None) is not None:
+        save_resume_pending(d)
+
+
 def set_task(pid: str, kind: str | None, pct: float = 0.0, msg: str = "", error: str = "",
-             ignore_cancel: bool = False) -> None:
+             ignore_cancel: bool = False, extra: dict | None = None) -> None:
     """任务进度只放内存；但「正在跑哪一步」落盘成 task.json，重启后能识别中断并续跑。
 
     并发改造（2026-11-08）：进度按组（cuts / shots）各存一份。
@@ -824,11 +1016,17 @@ def set_task(pid: str, kind: str | None, pct: float = 0.0, msg: str = "", error:
         # 同一步骤连续更新时保留起始时刻，前端据此显示「已用 X 秒」，进度按批跳也能看出在动
         prev = slots.get(group) or {}
         started = prev.get("started") if prev.get("kind") == kind else time.time()
-        slots[group] = {
+        slot = {
             "kind": kind, "pct": round(pct, 1), "msg": msg, "error": error,
             "at": time.time(), "started": started,
             "elapsed": round(time.time() - started, 1),
         }
+        # 进度之外的附加状态（2026-11-21 出片队列）：出片进度列表要区分
+        # 「排队中 / 正在出 / 已出片」，光凭一句 msg 只有一套。给了就带上、
+        # 给空就清掉，别让上一趟的队列表残留到下一次。
+        if extra:
+            slot["data"] = extra
+        slots[group] = slot
         if group == "cuts":
             # shots 不参与重启续跑（启动钩子只恢复转写/分析/渲染/出片），
             # 所以 task.json 只写 cuts，避免把 shots 的中断标记也塞进去。
@@ -862,6 +1060,13 @@ def get_task(pid: str, group: str = "cuts") -> dict | None:
     if group == "cuts":
         flag = task_flag(pid)
         if flag:
+            # 幽灵标记兜底（2026-11-18）：标记在、但这一组根本没在跑，说明是上次
+            # 异常/中断没清干净的残留（或续跑已结束却没抹掉）。此时不能报「正在
+            # 自动续跑」——那会把「开始出片」永久锁死。直接清标记、当作没任务。
+            # 真在跑的任务 _RUNNING 一定已登记（start_task 先登记再写标记），不会误伤。
+            if not task_running(pid, group):
+                clear_task_flag(pid)
+                return None
             return {"kind": flag, "pct": 0, "msg": "上次中断，正在自动续跑…", "error": "",
                     "at": 0, "elapsed": 0.0}
     return None
@@ -943,8 +1148,26 @@ def start_task(pid: str, kind: str, fn) -> bool:
             # 否则下次启动会把这个被中止的任务又拉起来。
             set_task(pid, None)
         except Exception as exc:  # noqa: BLE001
+            # 用户只看到 _friendly_error 的一句人话，但管理员排障必须能拿到堆栈：
+            # 2026-11-19 那次 _spans 解包错，异常被翻译后服务日志里一点痕迹都没有，
+            # 只能临时改代码才抓到。这里原样打到 stderr（服务日志），不改用户文案。
+            print(f"[task:{kind}] 失败，完整堆栈：\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
             set_task(pid, kind, 0, "失败", _friendly_error(exc))
+            # 异常失败的任务同样要抹掉 task.json 的「中断续跑」标记：失败的批次
+            # 不该在重启后被自动重新拉起、更不该让界面卡在「正在出片 0%」。
+            # set_task 带 error 不会写标记，但任务开头 start_task 登记的 0% 已经写过，
+            # 这里必须显式清一次（2026-11-18）。
+            if group == "cuts":
+                clear_task_flag(pid)
         finally:
+            # 任务真正退出的最后一道闸：无条件清 cuts 的 task.json 标记。
+            # 为什么放这里：校对/并行子线程也会 set_task("transcribe",...) 写标记，
+            # 可能在中止清标记之后又写回（幽灵写入）。runner 的 finally 是主线程
+            # 收尾的必经之路，在这里再清一次，保证「任务已退出 ⇒ 标记必不在」。
+            # 只清本任务那一组，不动另一条产线（cuts 才写 task.json）。
+            if group == "cuts" and pid:
+                clear_task_flag(pid)
             # _RUNNING 与 _CANCEL 必须同时清掉：以前分两把锁先后 pop，中间
             # 有一个「_RUNNING 还在、_CANCEL 已没」的窗口，cancel_task 读到
             # 这个窗口会拿到 found 非空但 ev=None，从而跳过 ev.set()，中止

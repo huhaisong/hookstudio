@@ -26,7 +26,7 @@ import time
 
 from . import core
 
-VERSION = "0.1.4"
+VERSION = "0.1.27"
 
 # 参与指纹的目录（相对 core.BASE）。web 是前端资源，app 是后端代码，
 # prompts 是提示词——提示词改一个字，AI 的输出结构就可能变，前端要重新拉一次。

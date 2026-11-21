@@ -1,7 +1,7 @@
 {
-  "version": 1,
-  "note": "内置曲库。audio/ 里的音频是程序合成的占位氛围音，不含任何第三方录音、无版权负担，仅用于跑通链路；正式商用请把它们替换为你已获授权的音乐，并同步维护每首的 mood / tags。程序只按情绪标签匹配：模型不写歌名，也不提供下载地址。",
-  "allow_hosts": [],
+  "version": 2,
+  "note": "内置曲库。程序只按情绪标签匹配选曲：模型不写歌名，也不提供下载地址。mood 取 tense/emotional/upbeat/neutral，tags 越多越容易被挑中；带 url 的曲目在本地缺文件时会按 allow_hosts 白名单重下，也可以直接把音频丢进 audio/ 或 data/bgm/。",
+  "allow_hosts": ["incompetech.com"],
   "tracks": [
     {
       "id": "tense_01",
@@ -10,8 +10,49 @@
       "tags": ["紧张", "悬疑", "弦乐", "鼓点", "冲突", "压迫", "反转", "低音", "对峙", "危机"],
       "file": "audio/tense_01.m4a",
       "url": "",
-      "license": "程序合成·无第三方版权",
-      "source": "ffmpeg 合成（占位示例）"
+      "license": "程序合成",
+      "placeholder": true,
+      "source": "ffmpeg 合成"
+    },
+    {
+      "id": "cc_tense_investigations",
+      "name": "Investigations",
+      "mood": "tense",
+      "tags": ["紧张", "悬疑", "推理", "排查", "低音", "推进", "压迫", "反转", "冷", "对峙"],
+      "file": "audio/cc_tense_investigations.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Investigations.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
+    },
+    {
+      "id": "cc_tense_interloper",
+      "name": "Interloper",
+      "mood": "tense",
+      "tags": ["紧张", "潜入", "压迫", "弦乐", "危机", "阴谋", "沉重", "急促", "暗黑", "冲突"],
+      "file": "audio/cc_tense_interloper.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Interloper.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
+    },
+    {
+      "id": "cc_tense_anxiety",
+      "name": "Anxiety",
+      "mood": "tense",
+      "tags": ["焦虑", "不安", "急促", "悬疑", "紧绷", "心跳", "紧张", "惊悚", "低音", "爆点"],
+      "file": "audio/cc_tense_anxiety.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Anxiety.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
+    },
+    {
+      "id": "cc_tense_sovereign",
+      "name": "Sovereign",
+      "mood": "tense",
+      "tags": ["史诗", "威压", "对峙", "低沉", "权力", "压迫", "紧张", "厚重", "冲突", "暗黑"],
+      "file": "audio/cc_tense_sovereign.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Sovereign.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
     },
     {
       "id": "emotional_01",
@@ -20,8 +61,29 @@
       "tags": ["抒情", "钢琴", "压抑", "伤感", "落泪", "渐强", "亲情", "温柔", "治愈", "独白"],
       "file": "audio/emotional_01.m4a",
       "url": "",
-      "license": "程序合成·无第三方版权",
-      "source": "ffmpeg 合成（占位示例）"
+      "license": "程序合成",
+      "placeholder": true,
+      "source": "ffmpeg 合成"
+    },
+    {
+      "id": "cc_emotional_heartbreaking",
+      "name": "Heartbreaking",
+      "mood": "emotional",
+      "tags": ["悲伤", "虐心", "落泪", "钢琴", "抒情", "压抑", "心碎", "独白", "伤感", "渐强"],
+      "file": "audio/cc_emotional_heartbreaking.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Heartbreaking.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
+    },
+    {
+      "id": "cc_emotional_revival",
+      "name": "Revival",
+      "mood": "emotional",
+      "tags": ["渐强", "希望", "感动", "抒情", "励志", "成长", "温柔", "治愈", "亲情", "反转"],
+      "file": "audio/cc_emotional_revival.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Revival.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
     },
     {
       "id": "upbeat_01",
@@ -30,8 +92,39 @@
       "tags": ["轻快", "明快", "欢快", "节奏感", "律动", "活泼", "轻松", "喜剧", "热血", "甜"],
       "file": "audio/upbeat_01.m4a",
       "url": "",
-      "license": "程序合成·无第三方版权",
-      "source": "ffmpeg 合成（占位示例）"
+      "license": "程序合成",
+      "placeholder": true,
+      "source": "ffmpeg 合成"
+    },
+    {
+      "id": "cc_upbeat_carefree",
+      "name": "Carefree",
+      "mood": "upbeat",
+      "tags": ["轻快", "明亮", "欢快", "喜剧", "轻松", "甜", "日常", "活泼", "跳跃", "阳光"],
+      "file": "audio/cc_upbeat_carefree.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Carefree.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
+    },
+    {
+      "id": "cc_upbeat_acidjazz",
+      "name": "AcidJazz",
+      "mood": "upbeat",
+      "tags": ["爵士", "轻快", "律动", "日常", "轻松", "节奏感", "现代", "都市", "跳跃", "爽"],
+      "file": "audio/cc_upbeat_acidjazz.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/AcidJazz.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
+    },
+    {
+      "id": "cc_upbeat_funkorama",
+      "name": "Funkorama",
+      "mood": "upbeat",
+      "tags": ["放克", "节奏", "活力", "爽", "热血", "动感", "轻快", "高能", "律动", "喜剧"],
+      "file": "audio/cc_upbeat_funkorama.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Funkorama.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
     },
     {
       "id": "neutral_01",
@@ -40,8 +133,39 @@
       "tags": ["铺底", "安静", "氛围", "平缓", "低调", "叙事", "日常", "过渡", "留白", "清淡"],
       "file": "audio/neutral_01.m4a",
       "url": "",
-      "license": "程序合成·无第三方版权",
-      "source": "ffmpeg 合成（占位示例）"
+      "license": "程序合成",
+      "placeholder": true,
+      "source": "ffmpeg 合成"
+    },
+    {
+      "id": "cc_neutral_wallpaper",
+      "name": "Wallpaper",
+      "mood": "neutral",
+      "tags": ["铺底", "安静", "氛围", "日常", "清淡", "过渡", "平缓", "低调", "叙事", "中性"],
+      "file": "audio/cc_neutral_wallpaper.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Wallpaper.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
+    },
+    {
+      "id": "cc_neutral_pamgaea",
+      "name": "Pamgaea",
+      "mood": "neutral",
+      "tags": ["铺底", "史诗", "叙事", "辽阔", "氛围", "平缓", "宏大", "旅行", "过渡", "低调"],
+      "file": "audio/cc_neutral_pamgaea.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Pamgaea.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
+    },
+    {
+      "id": "cc_neutral_aquarium",
+      "name": "Aquarium",
+      "mood": "neutral",
+      "tags": ["梦幻", "清淡", "氛围", "过渡", "安静", "铺底", "空灵", "回忆", "柔和", "留白"],
+      "file": "audio/cc_neutral_aquarium.mp3",
+      "url": "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Aquarium.mp3",
+      "license": "CC-BY（Kevin MacLeod / incompetech.com）",
+      "source": "incompetech.com 免版权曲库"
     }
   ]
 }

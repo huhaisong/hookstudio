@@ -826,15 +826,15 @@ def set_schedule(page, form, at: datetime.datetime) -> dict:
         if diff <= 0:
             break
         if not _mouse_click(page, form, SEL["cal_right"]):
-            raise PostError("翻不到下一个月（平台可能限制了这个排期范围）。")
+            raise PostError("翻不到下一个月（平台可能限制了这个定时范围）。")
         page.wait_for_timeout(500)
     else:
-        raise PostError("排期时间太远，日历翻不过去。")
+        raise PostError("定时时间太远，日历翻不过去。")
 
     # ④ 点日期
     if not _pick_cell(page, form, SEL["cal_table"], str(at.day)):
         raise PostError(
-            f"日历里选不了 {at.month} 月 {at.day} 号 —— 多半超出了平台允许的排期范围，"
+            f"日历里选不了 {at.month} 月 {at.day} 号 —— 多半超出了平台允许的定时范围，"
             "换个近一点的时间试试。")
     page.wait_for_timeout(600)
 
@@ -896,13 +896,13 @@ def set_schedule(page, form, at: datetime.datetime) -> dict:
         got = st.get("time")
         got_s = time.strftime("%Y-%m-%d %H:%M", time.localtime(got / 1000)) if got else "空"
         raise PostError(f"发表时间没有真正设上（组件里还是「{got_s}」），"
-                        f"跟排期「{at.strftime('%Y-%m-%d %H:%M')}」对不上，已停手。")
+                        f"跟定时「{at.strftime('%Y-%m-%d %H:%M')}」对不上，已停手。")
 
     # ⑦ 读回逐字核对；对不上绝不能让 worker 往下点发表
     want = at.strftime("%Y-%m-%d %H:%M")
     got = _read_text(form, SEL["schedule_at"]).strip()
     if got != want:
-        raise PostError(f"发表时间设成了「{got or '空'}」，跟排期「{want}」对不上，已停手。")
+        raise PostError(f"发表时间设成了「{got or '空'}」，跟定时「{want}」对不上，已停手。")
     # 收起弹层，免得挡住后面的「发表」按钮
     _ev(form, "() => { const e = document.querySelector('.input-editor'); if (e) e.focus(); }")
     return {"scheduled_at": got}
@@ -1240,7 +1240,7 @@ def publish_one(session, job: dict, tpl: dict, media: dict,
         raise PostError("这条没有标题，先给它起一个标题。")
     plan_at = publisher_parse(job.get("plan_at"))
     if not plan_at:
-        raise PostError("这条没有排期时间。")
+        raise PostError("这条没有定时时间。")
 
     def _say(label):
         if progress:

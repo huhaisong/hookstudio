@@ -35,7 +35,11 @@ WIN = 6.0        # 每句在当前时间码前后各看多少秒来找词
 SNAP = 0.60      # 词级起点离原字幕出现时刻多近才吸附
 MIN_COV = 0.50   # 词流覆盖该句多少字才认这个对齐
 MIN_DUR = 0.28
-VERSION = 1      # 对齐算法版本，改判据时 bump，老缓存作废
+VERSION = 3      # 对齐算法/词流参数版本，改判据或词流参数时 bump，老缓存作废
+                 # v2（2026-11-19）：词流参数与主转写同步（no_speech_threshold=0.9），
+                 # 且词流可走人声分离；缓存键加 denoise 标记区分两份词流。
+                 # v3（2026-11-19 晚）：**关掉 VAD**——它会把整段带背景音的人声丢掉，
+                 # 词流因此缺字，句子对不上只能原样保留（第 7 集实测漏 25.8 秒台词）。
 
 
 def words_dir(pid: str) -> str:
@@ -47,12 +51,14 @@ def _cache_path(pid: str, ep: dict) -> str:
 
 
 def words_of(pid: str, ep: dict) -> list[tuple[str, float, float]]:
-    """这一集的词级时间（带缓存）。换模型或换算法版本时缓存自动作废。"""
+    """这一集的词级时间（带缓存）。换模型/算法版本/降噪开关时缓存自动作废。"""
+    denoise = bool(core.load_config().get("asr_denoise"))
     path = _cache_path(pid, ep)
     if os.path.isfile(path):
         try:
             raw = json.load(open(path, encoding="utf-8"))
-            if raw.get("v") == VERSION and raw.get("tier") == core.whisper_tier():
+            if (raw.get("v") == VERSION and raw.get("tier") == core.whisper_tier()
+                    and raw.get("denoise") == denoise):
                 return [tuple(x) for x in raw["words"]]
         except (OSError, ValueError, KeyError):
             pass
@@ -60,21 +66,33 @@ def words_of(pid: str, ep: dict) -> list[tuple[str, float, float]]:
     src = os.path.join(p.get("src_dir") or "", ep.get("file") or "")
     if not os.path.isfile(src):
         raise RuntimeError(f"找不到素材文件：{ep.get('file')}")
-    audio = transcribe._decode(src)
+    # 与台词转写走同一份音频：开了人声分离就先分离再解码，否则背景音下词流缺失、
+    # 台词对不上词、时间码就飘（2026-11-19 与主转写同步的第二个缺口）。
+    audio = transcribe._decode(transcribe._denoise_audio(src))
     model = transcribe._model()
     out: list[tuple[str, float, float]] = []
     with transcribe._INFER_LOCK:
         segs, _ = model.transcribe(
             audio, language="zh", beam_size=5,
-            vad_parameters={"min_silence_duration_ms": 400},
+            # 与主转写同步：**关掉 VAD**。VAD 会把整段带背景音的人声当静音丢掉，
+            # 词流缺了这些字，对应句子的覆盖率不够就只能原样保留时间码——
+            # 表现为「这一集有几段字幕明明在动，台词时间却没被校正」。
+            vad_filter=False,
             word_timestamps=True, condition_on_previous_text=False,
+            # no_speech_threshold 提到 0.9（默认 0.6 时背景音让 no_speech_prob
+            # 轻易超标，整段有台词的词流被当静音跳过）。
+            no_speech_threshold=0.9,
         )
         for seg in segs:
+            # 词级推理的 segments 是惰性生成器，整集推理就在迭代里发生。
+            # 每拿到一段查一次中止（B 档 2026-11-19），别让用户点中止后干等整集。
+            core.check_cancel()
             for w in (seg.words or []):
                 out.append((w.word, float(w.start), float(w.end)))
     os.makedirs(words_dir(pid), exist_ok=True)
     try:
-        json.dump({"v": VERSION, "tier": core.whisper_tier(), "words": out},
+        json.dump({"v": VERSION, "tier": core.whisper_tier(), "denoise": denoise,
+                   "words": out},
                   open(path, "w", encoding="utf-8"), ensure_ascii=False)
     except OSError:
         pass
@@ -275,10 +293,14 @@ def run(pid: str, force: bool = False) -> None:
         on_msg=lambda i, n, ep: core.set_task(
             pid, "retime", i / max(1, n) * 100,
             f"正在校正第 {ep['index']} 集（{i + 1}/{n}）"))
+    # 对时之后按「原片字幕的一屏」切行（见 app/span_split.py）。
+    from . import span_split
+    sst = span_split.apply_to(p, by)
     core.save_merge(p, ["episodes"])
     core.set_task(pid, None)
     print(f"[retime] 完成 {stat['fixed'] + stat['skipped']}/{stat['total']} 集"
           f"（重算 {stat['fixed']}、已对过 {stat['skipped']}）"
+          f"，按字幕屏切行 {sst['cut']} 行 → 多 {sst['added']} 行"
           + (f"，{stat['miss']} 集没有字幕位置未处理" if stat["miss"] else ""),
           flush=True)
 

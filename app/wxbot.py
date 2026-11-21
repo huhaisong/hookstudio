@@ -298,6 +298,40 @@ class Session:
             return False
         return "channels.weixin.qq.com" in u and "/login" not in u
 
+    @staticmethod
+    def _qr_frame(page):
+        for f in page.frames:
+            if "qrconnect" in (f.url or ""):
+                return f
+        return None
+
+    def _is_logged_in(self, page) -> bool:
+        """**登录态判定的唯一可靠判据**（2026-11-16 收敛）。
+
+        三条子判据，按可靠度从高到低：
+          ① 二维码框（qrconnect）挂出来 = 铁证「没登录」。被平台踢下线后登录墙
+            是 SPA 自己跳的，地址栏常常还没变（仍停在 /platform、不含 /login），
+            残留 DOM 也还在——光看地址栏/DOM 会把「没登录」误判成「已登录」。
+            所以二维码框优先于一切，一出现就判「没登录」。
+          ② 地址栏不在 channels.weixin.qq.com 或进了 /login = 「没登录」。
+          ③ 地址栏判「在线」了，还要看 DOM 有没有后台标记元素。
+
+        关键（2026-11-16 用户报「大海2 明明登录了却要重新登录」）：③不能当成
+        「必须为 true」的硬门槛。视频号后台页是 SPA，hard 导航后 1.5 秒内冷加载
+        还没渲染出 .finder-nickname 等元素，此时 DOM 判「没登录」是**暂时的假象**，
+        不代表真没登录。所以 DOM 只在「地址栏判不出（域名/路由改版）」时才作为
+        补充，地址栏明确在线时不能被 DOM 的暂时空态推翻。
+        """
+        if self._qr_frame(page) is not None:
+            return False
+        if not self._logged_in(page):
+            # 地址栏判「没登录」时，DOM 作补充：域名/路由改版时地址栏可能不认，
+            # 但后台标记元素还在，说明其实在线。
+            return self._dom_logged_in(page)
+        # 地址栏明确在线（channels 且不含 /login），这就够了。SPA 冷加载中
+        # DOM 元素暂时没渲染出来是正常现象，不能据此判「没登录」。
+        return True
+
     def _pick_page(self):
         """挑一个「已经进了后台」的标签页。
 
@@ -313,19 +347,12 @@ class Session:
                         continue
                 except Exception:  # noqa: BLE001
                     continue
-                if self._logged_in(p):
+                if self._is_logged_in(p):
                     self._page = p
                     return p
         except Exception:  # noqa: BLE001
             pass
         return page
-
-    @staticmethod
-    def _qr_frame(page):
-        for f in page.frames:
-            if "qrconnect" in (f.url or ""):
-                return f
-        return None
 
     # ── 对外：扫码 ───────────────────────────────────────────────────────
     def _logout(self) -> None:
@@ -346,12 +373,18 @@ class Session:
         except Exception:  # noqa: BLE001  没有这个页面也不影响，cookie 已经清了
             pass
 
-    def open_login(self, force: bool = False) -> dict:
+    def open_login(self, force: bool = False, reopen: bool = False) -> dict:
         """把这个号的登录页在**可见浏览器窗口**里弹出来（2026-11-14 用户定：
         登录一律直接弹窗口手动做，界面里不再显示二维码）。
         平台自己的登录页自带快捷登录卡、自动换码、过期刷新，用户对着真窗口
         操作最直接；登没登上由前端轮询 login-state 判断，这个方法只负责开窗口。
         force=True（重登）＝先把旧登录态清掉再开登录页，保证换一个微信登录。
+        reopen=True（再开一次窗口）＝用户说上一个窗口已经没了，**不信任任何
+        残留状态**，先把浏览器整个关掉再起一个可见窗口。为什么不能复用 force
+        或 `_open()` 的现有逻辑：Windows 上用户关掉窗口后 Chrome 进程常常还
+        残留着（`about:blank` 空白标签），`_open()` 一看「还有活着的标签页」
+        就复用它、不重新 launch，`page.goto` 在没了窗口的后台页上静默执行，
+        屏幕上一个窗口都不弹——用户点「再开一次」就是没反应（2026-11-16 实测）。
 
         换可见模式必须**在账号线程里**做：这个方法是 API 线程直接调进来的，原来
         在外面跨线程 `_shutdown_browser()`，而 sync Playwright 不是线程安全的
@@ -361,9 +394,16 @@ class Session:
         不会再被当场拆浏览器。
         """
         def _go(_s):
+            if reopen:
+                # 重开窗口：直接丢弃旧实例，别让 `_open()` 去复用残留的空白页。
+                self._visible = True
+                self._shutdown_browser()
+                time.sleep(0.35)
             self.ensure_mode(True)
             page = self._pick_page()
-            if self._logged_in(page) and not force:
+            # 判「已经登录」统一走可靠判据（2026-11-16）：二维码框是登录墙铁证，
+            # 残留旧标签页会被 _is_logged_in 一起识破，不再光看地址栏。
+            if self._is_logged_in(page) and not force:
                 return {"logged_in": True}
             if force and self._logged_in(page):
                 # 用户明确要换一个微信重新登录：先登出，别让快捷登录卡
@@ -380,9 +420,10 @@ class Session:
                 # 用户可能正登着。
                 try:
                     page.goto(PLATFORM, wait_until="domcontentloaded", timeout=45000)
+                    self._settle(page)
                 except Exception:  # noqa: BLE001  导航失败不致命，窗口反正已经开了
                     pass
-            return {"logged_in": bool(self._logged_in(page))}
+            return {"logged_in": bool(self._is_logged_in(page))}
         return self.call(_go, timeout=150)
 
     # ── 对外：查登录状态 / 取昵称头像 ─────────────────────────────────────
@@ -425,41 +466,68 @@ class Session:
             pass
         return info
 
+    def _settle(self, page) -> None:
+        """导航后等登录墙跳转尘埃落定，再判。
+
+        为什么不能只等 1.5 秒：被平台踢下线后，导航到 /platform 会先停在
+        /platform（登录墙的跳转脚本还没跑），约 1 秒后才跳到 /login.html。这段
+        「空窗期」里地址栏还是 /platform、不含 /login，光看地址栏会把「没登录」
+        误判成「在线」（2026-11-16 狼王华少反复开/关登录窗就是它）。
+        等一个足够长的固定时长，让跳转必然发生：真在线就停在 /platform，真没
+        登录就落到 login.html/二维码框。判定本身仍交给 `_is_logged_in`。
+        """
+        try:
+            page.wait_for_timeout(2500)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _state(self, hard: bool = False) -> dict:
+        """查登录态，统一走 `_is_logged_in` 一条判据（2026-11-16 收敛）。
+
+        轻量（hard=False）：挑一个「看着在线」的标签页，直接判。
+        硬查（hard=True）：对「看着像登录」的旧标签页做一次真导航再判——
+        残留标签页会把死会话误报成在线（2026-11-14 实测），cookie 活着就停在
+        后台页、死了会被弹回登录墙，导航一次才算数。
+
+        一条硬规则：**登录确认进行中绝不导航**（地址在 oauth 回调、或码框还挂着
+        = 用户手机刚点了确认）——这时 goto 会让这次登录当场作废。所以看到这两样
+        时，无论 hard 与否都直接按当前状态返回，交给下一轮轮询出结论。
+        """
         page = self._pick_page()
-        if not self._logged_in(page):
-            # 别每次都重新导航：没登录时页面本来就停在登录页，重新取二维码由前端触发。
-            # **绝不在登录页上 goto/reload** —— 用户可能刚扫完、正要在手机上点确认，
-            # 这时导航会让这次登录当场作废（手机显示成功、这边永远转圈）。
-            try:
-                if "channels.weixin.qq.com" not in (page.url or ""):
-                    page.goto(PLATFORM, wait_until="domcontentloaded", timeout=45000)
-                    page.wait_for_timeout(1500)
-            except Exception:  # noqa: BLE001
-                pass
-            # 导航过了就**再看一次**。拿导航之前的旧答案当结论 = 界面永远差一拍，
-            # 用户看到的正是「扫完码没反应」。
-            if not self._logged_in(page) and not self._dom_logged_in(page):
-                return {"logged_in": False}
-        elif hard:
-            # 看着像登录 ≠ 真登录（2026-11-14 实测）：会话早被平台踢了，但残留的
-            # 旧标签页还停在上一回渲染好的后台页上——地址栏和 DOM 都在骗人，
-            # 账号卡一直亮「已登录」，实际每个读取都撞登录墙，扫码轮询还会把
-            # 刚摆出来的码误判成「已登录」直接关掉。真导航一次才算数：cookie
-            # 活着就停在后台页，死了会被弹回登录墙。
-            # **登录确认进行中绝不能导航**（地址在 oauth 回调、或码框还挂着 =
-            # 用户手机刚点了确认）：这时 goto 会让这次登录当场作废。放行，
-            # 交给下一轮轮询出结论。
-            mid = "/oauth" in (page.url or "") or self._qr_frame(page) is not None
-            if not mid:
-                try:
-                    page.goto(PLATFORM, wait_until="domcontentloaded", timeout=45000)
-                    page.wait_for_timeout(1500)
-                except Exception:  # noqa: BLE001
-                    pass
-                if not self._logged_in(page) and not self._dom_logged_in(page):
-                    return {"logged_in": False}
-        return self._profile(page)
+        if self._is_logged_in(page):
+            # 看着在线。硬查的话再导航验证一次（防残留标签页骗人），
+            # 但登录确认进行中不能动。
+            if hard:
+                mid = "/oauth" in (page.url or "") or self._qr_frame(page) is not None
+                if not mid:
+                    try:
+                        page.goto(PLATFORM, wait_until="domcontentloaded", timeout=45000)
+                        self._settle(page)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if not self._is_logged_in(page):
+                        return {"logged_in": False}
+            return self._profile(page)
+        # 看着没登录。页面可能停在登录页（二维码由前端触发取），也可能停在
+        # 别的网址（刚重启/空白页）。后者导航到平台首页再判一次，拿导航后的
+        # 真实结论——但登录页上绝不 goto/reload（用户可能刚扫完正要点确认）。
+        try:
+            if "channels.weixin.qq.com" not in (page.url or ""):
+                page.goto(PLATFORM, wait_until="domcontentloaded", timeout=45000)
+                self._settle(page)
+        except Exception:  # noqa: BLE001
+            pass
+        if self._is_logged_in(page):
+            return self._profile(page)
+        return {"logged_in": False}
+
+    def is_visible(self) -> bool:
+        """这个号当前是不是「可见窗口」模式（用户正在对着它扫码/操作）。
+
+        对账复查 online 号时要用它：可见窗口开着 = 用户正在登录或看这个号，
+        无头复查一去导航就会把窗口顶掉，把正在扫的码弄丢。所以这类号跳过复查。
+        """
+        return bool(self._visible)
 
     def state(self, hard: bool = False) -> dict:
         """查登录态。**这一步不许切无头**：它属于扫码流程，浏览器得留着。

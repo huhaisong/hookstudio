@@ -58,20 +58,62 @@ def _num(v, default: int = 0) -> int:
         return default
 
 
-def _collect(session, url: str, parts: tuple, wait_ms: int, got: dict) -> None:
+def _rate(v) -> float | None:
+    """平台完播率 → 百分比数值（14.3 表示 14.3%）。读不到返回 None。
+
+    平台给的是 0~1 小数；偶尔也见到已经是 0~100 的，做个范围判断。
+    绝不当 0 处理：0% 是「真的一条没看完」，None 是「平台没给这个字段」，
+    两者混在一起会让新号误以为作品全崩了。
+    """
+    if v is None or v == "":
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f < 0:
+        return None
+    return round(f * 100, 1) if f <= 1 else round(f, 1)
+
+
+def _seconds(v) -> float | None:
+    """平台平均观看秒数 → 秒。读不到返回 None，不补 0。"""
+    if v is None or v == "":
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(f, 1) if f >= 0 else None
+
+
+def _collect(session, url: str, parts: tuple, wait_ms: int, got: dict,
+             scroll: bool = False) -> None:
     """打开一个页面，把它自己发的几个接口的 JSON 响应存进 `got`。
 
     直接读响应、不重放第一页 —— 页面加载时本来就发了，白拿一份。
     监听器必须 remove：这个 page 是长期复用的，挂着不放会一次比一次多。
+
+    scroll=True（作品列表页用）：列表页是懒加载的，首屏只渲染前几条，
+    往下滚动才会发新的 post_list 请求。这里滚到底触发加载更多，把多次
+    post_list 响应都累积下来，否则永远只拿到第一屏那 4-5 条。
     """
     def _run(page):
         def _on_resp(resp):
             try:
                 u = resp.url or ""
                 for p in parts:
-                    if p in u and p not in got:
-                        got[p] = resp.json()
-                        return
+                    if p not in u:
+                        continue
+                    body = resp.json()
+                    # post_list 要累积多次（懒加载会发好几屏）；其余只取第一条
+                    if p == "post/post_list":
+                        got.setdefault(p, [])
+                        if body not in got[p]:
+                            got[p].append(body)
+                    elif p not in got:
+                        got[p] = body
+                    return
             except Exception:  # noqa: BLE001
                 # 二进制/非 JSON 响应会抛，监听器一抛就把 sync 通道卡死
                 pass
@@ -80,6 +122,18 @@ def _collect(session, url: str, parts: tuple, wait_ms: int, got: dict) -> None:
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(wait_ms)
+            if scroll:
+                # 滚 6 轮，每轮滚到底 + 等 1.5 秒，让懒加载把全部作品吐出来
+                for _ in range(6):
+                    try:
+                        page.evaluate("""() => {
+                            const sc = document.scrollingElement || document.documentElement;
+                            sc.scrollTop = sc.scrollHeight;
+                            window.scrollTo(0, document.body.scrollHeight);
+                        }""")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    page.wait_for_timeout(1500)
         finally:
             try:
                 page.remove_listener("response", _on_resp)
@@ -112,6 +166,11 @@ def _norm_post(it: dict) -> dict:
         "cover": media.get("thumbUrl") or media.get("coverUrl") or "",
         "collection": (comp.get("title") or "").strip(),
         "city": (loc.get("city") or "").strip(),
+        # 完播率 / 平均观看时长（2026-11-16 实数据确认：平台 post_list 每条都给）。
+        # fullPlayRate 是 0~1 的小数（0.1428＝14.3%），avgPlayTimeSec 是秒。
+        # 字段缺版本时存 None —— 界面显示「—」，绝不补 0（0% 和「平台没给」是两回事）。
+        "finish_rate": _rate(it.get("fullPlayRate")),
+        "avg_play_sec": _seconds(it.get("avgPlayTimeSec")),
         # 注意：这个是平台的「功能级禁用」（比如禁止下载/禁止转载），**不是违规下架**。
         # 2026-11-13 实测：首页能正常看的作品这里也可能是 true，拿它判违规会全员误报。
         # 真正的违规只能从通知中心的推送里看（见 notify）。
@@ -141,15 +200,60 @@ def _norm_acc(data: dict) -> dict:
     }
 
 
+def _dump_post_list(raw_lists: list) -> None:
+    """探测用：把 post_list 的完整原始响应落一份盘，供人工核对字段/翻页。
+
+    只写文件、不影响主流程。看完可删。目标是确认两件事：
+      ① 列表页一屏到底返回多少条、有没有 totalCount / 翻页字段；
+      ② 单条 item 里有没有完播率 / 平均时长 / 起始播放这些字段。
+    """
+    try:
+        p = os.path.join(core.DATA_DIR, "diag", "post_list_raw.json")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(raw_lists, f, ensure_ascii=False, indent=1)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _merge_lists(raw_lists: list) -> list:
+    """把多次 post_list 响应里的 item 合并去重，返回完整作品列表。
+
+    懒加载会发好几屏，每屏 data.list 是一段；用 objectId 去重（同一条
+    可能在滚动时被重复返回）。
+    """
+    seen: set = set()
+    out: list = []
+    for raw in raw_lists or []:
+        if not isinstance(raw, dict):
+            continue
+        data = raw.get("data") or {}
+        for it in data.get("list") or []:
+            if not isinstance(it, dict):
+                continue
+            oid = it.get("objectId") or it.get("id") or ""
+            if oid and oid in seen:
+                continue
+            if oid:
+                seen.add(oid)
+            out.append(it)
+    return out
+
+
 def fetch(session, deep: bool = False) -> dict:
     """采一次原始数据（不落盘）。deep=True 时多开一次首页，补权限/加热那几项。"""
     got: dict = {}
-    _collect(session, wxpub.LIST_URL, _WANT_DEEP if deep else _WANT, 9000, got)
+    _collect(session, wxpub.LIST_URL, _WANT_DEEP if deep else _WANT, 9000, got,
+             scroll=True)
     if deep and "vip/get-user-member-service-status" not in got:
         _collect(session, wxpub.PLATFORM_URL, _WANT_DEEP, 9000, got)
 
-    raw_list = got.get("post/post_list") or {}
-    lst = ((raw_list.get("data") or {}).get("list")) or []
+    raw_lists = got.get("post/post_list") or []
+    if isinstance(raw_lists, dict):
+        raw_lists = [raw_lists]
+    _dump_post_list(raw_lists)
+    lst = _merge_lists(raw_lists)
+    raw_list = raw_lists[0] if raw_lists else {}
     auth = ((got.get("auth/auth_data") or {}).get("data")) or {}
     posts = [_norm_post(x) for x in lst if isinstance(x, dict)]
     acc = _norm_acc(auth)
@@ -190,11 +294,20 @@ def _norm_notify(data: dict) -> dict:
     """
     lst = data.get("list") or []
     hits = []
+    all_notices = []
     for it in lst:
         if not isinstance(it, dict):
             continue
         txt = " ".join(str(it.get(k) or "") for k in
                        ("title", "content", "digest", "desc", "subTitle"))
+        # 通知记录：把平台发的每条通知都留下（小v猫「通知记录」口径）。
+        # 只有一个概数 unread 没用——客户要能点开逐条看。字段逐个兜底，
+        # 平台各版本 title/content 名字不一，全为空就跳过（不造空白行）。
+        title = str(it.get("title") or it.get("subTitle") or "").strip()
+        text = str(it.get("content") or it.get("digest") or it.get("desc") or "").strip()
+        nts = _num(it.get("createTime") or it.get("timestamp"))
+        if title or text:
+            all_notices.append({"title": title[:60], "text": text[:200], "ts": nts})
         if not any(k in txt for k in ("违规", "处罚", "限制", "下架", "申诉", "不通过")):
             continue
         raw = it.get("raw") if isinstance(it.get("raw"), dict) else it
@@ -209,7 +322,7 @@ def _norm_notify(data: dict) -> dict:
                      "oid": oid,
                      "ts": _num(it.get("createTime") or it.get("timestamp"))})
     return {"unread": _num(data.get("unreadCount")), "hits": hits[:20],
-            "ok": bool(lst) or "list" in data}
+            "all": all_notices[:50], "ok": bool(lst) or "list" in data}
 
 
 # visibleType：1 公开、2 仅好友可见、3 仅自己可见（2026-11-13 与列表页文案对齐核对过）
@@ -313,10 +426,12 @@ def _attach(posts: list[dict], hist: dict) -> None:
         p["span"] = max(0, s[-1][0] - s[-2][0]) if len(s) >= 2 else 0
         p["since"] = s[0][0] if s else now
         p["points"] = len(s)
+        p["base"] = int(s[0][1]) if s else 0
         rec["last"] = {k: v for k, v in zip(keys, vals)}
         rec["last"].update({
             "title": p["title"], "ts": p["ts"], "dur": p["dur"],
             "cover": p["cover"], "collection": p["collection"],
+            "finish_rate": p.get("finish_rate"), "avg_play_sec": p.get("avg_play_sec"),
             "disabled": p["disabled"], "original": p["original"],
             # visible 要落盘：诊断页的「近期异常视频」读的是缓存，
             # 不存的话每次都得重新开浏览器才知道哪条没在公域推
@@ -342,6 +457,13 @@ def sample(session, deep: bool = False, aid: str = "") -> dict:
         _save(hist, aid)
     snap["aid"] = aid
     snap["points"] = max((p.get("points") or 0) for p in snap.get("posts") or [{}]) if snap.get("posts") else 0
+    plays = [p["play"] for p in snap.get("posts") or []]
+    snap["summary"] = {
+        "count": len(plays),
+        "max_play": max(plays) if plays else 0,
+        "min_play": min(plays) if plays else 0,
+        "total_play": sum(plays),
+    }
     snap["abnormal"] = abnormal(snap.get("posts") or [], snap.get("notify") or {})
     return snap
 
@@ -366,18 +488,61 @@ def cached(aid: str = "") -> dict:
             "fav": _num(last.get("fav")),
             "dur": _num(last.get("dur")), "cover": last.get("cover") or "",
             "collection": last.get("collection") or "",
+            # 老缓存没有这两个键 → None，界面显示「—」，不伪造 0
+            "finish_rate": last.get("finish_rate"), "avg_play_sec": last.get("avg_play_sec"),
             "disabled": bool(last.get("disabled")), "original": _num(last.get("original")),
             "visible": _num(last.get("visible")), "status": _num(last.get("status")),
             "series": [int(x[1]) for x in s][-SHOW_POINTS:],
             "inc": (int(s[-1][1]) - int(s[-2][1])) if len(s) >= 2 else None,
             "span": max(0, s[-1][0] - s[-2][0]) if len(s) >= 2 else 0,
             "points": len(s), "since": s[0][0],
+            # 起始播放 = 第一次采样值（小v猫口径）。只有 1 个点时就是它自己。
+            "base": int(s[0][1]) if s else 0,
         })
     posts.sort(key=lambda x: x["ts"], reverse=True)
+    # 顶部汇总（小v猫式一眼看全）：只在有作品时算，全是 0 也不假装热闹
+    plays = [p["play"] for p in posts]
     return {"aid": aid, "at": h.get("at") or "", "account": h.get("account") or {},
             "posts": posts, "points": max((p["points"] for p in posts), default=0),
+            "summary": {
+                "count": len(posts),
+                "max_play": max(plays) if plays else 0,
+                "min_play": min(plays) if plays else 0,
+                "total_play": sum(plays),
+            },
             "abnormal": abnormal(posts, h.get("notify") or {}),
+            "notify_unread": _num((h.get("notify") or {}).get("unread")),
             "note": ""}
+
+
+def notify_records(aid: str = "") -> dict:
+    """通知记录：从上次采样的缓存读，不打浏览器（小v猫「通知记录」口径）。
+
+    没采过或缓存里没存通知（老版本）就如实说，不伪造。
+    """
+    h = _load(aid)
+    ntf = h.get("notify") or {}
+    return {"aid": aid, "at": h.get("at") or "",
+            "unread": _num(ntf.get("unread")),
+            "items": list(ntf.get("all") or []),
+            "note": "" if ntf.get("ok") or ntf.get("all") is not None
+                    else "这个号还没读到通知，点「采一次」后再看。"}
+
+
+def clear_data(aid: str = "") -> dict:
+    """清空这个号的采样记录（小v猫「清空数据」口径）。
+
+    只删这一个号的缓存文件，不碰别的号、不碰队列、不碰成片。
+    """
+    p = _path(aid)
+    removed = False
+    try:
+        if os.path.isfile(p):
+            os.remove(p)
+            removed = True
+    except OSError:
+        pass
+    return {"aid": aid, "removed": removed}
 
 
 def profile(session) -> dict:

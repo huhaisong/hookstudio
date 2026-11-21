@@ -16,9 +16,10 @@ from pydantic import BaseModel
 from urllib.parse import quote
 
 from . import admin as admin_api
-from . import (aigate, analyze, audit, auth, batch, bgmlib, buildstamp, core, db,
-               names, nosub, publishapi, publisher, report, render, retime, shots,
-               shortcut, transcribe, update, vmerge, wxbot, wxmon, wxworker, zh)
+from . import (aigate, autopipe, addvideos, analyze, audit, auth, batch, bgmlib, buildstamp,
+               core, db, direct, names, nosub, proof, publishapi, publisher, report,
+               render, retime, shots, shortcut, transcribe, update, vmerge, wxbot,
+               wxmon, wxworker, zh)
 
 # 版本号只在这里定义一次，构建指纹模块也用它（buildstamp.VERSION）
 APP_VERSION = buildstamp.VERSION
@@ -216,6 +217,12 @@ def resume_interrupted():
                   f"，迁移 API Key：{'是' if mig['key_migrated'] else '否'}")
     except Exception as exc:  # noqa: BLE001
         print(f"[migrate] 跳过：{exc}")
+    # 上次异常中断的任务：C 档（2026-11-19 用户定）——开机不再自动续跑。
+    # 原来是「看到 task.json 标记 + 数据没做完就直接 start_task」，结果是用户
+    # 明明点了中止，只要标记因竞态残留，重启又被拉起来，形成「停不掉」的死循环。
+    # 现在只把「哪一步没做完」登记到待确认表，前端问过用户、用户点了才跑。
+    # 顺手清掉每个项目的 task.json：它不再承担「自动续跑」职责，留着只会让
+    # get_task 报「上次中断，正在自动续跑」的假 busy、把按钮锁死。
     for row in core.list_projects():
         pid = row["id"]
         p = core.load(pid)
@@ -225,19 +232,10 @@ def resume_interrupted():
         if not kind:
             continue
         if _step_incomplete(p, kind):
-            if kind == "batch":
-                core.start_task(pid, "batch", lambda pid=pid: batch.render_plans(pid))
-            else:
-                # 第 2 步（nosub）拆成独立组后不再写 task.json，重启不自动续跑：
-                # 它自带「设置没变就跳过已生成集」的断点续做，重新点一次即可，
-                # 而且不能让它的中断标记把第 1/3 步的按钮锁在「正在续跑」上。
-                # 映射里留着 nosub 只为兼容极老的标记文件。
-                fn = {"transcribe": transcribe.run, "analyze": analyze.run,
-                      "render": render.run, "nosub": nosub.run}[kind]
-                core.start_task(pid, kind, lambda fn=fn, pid=pid: fn(pid))
-        else:
-            # 标记还在但其实已经做完（比如死在最后一步保存前），清掉即可
-            core.clear_task_flag(pid)
+            core.set_resume_pending(pid, {"kind": kind, "name": p.get("name") or ""})
+            print(f"[resume] 登记待确认续跑：{p.get('name') or pid} / {kind}（未自动运行）")
+        # 无论是否真的没做完，标记都已移交待确认表（或本就完成），清掉
+        core.clear_task_flag(pid)
 
 
 class NewProject(BaseModel):
@@ -249,6 +247,8 @@ class NewProject(BaseModel):
     mode: str = "batch"
     # 新建时直接复用另一个项目的转写台词（同一批素材不必重跑 Whisper）
     reuse_from: str = ""
+    # 一键全自动：建完项目后自动跑完整条链，cfg 是那套参数（模型/套数/时长/出片设置）
+    autopipe_cfg: dict | None = None
 
 
 class ConfigBody(BaseModel):
@@ -267,6 +267,15 @@ class ConfigBody(BaseModel):
     report_audit: bool | None = None
     # 同时生成几条（第 2 步多组 / 第 3 步多条共用），1-8，本机偏好。
     max_concurrent: int | None = None
+    # 台词整理前先去背景音（本机偏好，任何登录用户都能改，同 hw_encode）。
+    asr_denoise: bool | None = None
+    # 一键全自动上次的参数（记住上次用）：整套 dict 存进 config.autopipe_cfg。
+    autopipe_cfg: dict | None = None
+
+
+class AutoPipeBody(BaseModel):
+    """点「一键全自动」时带的参数。cfg 为空 = 沿用项目里存的/全局默认。"""
+    cfg: dict | None = None
 
 
 class EdlBody(BaseModel):
@@ -306,6 +315,15 @@ def status():
         "update": update.state(),
         "dist_mode": bool(core.load_config().get("dist_mode")),
     }
+
+
+def _asr_denoise_available() -> bool:
+    """人声分离模型是否随包带了。没带就把设置项藏起来，别让用户勾了没反应。"""
+    try:
+        from . import voiceiso
+        return voiceiso.available()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 @app.get("/api/config")
@@ -365,6 +383,9 @@ def get_config(request: Request):
         "trial": trial,
         "whisper_tier": core.whisper_tier(),
         "tiers": tiers,
+        # 台词整理前的「去背景音」开关：模型随包带才显示，没带就不露这个选项
+        "asr_denoise": bool(core.load_config().get("asr_denoise")),
+        "asr_denoise_available": _asr_denoise_available(),
         "system": {"cpu": info["cpu"], "mem_gb": info["mem_gb"]},
         "paths": {"base": core.BASE, "data": core.DATA_DIR,
                   "models": core.MODELS, "prompts": core.PROMPTS,
@@ -376,6 +397,8 @@ def get_config(request: Request):
         # 日志上报**实际生效值**（不是配置里的原值）：没显式设置时跟随分发形态，
         # 前端要显示的就是「现在到底报不报」，否则勾选框和实际行为会打架。
         "report_audit": report.enabled(),
+        # 一键全自动上次的参数（前端新建页/项目页拿来预填「记住上次」）
+        "autopipe_cfg": core.load_config().get("autopipe_cfg") or {},
         "update": update.state(),
     }
 
@@ -404,7 +427,7 @@ def put_config(body: ConfigBody, request: Request):
     if body.ds_key is not None:
         patch["ds_key"] = body.ds_key.strip()
     if body.whisper_tier and body.whisper_tier != core.TIER:
-        raise HTTPException(400, f"只提供 {core.TIER} 模型")
+        raise HTTPException(400, "目前只提供一种整理方式")
     if body.output_dir is not None:
         d = body.output_dir.strip()
         if d:
@@ -417,13 +440,21 @@ def put_config(body: ConfigBody, request: Request):
                     f.write("ok")
                 os.remove(probe)
             except OSError as exc:
-                raise HTTPException(400, f"这个目录写不进去：{exc}")
+                raise HTTPException(400, "这个目录写不进去，请换个位置")
         patch["output_dir"] = d
     if body.hw_encode is not None:
         v = body.hw_encode.strip().lower()
         if v not in ("auto", "off"):
             raise HTTPException(400, "显卡加速只能选「自动」或「关闭」")
         patch["hw_encode"] = v
+    # 去背景音：本机偏好（同 hw_encode），任何登录用户都能改。
+    if body.asr_denoise is not None:
+        patch["asr_denoise"] = bool(body.asr_denoise)
+    # 一键全自动参数记忆：本机偏好，任何登录用户都能改（同 hw_encode）。
+    if body.autopipe_cfg is not None:
+        if not isinstance(body.autopipe_cfg, dict):
+            raise HTTPException(400, "全自动参数格式不对")
+        patch["autopipe_cfg"] = body.autopipe_cfg
     # 同时生成上限：本机偏好，任何登录用户都能改（同 hw_encode）。
     # 必须夹在 1-8——0 会让线程池直接抛错，999 会把上游账号打限流。
     if body.max_concurrent is not None:
@@ -557,7 +588,7 @@ def browse(path: str = ""):
     try:
         entries = sorted(os.listdir(path), key=core.natural_key)
     except OSError as exc:
-        raise HTTPException(403, f"无法读取这个目录：{exc.strerror}") from exc
+        raise HTTPException(403, "无法读取这个目录，请检查路径") from exc
     for name in entries:
         full = os.path.join(path, name)
         if not os.path.isdir(full) or name.startswith("."):
@@ -625,14 +656,16 @@ def _copy_lines_from(src_pid: str, proj: dict) -> int:
         if lines:
             by_file[ep.get("file") or ""] = lines
     if not by_file:
-        raise HTTPException(400, f"「{src.get('name')}」还没有转写好的台词")
+        raise HTTPException(400, f"「{src.get('name')}」还没有整理好的台词")
     n = 0
     for ep in proj.get("episodes") or []:
         if ep.get("lines"):
             continue                      # 已经有台词的集不覆盖
         lines = by_file.get(ep.get("file") or "")
         if lines:
-            ep["lines"] = [dict(ln) for ln in lines]
+            fresh = [dict(ln) for ln in lines]
+            _clean_imported_lines(fresh)
+            ep["lines"] = fresh
             ep["status"] = "done"
             ep.pop("error", None)
             n += 1
@@ -724,6 +757,16 @@ def _parse_transcript(text: str, default_ep: int = 0) -> dict[int, list[dict]]:
     return out
 
 
+def _clean_imported_lines(lines: list[dict]):
+    """粘贴/复用进来的台词过繁转简（确定性规则），和转写走同一套。
+
+    人名统一已交给第 1 步末尾的整剧 AI 校对（2026-11-19 用户定）：没有标准来源，
+    对照表填不出来，所以不再自动套 names 表——否则两套口径打架。只改文字，
+    时间码不动；zh.apply_lines 幂等。
+    """
+    zh.apply_lines(lines)
+
+
 def _apply_lines(proj: dict, parsed: dict[int, list[dict]]) -> int:
     """把解析结果写进项目（按集号或按文件名顺序对齐），返回写了几集。"""
     eps = proj.get("episodes") or []
@@ -738,6 +781,7 @@ def _apply_lines(proj: dict, parsed: dict[int, list[dict]]) -> int:
         ep = by_index.get(int(ep_i))
         if not ep or not lines:
             continue
+        _clean_imported_lines(lines)
         ep["lines"] = lines
         ep["status"] = "done"
         ep.pop("error", None)
@@ -757,7 +801,7 @@ def reuse_lines(pid: str, body: ReuseLines, request: Request):
         raise HTTPException(404, "项目不存在")
     n = _copy_lines_from(body.from_pid, p)
     if not n:
-        raise HTTPException(400, "没有可复用的集：要么源项目没转写，要么文件名对不上")
+        raise HTTPException(400, "没有可复用的集：要么源项目还没整理台词，要么文件名对不上")
     total = sum(len(e.get("lines") or []) for e in p["episodes"])
     audit.log_event(me, "project.transcript_reuse", target=audit.target_of(pid),
                     payload={"from": body.from_pid, "copied": n, "lines": total},
@@ -840,9 +884,20 @@ def create(body: NewProject, request: Request):
         except HTTPException:
             # 复用失败不该把建项目一起搞崩：留空转写即可
             pass
-    # 还有没台词的集才自动转写：全复用上了就不用跑 Whisper。
-    if any(not (e.get("lines")) for e in proj["episodes"]):
-        core.start_task(proj["id"], "transcribe", lambda pid=proj["id"]: transcribe.run(pid))
+    # 一键全自动：建完就把参数存进项目、启动整条链（转写→抹字幕→生成→出片）。
+    # 没勾全自动就走原来的「只自动转写」逻辑。
+    if body.autopipe_cfg:
+        proj["autopipe"] = {"cfg": body.autopipe_cfg, "stage": "init",
+                            "indexes": [], "last_error": "", "done": False}
+        core.save_merge(proj, ["autopipe"])
+        # 也写进全局默认，下次新建时前端能回填「上次的参数」
+        core.save_config({"autopipe_cfg": body.autopipe_cfg})
+        core.start_task(proj["id"], "autopipe",
+                        lambda pid=proj["id"]: autopipe.run(pid))
+    else:
+        # 还有没台词的集才自动转写：全复用上了就不用跑 Whisper。
+        if any(not (e.get("lines")) for e in proj["episodes"]):
+            core.start_task(proj["id"], "transcribe", lambda pid=proj["id"]: transcribe.run(pid))
     return proj
 
 
@@ -862,6 +917,7 @@ def project(pid: str):
     slim["task"] = core.get_task(pid)                  # 第 1 步 + 第 3 步（cuts）
     slim["task_shots"] = core.get_task(pid, "shots")   # 第 4 步引流分镜
     slim["task_nosub"] = core.get_task(pid, "nosub")   # 第 2 步去字幕（独立并行）
+    slim["task_planadd"] = core.get_task(pid, "planadd")  # 追加结构（与出片并行）
     # 老项目没有 plan_result：读的时候按 jobs 与实际产出的差额补一份只读推断，
     # 让「缺套提示 + 只补跑没出来的套」对改动前生成的项目也能用。不写盘。
     if not (slim.get("batch") or {}).get("plan_result"):
@@ -873,6 +929,66 @@ def project(pid: str):
 
 class CancelTaskBody(BaseModel):
     group: str = ""     # "" = 三条产线都停；"cuts"/"nosub"/"shots" 只停对应那条
+
+
+# kind → 启动函数：待确认续跑、用户点头时用。startup 已不再自动跑，统一走这里。
+_RESUME_RUNNERS = {
+    "transcribe": lambda pid: transcribe.run(pid),
+    "analyze": lambda pid: analyze.run(pid),
+    "render": lambda pid: render.run(pid),
+    "nosub": lambda pid: nosub.run(pid),
+    "batch": lambda pid: batch.render_plans(pid),
+}
+_RESUME_LABEL = {
+    "transcribe": "整理台词", "analyze": "让 AI 挑片段", "render": "出片",
+    "nosub": "重做字幕", "batch": "批量出片",
+}
+
+
+@app.get("/api/resume/pending")
+def resume_pending():
+    """开机时登记的「上次没做完」任务，给前端问用户要不要续跑。"""
+    return {"items": [
+        {"pid": pid, "kind": (v.get("kind") or ""),
+         "label": _RESUME_LABEL.get(v.get("kind"), "上次那一步"),
+         "name": v.get("name") or ""}
+        for pid, v in core.load_resume_pending().items()
+    ]}
+
+
+class ResumeDecision(BaseModel):
+    pid: str
+    action: str = "run"     # run=接着跑 / dismiss=忽略，不再问
+
+
+@app.post("/api/resume/decide")
+def resume_decide(body: ResumeDecision):
+    """用户对「上次没做完」做决定：run 才真正开跑，dismiss 只清登记。"""
+    pending = core.load_resume_pending()
+    info = pending.get(body.pid)
+    if not info:
+        return {"ok": True, "started": False}     # 已被处理过，幂等
+    kind = info.get("kind") or ""
+    action = (body.action or "run").strip()
+    core.drop_resume_pending(body.pid)
+    if action == "dismiss":
+        return {"ok": True, "started": False}
+    if action != "run":
+        raise HTTPException(400, "设置问题，请刷新后重试")
+    if not core.load(body.pid):
+        raise HTTPException(404, "项目已不存在")
+    # 直出项目中断在 transcribe：走完整链（转写→自动对齐），别漏掉对齐
+    if kind == "transcribe":
+        p = core.load(body.pid) or {}
+        fn = (lambda pid=body.pid: direct.transcribe_then_analyze(pid)) if direct.is_direct(p) \
+             else _RESUME_RUNNERS.get("transcribe")
+    else:
+        fn = _RESUME_RUNNERS.get(kind)
+    if not fn:
+        raise HTTPException(400, "这一步不支持自动续跑，请到项目里手动重新点一次")
+    if not core.start_task(body.pid, kind, fn):
+        raise HTTPException(409, "这个项目已有任务在跑，稍后再试")
+    return {"ok": True, "started": True}
 
 
 @app.post("/api/projects/{pid}/task/cancel")
@@ -888,32 +1004,58 @@ def cancel_project_task(pid: str, body: CancelTaskBody | None = None):
     # 白名单从任务分组表动态取，别写死：以后再加一条产线，这里不用跟着改，
     # 也不会出现「能跑起来却中止不了」的口子。
     if group and group not in set(core._TASK_GROUP.values()):
-        raise HTTPException(400, "产线参数不对")
+        raise HTTPException(400, "设置有问题，请检查后重试")
     hit = core.cancel_task(pid, group or None)
     return {"ok": True, "cancelled": hit}
 
 
 @app.delete("/api/projects/{pid}")
 def delete(pid: str, force: int = 0):
-    """删项目。这个项目出的片还被发布队列指着时先拦一次，用户确认后带 force=1 再来。
+    """删项目：自动中止这个项目的任务，并把它名下的缓存/残留一起清掉。
 
-    队列是全局的（不挂在项目下），所以删项目**不会**删掉发布记录 —— 但那几条
-    作业指向的文件就在这个项目的输出目录里，删了之后它们会变成「文件找不到了」。
-    与其留一堆坏死记录，不如提前问一句（2026-11-13 用户定）。
+    顺序很关键：先中止 → 立刻立墓碑（挡住 worker 收尾时的迟到写回，否则项目
+    会「删了又活」）→ 等任务真正退出 → 再删目录和各类残留。
+
+    发布队列是全局的，未发作业里属于这个项目的会一并摘掉；已经交到平台的
+    （publishing / uncertain / 有 submit_started_at）保留，否则就没法继续追踪。
+    成片 mp4 按视频名存、不带 pid，无法可靠归属，一律不动。
     """
     p = core.load(pid)
-    if p:
-        n = publisher.jobs_of_project(pid)
-        if n and not force:
-            raise HTTPException(
-                409,
-                f"这个项目还有 {n} 条视频等着发布（在「发布」里排着）。"
-                f"删掉项目会把这些视频文件一起删掉，那几条发布记录就发不出去了。"
-                f"确实要删就再点一次。")
-    d = os.path.join(core.PROJECTS, pid)
-    if os.path.isdir(d):
-        core.rmtree(d)
-    return {"ok": True}
+    n = publisher.jobs_of_project(pid) if p else 0
+    if n and not force:
+        raise HTTPException(
+            409,
+            f"这个项目还有 {n} 条视频等着发布（在「发布」里排着）。"
+            f"删除会把这些还没发的条目一并移除；已经交到平台的不受影响。"
+            f"成片文件不会删。确实要删就再点一次。")
+
+    cancelled = core.cancel_task(pid)          # group=None：这个项目所有产线
+    core.mark_deleted(pid)                     # 墓碑必须在删目录之前立
+
+    # 中止是打标记，不是强杀线程；等它走到检查点自己退。ffmpeg 可能要等当前
+    # 分段结束，给 12 秒；超时也照删——墓碑已经保证它写不回 project.json。
+    waited = 0.0
+    deadline = time.monotonic() + 12.0
+    while core.task_running(pid) and time.monotonic() < deadline:
+        time.sleep(0.25)
+        waited = min(12.0, waited + 0.25)
+    still_running = core.task_running(pid)
+
+    files = core.purge_project_files(pid, p or {})
+    jobs = publisher.purge_project(pid)
+    logs = audit.purge_project(pid, (p or {}).get("name") or "")
+    with core._TASKS_LOCK:
+        core._TASKS.pop(pid, None)              # 只清显示的进度；_CANCEL 不能动，
+                                                # 否则还在收尾的 worker 会以为没中止
+    return {
+        "ok": True,
+        "cancelled": len(cancelled),
+        "waited": round(waited, 1),
+        "still_running": still_running,
+        "files": files,
+        "jobs": jobs,
+        "logs": logs,
+    }
 
 
 # ── 台词整理之后的一步：去掉原字幕 + 在原位置加回自己的字幕（2026-11-11）──
@@ -1040,7 +1182,7 @@ def open_nosub(pid: str):
     try:
         _open_native(d)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"打不开文件夹：{exc}") from exc
+        raise HTTPException(500, "打不开这个文件夹，请检查文件夹是否正常") from exc
     return {"ok": True, "path": d}
 
 
@@ -1064,17 +1206,90 @@ def preview_nosub(pid: str, ep: int = 0):
     try:
         _open_native(target)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"打不开视频：{exc}") from exc
+        raise HTTPException(500, "打不开这个视频，请检查文件是否还在、格式是否支持") from exc
     return {"ok": True, "path": target}
 
 
+class TranscribeBody(BaseModel):
+    # force=True：不管哪几集已有台词，全部重新识别一遍（用户 2026-11-19 要的
+    # 「要么不重来，要读就整剧一起读」）。重转后繁转简、对时、校对都会自动跟着走。
+    force: bool = False
+
+
 @app.post("/api/projects/{pid}/transcribe")
-def do_transcribe(pid: str):
+def do_transcribe(pid: str, body: TranscribeBody | None = None):
     if not core.load(pid):
         raise HTTPException(404, "项目不存在")
-    if not core.start_task(pid, "transcribe", lambda: transcribe.run(pid)):
+    force = bool(body and body.force)
+    if not core.start_task(pid, "transcribe", lambda: transcribe.run(pid, force=force)):
         raise HTTPException(409, "这个项目已有任务在跑")
-    return {"ok": True}
+    return {"ok": True, "force": force}
+
+
+class AddVideosBody(BaseModel):
+    # scan_src=True：扫项目原素材目录；否则用 paths（文件或文件夹的绝对路径）
+    scan_src: bool = False
+    paths: list[str] = []
+
+
+@app.post("/api/projects/{pid}/add-videos")
+def do_add_videos(pid: str, body: AddVideosBody | None = None):
+    """往已有项目追加视频，追加后自动一键跑：新集转写(含对时+校对) → 抹原字幕。
+
+    只动新增的集——旧集台词/校对/成片一律不碰（新集靠「没有台词」被识别）。
+    追加动作本身要先于起任务完成，这样 transcribe 一进来就能看到新集。
+    """
+    if not core.load(pid):
+        raise HTTPException(404, "项目不存在")
+    # 一键任务要占 cuts（转写+校对）和 nosub（抹字幕）两组，事先拦住正在跑的任务
+    if core.running_kind(pid, "cuts") or core.running_kind(pid, "nosub"):
+        raise HTTPException(409, "这个项目已有任务在跑，等它跑完再加视频")
+    scan = bool(body and body.scan_src)
+    paths = list((body.paths if body else None) or [])
+    if not scan and not paths:
+        raise HTTPException(400, "没有选到视频，也没有选扫描素材目录")
+    try:
+        r = addvideos.add(pid, paths, scan)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if r["added"] and not core.start_task(pid, "addvideos", lambda: addvideos.run(pid)):
+        # 极端竞态：追加已写盘但任务没起来，如实告诉用户，别假装成功
+        raise HTTPException(409, "视频已加入，但一键任务没能启动，请点「重新整理台词」继续")
+    return {"ok": True, **r}
+
+
+@app.post("/api/projects/{pid}/autopipe")
+def do_autopipe(pid: str, body: AutoPipeBody | None = None):
+    """一键全自动：把转写→抹字幕→生成N套→出片串成一条后台任务。
+
+    已有项目点「一键全自动」走这里。带 cfg 就用新的（并记住）；不带就沿用项目存的
+    或全局默认。每步幂等跳过已完成的——重跑/续跑不会重复花钱。失败原因写在
+    project.autopipe.last_error，界面上给「重试」按钮。
+    """
+    p = core.load(pid)
+    if not p:
+        raise HTTPException(404, "项目不存在")
+    if core.running_kind(pid, "cuts") or core.running_kind(pid, "nosub"):
+        raise HTTPException(409, "这个项目已有任务在跑，等它跑完再启动全自动")
+    cfg = (body.cfg if body else None) or (p.get("autopipe") or {}).get("cfg") \
+        or core.load_config().get("autopipe_cfg") or {}
+    if not isinstance(cfg, dict):
+        raise HTTPException(400, "全自动参数格式不对")
+    # 校验必填：模型/套数；勾了配乐必须有文件夹
+    jobs = cfg.get("jobs") or []
+    if not jobs:
+        raise HTTPException(400, "先设置要用的模型和每个模型出几套")
+    fx = cfg.get("fx") or {}
+    if fx.get("bgm") and (fx.get("bgm_mode") or "folder") == "folder" \
+            and not (fx.get("bgm_dir") or "").strip():
+        raise HTTPException(400, "勾了配乐，就先选一个放着多首歌的音乐文件夹")
+    p["autopipe"] = {"cfg": cfg, "stage": "init", "indexes": [],
+                     "last_error": "", "done": False}
+    core.save_merge(p, ["autopipe"])
+    core.save_config({"autopipe_cfg": cfg})
+    if not core.start_task(pid, "autopipe", lambda: autopipe.run(pid)):
+        raise HTTPException(409, "没能启动全自动任务，请再点一次")
+    return {"ok": True, "cfg": cfg}
 
 
 @app.post("/api/projects/{pid}/transcribe-ep")
@@ -1102,10 +1317,10 @@ def do_transcribe_ep(pid: str, body: dict):
         for e in latest["episodes"]:
             if e["index"] == ep["index"]:
                 e["status"] = "error"
-                e["error"] = f"{type(exc).__name__}: {exc}"
+                e["error"] = f"整理时出错了：{exc}"
                 break
         core.save_merge(latest, ["episodes"])
-        raise HTTPException(500, f"{type(exc).__name__}: {exc}")
+        raise HTTPException(500, f"整理时出错了：{exc}")
     # 基于磁盘最新状态合并保存，避免覆盖任务期间其它线程写入的数据
     latest = core.load(pid) or p
     for e in latest["episodes"]:
@@ -1186,6 +1401,10 @@ class PlanBody(BaseModel):
     jobs: list[PlanJob] | None = None  # 多模型对比：每个模型各自的套数/时长
     # True = 只把没生成成功的组重跑一遍，产出追加到现有 plans 后面（不覆盖、不清出片进度）
     append: bool = False
+    # 本批只在这些集里排（2026-11-19 选集生成）。留空 = 全集。
+    eps: list[int] = []
+    # True = 用户主动开的新一批（批号 +1）；补跑时保持 False，沿用上一批的批号
+    new_batch: bool = False
 
 
 class HookcutBody(BaseModel):
@@ -1232,7 +1451,7 @@ _PROMPT_EDIT_ON = os.environ.get("HOOK_ALLOW_PROMPT_EDIT") == "1"
 def _prompt_file(key: str) -> str:
     fname = _PROMPTS.get(key)
     if not fname:
-        raise HTTPException(404, f"没有叫 {key} 的提示词")
+        raise HTTPException(404, "没有找到这个提示词")
     return fname
 
 
@@ -1282,6 +1501,9 @@ def do_plan(pid: str, body: PlanBody, request: Request):
     AI 看得到完整剧情，能把这套排成讨债线、那套排成反击线。结果落在 p["plans"]，
     后续出片流程完全一样。界面上的「生成 N 套结构」就是它。
 
+    eps（2026-11-19）：只把这些集交给 AI。同一部剧可以反复分批生成——这批勾
+    1-8 集出 3 套、下批勾 5-11 集再出 3 套，套全部攒在同一个项目里，靠批号分组。
+
     **AI 用服务端的 Key**：前端不持有 Key，必须先 `POST /api/ai/grant` 换票据，
     带 `X-AI-Grant` 头来调用（见 app/aigate.py）。
     """
@@ -1291,7 +1513,7 @@ def do_plan(pid: str, body: PlanBody, request: Request):
     if not p:
         raise HTTPException(404, "项目不存在")
     if not (p.get("episodes") or []):
-        raise HTTPException(400, "还没有转写结果，请先转写")
+        raise HTTPException(400, "还没有整理好的台词，请先整理台词")
     if body.append:
         old_plans = p.get("plans") or []
         if not old_plans:
@@ -1300,13 +1522,18 @@ def do_plan(pid: str, body: PlanBody, request: Request):
             raise HTTPException(400, "当前是单集钩子结构，不能往里追加混剪的套")
     # AI 一次输出不了太多套（每套十几块，输出会过长易截断），上限压到 20
     order = body.order if body.order in ("auto", "chrono", "varied") else "chrono"
+    # 追加新套走独立任务组 planadd：只读前两步已定好的台词、写 plans 尾部，
+    # 不碰出片在用的 gen/batch，因此可以和正在跑的出片并行。覆盖式重排仍在 cuts 组互斥。
+    task_kind = "planadd" if body.append else "plan"
     if body.jobs:
         # 多模型对比：每个模型各自的套数/时长，依次各走 1 次 API
         jobs = [{"model": (j.model or "").strip(), "count": max(1, min(20, int(j.count))),
                  "min_minutes": max(0.5, float(j.min_minutes)),
                  "max_minutes": max(0.5, float(j.max_minutes))} for j in body.jobs]
         total = sum(j["count"] for j in jobs)
-        runner = lambda: batch.ai_plan_multi(pid, jobs, order, append=body.append)
+        runner = lambda: batch.ai_plan_multi(pid, jobs, order, append=body.append,
+                                             eps=body.eps, new_batch=body.new_batch,
+                                             task_kind=task_kind)
     else:
         count = max(1, min(20, int(body.count)))
         mn = max(0.5, float(body.min_minutes))
@@ -1314,7 +1541,9 @@ def do_plan(pid: str, body: PlanBody, request: Request):
         jobs = [{"model": (body.model or "").strip(), "count": count,
                  "min_minutes": mn, "max_minutes": mx}]
         total = count
-        runner = lambda: batch.ai_plan_multi(pid, jobs, order, append=body.append)
+        runner = lambda: batch.ai_plan_multi(pid, jobs, order, append=body.append,
+                                             eps=body.eps, new_batch=body.new_batch,
+                                             task_kind=task_kind)
 
     # 任务跑在后台线程里，中间件那条日志只知道「有人点了生成」，不知道跑成功没有。
     # 真正的消耗在下面这条：谁、哪个项目、几个模型、跑了几分钟、成没成。
@@ -1338,7 +1567,7 @@ def do_plan(pid: str, body: PlanBody, request: Request):
                         duration_ms=int((time.perf_counter() - t0) * 1000),
                         request=request)
 
-    if not core.start_task(pid, "plan", job):
+    if not core.start_task(pid, task_kind, job):
         raise HTTPException(409, "这个项目已有任务在跑")
     return {"ok": True, "count": total, "order": order, "models": len(jobs),
             "append": body.append}
@@ -1363,7 +1592,7 @@ def do_hookcut_plan(pid: str, body: HookcutBody, request: Request):
     if not p:
         raise HTTPException(404, "项目不存在")
     if not (p.get("episodes") or []):
-        raise HTTPException(400, "还没有转写结果，请先转写")
+        raise HTTPException(400, "还没有整理好的台词，请先整理台词")
     all_eps = [int(e["index"]) for e in p["episodes"]]
     eps = [e for e in (body.eps or []) if e in set(all_eps)]
     hk = batch._norm_hook_sec(body.hook_sec)
@@ -1430,7 +1659,7 @@ def do_shots(pid: str, body: ShotsBody, request: Request):
         raise HTTPException(404, "项目不存在")
     script = (body.script or "").strip()
     if not script and not (p.get("episodes") or []):
-        raise HTTPException(400, "还没有转写结果，请先转写；或提供一段剧情素材")
+        raise HTTPException(400, "还没有整理好的台词，请先整理台词；或提供一段剧情素材")
     duration = 60 if body.duration >= 60 else (30 if body.duration >= 30 else 15)
     # 分段长度（2026-11-05 加 30 秒选项）：只能 15 / 30，且不能比整条还长
     seg_len = 30 if int(body.seg_len or 15) >= 30 else 15
@@ -1481,7 +1710,7 @@ def do_shots_layout(pid: str, body: ShotsLayoutBody, request: Request):
     try:
         return shots.shots_layout(pid, body.ctl, body.style)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, (str(exc) or type(exc).__name__)[:200])
+        raise HTTPException(500, "分镜排版没成功，请重试")
 
 
 @app.put("/api/projects/{pid}/plans-select")
@@ -1554,11 +1783,15 @@ def put_plan_fx(pid: str, body: PlanFxBody):
 
 class FxDefaultBody(BaseModel):
     fx: dict = {}
+    # 哪个面板的默认值（2026-11-18）："" = AI 编辑出片（fx-），"direct" = 选视频直接出片（d-）。
+    # 两边不能共用一个键——直出的「素材版本」被强制成 live、还多一套份数/配乐设置，
+    # 存到一起会把 AI 面板的设置串味。
+    scope: str = ""
 
 
 @app.put("/api/projects/{pid}/fx-default")
 def put_fx_default(pid: str, body: FxDefaultBody):
-    """记住全局「出片增强 / 画面」的默认值：下次打开这个项目还按上次的设置。
+    """记住「出片增强 / 画面」的默认值：下次打开这个项目还按上次的设置。
 
     只存不校验业务含义（校验在出片时做）——这里存的是用户正在调的状态。
     """
@@ -1566,9 +1799,10 @@ def put_fx_default(pid: str, body: FxDefaultBody):
     if not p:
         raise HTTPException(404, "项目不存在")
     # batch 容器里还有出片任务在写的进度/失败记录：重读磁盘最新，
-    # 只改 fx_default 这一个子键，别用接口开头的旧快照整份盖回去。
+    # 只改这一个子键，别用接口开头的旧快照整份盖回去。
+    key = "fx_default_direct" if str(body.scope or "").strip().lower() == "direct" else "fx_default"
     latest = core.load(pid) or p
-    latest.setdefault("batch", {})["fx_default"] = dict(body.fx or {})
+    latest.setdefault("batch", {})[key] = dict(body.fx or {})
     core.save_merge(latest, ["batch"])
     return {"ok": True}
 
@@ -1579,11 +1813,31 @@ def bgm_library():
     return {"ok": True, **bgmlib.library_summary()}
 
 
+class BgmFetchBody(BaseModel):
+    url: str = ""
+    name: str = ""
+
+
+@app.post("/api/bgm/fetch")
+def bgm_fetch(body: BgmFetchBody):
+    """把粘进来的音乐地址下载进「我的曲库」（data/bgm/）。
+
+    免版权站点很慢（实测约 40KB/s，一首 3~5MB 要一分多钟），前端要一直等，
+    所以别在界面上加额外超时；这里失败一律给出能看懂的中文原因。
+    """
+    try:
+        got = bgmlib.fetch_url(body.url, body.name)
+    except bgmlib.BgmError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "id": got["id"], "name": got["name"],
+            "mb": round(got["size"] / 1048576, 1), **bgmlib.library_summary()}
+
+
 class RenderFx(BaseModel):
     """出片增强开关 + 画面参数。
 
-    缺省值（2026-11-05 晚按用户要求定稿）：看点字幕、钩子卡**默认关**；
-    放大、缓冲加速默认开；BGM 默认关；调色默认「随机」档。
+    缺省值（2026-11-18 用户定稿）：看点字幕、钩子卡**默认关**；
+    放大、缓冲加速默认开；BGM 默认开；开头闪镜默认开且上下翻；调色默认「随机」档。
     前端面板、batch._flags、这里三处的缺省必须一致。
 
     「画面」这几项都是**只改画面、不改时长**的参数：切段那一趟顺手烧进去，
@@ -1592,13 +1846,27 @@ class RenderFx(BaseModel):
     buffer_speed: bool = True   # 缓冲段（评分 5-6）加速 1.15×，爆点块原速
     hook_card: bool = False     # 片头 1.8 秒黑屏大字（默认关，用户要就单套开）
     hook_sec: float = 1.8       # 卡片时长，1-4 秒
+    # 段间转场空境（2026-11-18）：每个镜头段之间插一段虚化推镜过渡，淡入淡出。
+    # 默认开 0.7s（2026-11-18 用户定「所有转场默认开启」），显式 0 才是关。
+    # 直出路径会先按场景检测把整段切成多段，AI 出片本来就是多段。
+    trans_sec: float = 0.7      # 0=关；开启时 0.4-1.5 秒
     zoom: bool = True           # 画面放大 103% 再裁回，去重 + 切掉边缘一圈
     title: bool = False         # 每块画面顶部烧一行「看点：XXX」（默认关）
-    bgm: bool = False           # 配乐 BGM：混入音乐，台词响时自动压低
-    bgm_auto: bool = True       # 2026-11-12：默认自动配乐（曲库按 AI 的配乐建议选曲）
-    bgm_pick: str = ""          # 可选：指定曲库曲目 id，空 = 按情绪自动挑
-    bgm_path: str = ""          # 本地音乐路径；自动模式由曲库在出片时解析后临时写入
-    bgm_vol: float = 0.22       # BGM 基础音量 0.05-0.6（闪避之外的基础垫底音量）
+    bgm: bool = True            # 配乐 BGM：混入音乐，台词响时自动压低（2026-11-18 默认开）
+    bgm_auto: bool = True       # 老字段保留兼容：老项目 auto 仍能出片；新默认已不走自动配乐
+    bgm_pick: str = ""          # 老字段保留兼容：老项目指定曲库曲目 id
+    bgm_path: str = ""          # 本地音乐路径；folder 模式由后端逐套解析后临时写入
+    # 配乐从哪来（2026-11-19 去掉自动配乐）：
+    #   ""      → 按老字段 bgm_auto 推导（true=老项目曲库，false=单曲），老项目照样能出片
+    #   auto    → 老项目遗留的内置曲库（前端已无此档，仍能出片不破坏老数据）
+    #   folder  → 用户指定的文件夹里随机挑，逐套尽量不重复（新默认）
+    #   file    → 指定的单个音乐文件
+    bgm_mode: str = "folder"
+    bgm_dir: str = ""           # 配乐文件夹（folder 模式用）
+    bgm_vol: float = 0.35       # BGM 基础音量 0.05-0.6（闪避之外的基础垫底音量）
+    # 去掉原片自带音乐（2026-11-19 用户定默认开）：出片时分离人声、把原片 BGM 压掉。
+    # 只有显式 false 才关；缺省当开。代价是首次出片多几分钟（同样素材再出走缓存）。
+    voice_iso: bool = True
     # ── 调色 / 画面（2026-11-05）─────────────────────────────────────
     # grade 五个值："" 原片 / cold 冷调 / warm 暖调 / vivid 浓郁 / film 胶片 /
     #              rand 随机（每区从四档里换着抽，相邻区不重样）——
@@ -1613,9 +1881,9 @@ class RenderFx(BaseModel):
     lut: str = ""               # 自己的 .cube LUT 文件（给了就替代预设档）
     mirror: bool = False        # 左右镜像（去重强；想连字幕一起翻反，先选去字幕版素材）
     # ── 开头画面镜像（2026-11-12）：界面上单独一组，跟上面的整幅镜像不是一回事 ──
-    # 只翻成片最前面约 0.3 秒，之后恢复原样；默认不勾，老项目读进来就是关。
-    first_mirror: bool = False
-    first_mirror_dir: str = "h"     # "h" 左右 / "v" 上下
+    # 只翻成片最前面约 0.3 秒，之后恢复原样；默认开、上下翻（2026-11-18 用户定）。
+    first_mirror: bool = True
+    first_mirror_dir: str = "v"     # "h" 左右 / "v" 上下（默认上下翻）
     stretch: float = render.FX_DEFAULTS["stretch"]  # 横向变形 0.94-1.06（默认 1.5%，视觉无感）
     glow: float = render.FX_DEFAULTS["glow"]        # 光晕（亮部溢光）0-1
     grain: float = render.FX_DEFAULTS["grain"]      # 颗粒 0-1
@@ -1623,6 +1891,10 @@ class RenderFx(BaseModel):
     # ── 指纹强度（2026-11-12）：每套按这个档位抽自己的放大/旋转/取景偏移 ──
     # soft 保守 / std 标准（默认）/ strong 强力。不传就是标准，老项目行为不变。
     fp_level: str = render.FP_DEFAULT
+    # ── 全自动随机（2026-11-17）：一张卡全随机，不用逐项设。默认开。
+    # 开时：放大/变形每段无感级微抖、左右镜像和字幕动效按集随机（都挂 fp_seed，
+    # 同批可复现、每次重出出新）。关时下面各项回归手调，老项目行为不变。
+    auto_fx: bool = True
     # ── 用哪份视频（界面上独立一组，不与上面四项混用）──
     # 去字幕 + 加自己的字幕已在「台词整理」之后那一步做成独立视频文件；
     # 出片这一步只挑素材，不再改画面。默认原始视频，老项目不受影响。
@@ -1649,6 +1921,23 @@ def _clean_fx(fx: dict) -> dict:
             fx["grade_int"] = min(1.0, max(0.0, float(fx.get("grade_int") or 0.65)))
         except (TypeError, ValueError):
             fx["grade_int"] = 0.65
+    # 去掉原片音乐：只认真正的布尔真，前端传 "false"/"0" 这类字符串一律当关
+    if "voice_iso" in fx:
+        fx["voice_iso"] = fx.get("voice_iso") is True
+    # 段间转场时长：0=关；开时夹到 0.4-1.5 秒。前端传字符串数字也认。
+    if "trans_sec" in fx:
+        try:
+            v = float(fx.get("trans_sec") or 0)
+            fx["trans_sec"] = 0.0 if v <= 0 else min(1.5, max(0.4, v))
+        except (TypeError, ValueError):
+            fx["trans_sec"] = 0.0
+    # 配乐来源只认三档；其它值一律当「没指定」，交给老字段 bgm_auto 推导
+    if "bgm_mode" in fx:
+        fx["bgm_mode"] = str(fx.get("bgm_mode") or "").strip().lower()
+        if fx["bgm_mode"] not in ("auto", "folder", "file"):
+            fx["bgm_mode"] = ""
+    if "bgm_dir" in fx:
+        fx["bgm_dir"] = str(fx.get("bgm_dir") or "").strip()
     if "grade" in fx:
         # grade_rand/rand_sec 是老版随机开关的字段：读进来合并成 grade=rand 后废弃
         if fx.get("grade_rand") and not fx.get("grade"):
@@ -1694,7 +1983,7 @@ def _clean_fx(fx: dict) -> dict:
         lut = (fx.get("lut") or "").strip()
         if lut:
             if not os.path.isfile(lut):
-                raise HTTPException(400, f"LUT 文件不存在：{lut}")
+                raise HTTPException(400, "调色文件找不到，请重新选")
             if not lut.lower().endswith(".cube"):
                 raise HTTPException(400, "LUT 只支持 .cube 格式（剪映/达芬奇的调色包导出成 .cube）")
         fx["lut"] = lut
@@ -1735,6 +2024,12 @@ class RenderPlansBody(BaseModel):
     # 每套单独的画面设置：key 是套号（"1"/"2"…），值只包含要覆盖的字段。
     # 不传的套就用 fx 里的全局值——「默认都一样，想改单套就改单套」。
     sets_fx: dict[str, dict] | None = None
+    # 只渲指定的几套（套号列表）。给「新追加的套单独出片」用：不动勾选状态，
+    # 只在这一趟里限定范围；不传 = 渲全部勾选的套（老行为不变）。
+    only: list[int] | None = None
+    # 选视频直接出片专用：一个视频出几份（1~5，0/不传 = 沿用项目里的设置）。
+    # 多份时每份是独立的套编号，随机项各不相同——共用编号只会渲出一模一样的几条。
+    copies: int = 0
 
 
 def _wants_live(plans: list[dict], fx: dict, sets_fx: dict) -> bool:
@@ -1844,6 +2139,39 @@ def _prepared_mirror_conflict(p: dict, plans: list[dict], fx: dict, sets_fx: dic
             "回第 2 步点一次「生成处理好的视频」，重做完再出片。")
 
 
+def _bgm_mode(fx: dict) -> str:
+    """配乐从哪来：auto=内置曲库 / folder=本地文件夹随机 / file=指定单曲。
+
+    新字段 bgm_mode 优先；老页面只传 bgm_auto + bgm_path，按老语义推导：
+    bgm_auto=false 且有路径 = 用我自己的音乐，否则走曲库。
+    """
+    m = str(fx.get("bgm_mode") or "").strip().lower()
+    if m in ("auto", "folder", "file"):
+        return m
+    return "file" if fx.get("bgm_auto") is False else "auto"
+
+
+def _apply_direct_copies(pid: str, p: dict, want: int) -> dict:
+    """把「一个视频出几份」落到项目上（0 = 不改，沿用项目里的值）。
+
+    份数一变就重建计划：多份时每份是独立的套编号，出片的随机种子按编号算，
+    这样几份的画面/镜像/调色/字幕动效才不一样。旧份数的成片记录同时清掉——
+    编号对不上了，留着会让成片列表混着两种叫法；磁盘上的文件一个都不动。
+    """
+    if not want:
+        return p
+    want = max(1, min(direct.COPIES_MAX, int(want)))
+    if direct.copies_of(p) == want:
+        return p
+    p["copies"] = want
+    direct.build_plans(p)
+    keep = {pl["index"] for pl in (p.get("plans") or [])}
+    p["sets"] = [s for s in (p.get("sets") or []) if s.get("index") in keep]
+    p.setdefault("batch", {})["done"] = sum(1 for s in p["sets"] if s.get("output"))
+    core.save_merge(p, ["copies", "plans", "sets", "batch"])
+    return core.load(pid) or p
+
+
 @app.post("/api/projects/{pid}/render-plans")
 def do_render_plans(pid: str, body: RenderPlansBody | None = None):
     """出片：只渲染勾选的套，成片存到用户指定的目录。"""
@@ -1862,7 +2190,7 @@ def do_render_plans(pid: str, body: RenderPlansBody | None = None):
                 f.write("ok")
             os.remove(probe)
         except OSError as exc:
-            raise HTTPException(400, f"这个保存位置用不了：{exc}") from exc
+            raise HTTPException(400, "这个保存位置用不了，请换个位置") from exc
     fx = (body.fx.model_dump() if body and body.fx else {})
     # 兼容老页面/老项目：没带 bgm_auto 却勾了 BGM 并给了文件路径 = 手动模式，
     # 别让默认值 True 把用户已经选好的歌悄悄吞掉。
@@ -1871,21 +2199,38 @@ def do_render_plans(pid: str, body: RenderPlansBody | None = None):
         if (fx.get("bgm_path") or "").strip():
             fx["bgm_auto"] = False
     chosen = [pl for pl in (p.get("plans") or []) if pl.get("on", True)]
+    # only：只渲指定套（新追加的套单独出片）。仍受 on 勾选约束，不动项目里的勾选。
+    only_idx = set(body.only or []) if (body and body.only) else None
+    if only_idx:
+        chosen = [pl for pl in chosen if int(pl.get("index") or 0) in only_idx]
+        if not chosen:
+            raise HTTPException(400, "指定的套没有勾选，或套号不存在")
     # BGM（2026-11-12）：勾了就一定要拿到一个能播的本地音频文件。自动配乐由曲库
     # 按 AI 的「BGM 建议」选曲（模型不给 URL、不写歌名），逐套解析见下面 run_sets_fx；
-    # 手动模式沿用原来的文件校验。两条路都在接口层当场验完，别等切完 20 段才炸。
+    # 手动模式沿用原来的文件校验。三条路都在接口层当场验完，别等切完 20 段才炸。
+    bgm_mode = _bgm_mode(fx)
     if fx.get("bgm"):
         try:
-            fx["bgm_vol"] = min(0.6, max(0.05, float(fx.get("bgm_vol") or 0.22)))
+            fx["bgm_vol"] = min(0.6, max(0.05, float(fx.get("bgm_vol") or 0.35)))
         except (TypeError, ValueError):
-            fx["bgm_vol"] = 0.22
-        if fx.get("bgm_auto") is False:
+            fx["bgm_vol"] = 0.35
+        if bgm_mode == "file":
             bp = (fx.get("bgm_path") or "").strip()
             if not bp:
-                raise HTTPException(400, "选了「用我自己的音乐」，但还没选音乐文件")
+                raise HTTPException(400, "选了「指定一首歌」，但还没选音乐文件")
             if not os.path.isfile(bp):
-                raise HTTPException(400, f"BGM 音乐文件不存在：{bp}")
+                raise HTTPException(400, "配乐文件找不到，请重新选")
             fx["bgm_path"] = bp
+        elif bgm_mode == "folder":
+            bd = (fx.get("bgm_dir") or "").strip()
+            if not bd:
+                raise HTTPException(400, "选了「从文件夹随机挑」，但还没选音乐文件夹")
+            if not os.path.isdir(bd):
+                raise HTTPException(400, "配乐文件夹找不到，请重新选")
+            if not bgmlib.list_dir_tracks(bd):
+                raise HTTPException(
+                    400, "这个音乐文件夹里没有能用的音频：支持 mp3 / m4a / aac / wav / flac / ogg / wma")
+            fx["bgm_path"] = ""   # 逐套解析后写进 run_sets_fx，不落库
         else:
             fx["bgm_path"] = ""   # 逐套解析后写进 run_sets_fx，不落库
     else:
@@ -1904,9 +2249,9 @@ def do_render_plans(pid: str, body: RenderPlansBody | None = None):
         ov = sets_fx[idx]
         if ov.get("bgm"):
             try:
-                ov["bgm_vol"] = min(0.6, max(0.05, float(ov.get("bgm_vol") or 0.22)))
+                ov["bgm_vol"] = min(0.6, max(0.05, float(ov.get("bgm_vol") or 0.35)))
             except (TypeError, ValueError):
-                ov["bgm_vol"] = 0.22
+                ov["bgm_vol"] = 0.35
     # 存进项目：下次打开页面还按这套设置显示，不用每次重新调。
     # 重读最新再改 plans[].fx——接口开头的 p 是旧快照，整份保存会擦掉
     # 并行产线刚写好的分镜/去字幕结果。
@@ -1918,21 +2263,35 @@ def do_render_plans(pid: str, body: RenderPlansBody | None = None):
                     pl["fx"] = cfg
         core.save_merge(latest, ["plans"])
 
-    # 自动配乐：逐套按自己的 AI 配乐建议到曲库选曲。解析出的本地路径只放进
-    # run_sets_fx 传给 batch，绝不写回项目——曲库缓存路径不该固化进项目文件。
+    # 配乐逐套解析（2026-11-18 起三种来源）：曲库 / 本地文件夹随机 / 指定单曲。
+    # 解析出的本地路径只放进 run_sets_fx 传给 batch，绝不写回项目——
+    # 曲库缓存路径和用户文件夹路径不该固化进项目文件。
     run_sets_fx = {k: dict(v) for k, v in sets_fx.items()}
     used_bgm: set[str] = set()
-    if fx.get("bgm") and fx.get("bgm_auto") is not False:
+    if fx.get("bgm"):
         for pl in chosen:
             idx = str(pl.get("index"))
             ov = run_sets_fx.setdefault(idx, {})
             if ov.get("bgm", True) is False:
                 continue                      # 这一套单独关了 BGM
-            if ov.get("bgm_auto", True) is False:
+            # 单套可以有自己的来源（sets_fx 里带 bgm_mode），否则跟全局走
+            m = str(ov.get("bgm_mode") or "").strip().lower()
+            if m not in ("auto", "folder", "file"):
+                m = "file" if ov.get("bgm_auto") is False else bgm_mode
+            if m == "file":
                 bp = (ov.get("bgm_path") or fx.get("bgm_path") or "").strip()
                 if not bp or not os.path.isfile(bp):
-                    raise HTTPException(400, f"第 {idx} 套选了「用我自己的音乐」，但还没选可用的音乐文件")
+                    raise HTTPException(400, f"第 {idx} 套选了「指定一首歌」，但还没选可用的音乐文件")
                 ov["bgm_path"] = bp
+                continue
+            if m == "folder":
+                bd = (ov.get("bgm_dir") or fx.get("bgm_dir") or "").strip()
+                try:
+                    got = bgmlib.pick_from_dir(bd, f"{pid}:{idx}", used_bgm)
+                except bgmlib.BgmError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                used_bgm.add(os.path.normcase(got["path"]))
+                ov["bgm_path"] = got["path"]
                 continue
             try:
                 got = bgmlib.resolve(
@@ -1959,7 +2318,8 @@ def do_render_plans(pid: str, body: RenderPlansBody | None = None):
         raise HTTPException(400, "还没有整理台词。出片这一步要按台词重做字幕，"
                                  "先去第 1 步「台词整理」做完")
     if not core.start_task(pid, "batch",
-                          lambda: batch.render_plans(pid, save_dir or None, fx, run_sets_fx)):
+                          lambda: batch.render_plans(pid, save_dir or None, fx, run_sets_fx,
+                                                     only=sorted(only_idx) if only_idx else None)):
         raise HTTPException(409, "这个项目已有任务在跑")
     if save_dir:
         root = os.path.abspath(os.path.expanduser(save_dir))
@@ -1988,7 +2348,7 @@ def transcript(pid: str, ep: int = 0, download: int = 0):
             # 和编辑器同一套无损格式：下载后再粘回来，时间码不会掉精度
             out.append(f"{i}. ({float(ln['start']):g}-{float(ln['end']):g}) {ln['text']}")
         out.append("")
-    text = "\n".join(out).strip() or "还没有转写文本"
+    text = "\n".join(out).strip() or "还没有整理好的台词"
     headers = {}
     if download:
         name = p["name"] + ("_台词" if not ep else f"_第{ep:02d}集台词") + ".txt"
@@ -2036,6 +2396,11 @@ def save_lines(pid: str, body: EditLines, request: Request):
     task = core.get_task(pid)
     if task and task.get("kind") == "transcribe":
         raise HTTPException(409, "正在自动整理台词，等这一步跑完再改")
+    # 直出项目额外保护：出片那批 ffmpeg 已经把台词读进内存/正在写盘，这会儿
+    # 手改会两边同时 save_merge，轻则改了不生效、重则把成片记录冲掉。
+    # 主项目（AI 出片）行为不变。
+    if task and p.get("direct") and task.get("kind") == "batch":
+        raise HTTPException(409, "正在出片，等这批改完再改台词")
     ep_i = int(body.ep or 0)
     by = {int(e.get("index") or 0): e for e in (p.get("episodes") or [])}
     if ep_i not in by:
@@ -2065,6 +2430,94 @@ def save_lines(pid: str, body: EditLines, request: Request):
                     payload={"ep": ep_i, "lines": len(lines), "line_total": total},
                     request=request, status_code=200)
     return {"ok": True, "ep": ep_i, "line_count": len(lines), "line_total": total}
+
+
+# ── 整剧台词校对（2026-11-19 改成整剧一次）─────────────────────────────────────
+# 转写 → 繁简 → 对时都在第 1 步自动完成；校对用户点一次，整剧一次喂给模型，
+# 出「人名归并 + 错字」两张清单，勾选才写回。只改文字，时间码一个字不动。
+# 逻辑见 app/proof.py。
+
+class ProofSuggestBody(BaseModel):
+    ep: int | None = None      # 直出场景指定「只校这一集」；不传则按项目类型分流
+
+
+class ProofApplyBody(BaseModel):
+    ep: int | None = None      # 直出场景只改这一集；不传则按项目类型分流
+    name_picks: list[int] | None = None
+    typo_picks: list[int] | None = None
+    drop_picks: list[int] | None = None       # 勾选要删掉的整行（纯杂音行）
+    standards: dict[str, str] | None = None   # 用户改过的人名标准写法 {组索引: 写法}
+
+
+@app.get("/api/projects/{pid}/proof")
+def proof_get(pid: str, request: Request, ep: int | None = None):
+    """只读已存的校对清单（打开台词弹窗/切集时用）。没有就返回空，绝不触发 AI。
+
+    直出场景传 ep 只取那一集；主项目不传，取整剧清单。
+    """
+    auth.current_user(request)
+    p = core.load(pid)
+    if not p:
+        raise HTTPException(404, "项目不存在")
+    return {"ok": True, **proof.read(pid, ep)}
+
+
+@app.post("/api/projects/{pid}/proof-suggest")
+def proof_suggest(pid: str, request: Request, body: ProofSuggestBody | None = None):
+    """出校对清单，不改任何台词。
+
+    直出项目不传 ep 时**每个视频各调一次**（互相独立的素材不能合并校对）；
+    主项目不传 ep 时整剧一次。台词没变不重复花钱。
+    """
+    me = auth.current_user(request)
+    task = core.get_task(pid)
+    if task and task.get("kind") in ("transcribe", "analyze_direct"):
+        raise HTTPException(409, "正在自动整理台词，等这一步跑完再检查")
+    ep = body.ep if body else None
+    try:
+        r = proof.suggest(pid, ep)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:  # noqa: BLE001 — 把 AI 接口的报错翻成人话
+        raise HTTPException(400, str(exc))
+    # 直出汇总返回 name_total/typo_total（数字）；单集/整剧返回 names/typos（列表）
+    n_names = r.get("name_total")
+    if n_names is None:
+        n_names = len(r.get("names") or [])
+    n_typos = r.get("typo_total")
+    if n_typos is None:
+        n_typos = len(r.get("typos") or [])
+    n_drops = r.get("drop_total")
+    if n_drops is None:
+        n_drops = len(r.get("drops") or [])
+    audit.log_event(me, "project.proof_suggest", target=audit.target_of(pid),
+                    payload={"ep": ep, "mode": r.get("mode") or "",
+                             "names": n_names, "typos": n_typos,
+                             "drops": n_drops,
+                             "cached": bool(r.get("cached"))},
+                    request=request, status_code=200)
+    return {"ok": True, **r}
+
+
+@app.post("/api/projects/{pid}/proof-apply")
+def proof_apply(pid: str, body: ProofApplyBody, request: Request):
+    """把勾选的改动写回台词。改字不动时间码；勾了「删除行」会连那一行的时间码一起删。
+
+    直出场景必须带 ep（只改那一集）；不带则按项目类型：直出逐集套自己那份清单，
+    主项目用整剧清单。
+    """
+    me = auth.current_user(request)
+    try:
+        r = proof.apply(pid, body.name_picks, body.typo_picks, body.standards,
+                        body.ep, body.drop_picks)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc))
+    audit.log_event(me, "project.proof_apply", target=audit.target_of(pid),
+                    payload={"ep": body.ep, "names": r.get("names", 0),
+                             "typos": r.get("typos", 0),
+                             "dropped": r.get("dropped", 0)},
+                    request=request, status_code=200)
+    return {"ok": True, **r}
 
 
 # ── 人名写法统一（2026-11-16）───────────────────────────────────────────────
@@ -2219,17 +2672,18 @@ def open_video(pid: str, set: int = 0):
 
             subprocess.Popen(["xdg-open", path])
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"打不开文件：{exc}") from exc
+        raise HTTPException(500, "打不开这个文件，请检查文件是否正常") from exc
     return {"ok": True, "path": path}
 
 
 @app.post("/api/pick-folder")
-def pick_folder(initial: str = "", key: str = "proj_out"):
+def pick_folder(initial: str = "", key: str = "proj_out", title: str = ""):
     """弹系统原生的「选择文件夹」对话框（本机工具才有的能力）。
     浏览器拿不到真实磁盘路径，所以由后端弹框、把选中的路径回给前端。
 
     起始位置优先级：前端传来的有效路径 → 上次在这个用途下确认的目录 → 系统默认。
-    key 区分用途（成片保存 / 两两合并），互不干扰。"""
+    key 区分用途（成片保存 / 两两合并 / 配乐文件夹），互不干扰。
+    title 让不同用途显示对的标题（选配乐文件夹时别写「选择成片保存位置」）。"""
     import threading
 
     from . import nativedlg, pickmem
@@ -2240,7 +2694,7 @@ def pick_folder(initial: str = "", key: str = "proj_out"):
     def _pick():
         try:
             init = initial if initial and os.path.isdir(initial) else pickmem.recall_dir(key)
-            result["path"] = nativedlg.pick_folder("选择成片保存位置", init)
+            result["path"] = nativedlg.pick_folder(title.strip() or "选择成片保存位置", init)
         except Exception as exc:  # noqa: BLE001
             err["msg"] = str(exc)
 
@@ -2289,6 +2743,44 @@ def pick_file(initial: str = "", key: str = ""):
     return {"ok": True, "path": result["path"].replace("\\", "/")}
 
 
+@app.post("/api/pick-videos")
+def pick_videos(initial: str = "", key: str = "direct_src_video"):
+    """选视频直接出片专用：弹原生「选择视频」对话框，只列视频、可多选。
+
+    为什么不给 /api/pick-file 加个 multi 参数凑合（2026-11-18）：那个接口
+    写死了音频过滤器（mp3/m4a…）+ 单选对话框，是给 BGM/LUT 用的。直出从这里
+    选视频时，进到文件夹视频全被过滤器藏起来、还只能选一个——用户反馈
+    「文件夹里明明有视频却不显示」。所以单独开一个口：视频过滤器 + 多选对话框
+    （nativedlg.pick_files 已是现成的批量发布多选实现），和老接口互不干扰。
+    """
+    import threading
+
+    from . import nativedlg, pickmem
+
+    result: dict = {"paths": []}
+    err: dict = {}
+
+    def _pick():
+        try:
+            init = initial if initial and os.path.isdir(initial) else pickmem.recall_dir(key)
+            result["paths"] = nativedlg.pick_files(
+                "选择视频（可按住 Ctrl / Shift 多选）", init,
+                filetypes=[("视频文件", "*.mp4 *.mov *.mkv"),
+                           ("所有文件", "*.*")])
+        except Exception as exc:  # noqa: BLE001
+            err["msg"] = str(exc)
+
+    t = threading.Thread(target=_pick, daemon=True)
+    t.start()
+    t.join(timeout=300)
+    if err:
+        raise HTTPException(500, f"弹不出选择框（{err['msg']}），可以改用「选择文件夹」")
+    paths = [str(x).replace("\\", "/") for x in result["paths"] if x]
+    if paths:
+        pickmem.remember(key, paths[0], False)
+    return {"ok": bool(paths), "paths": paths}
+
+
 @app.get("/api/pick-history")
 def pick_history(key: str, limit: int = 3):
     """界面「最近用过」用：返回这个用途下最近确认过、且目录还在的路径。"""
@@ -2308,9 +2800,9 @@ class MergeBody(BaseModel):
 def merge_preview(body: MergeBody):
     """开跑前的确认单：两边各有哪些视频、共组合出多少条。"""
     if not body.a or not os.path.isdir(body.a):
-        raise HTTPException(400, f"第一个文件夹不存在：{body.a}")
+        raise HTTPException(400, "第一个文件夹找不到，请重新选")
     if not body.b or not os.path.isdir(body.b):
-        raise HTTPException(400, f"第二个文件夹不存在：{body.b}")
+        raise HTTPException(400, "第二个文件夹找不到，请重新选")
     return vmerge.preview(body.a, body.b)
 
 
@@ -2344,12 +2836,23 @@ def merge_open():
 
 
 @app.post("/api/projects/{pid}/open-folder")
-def open_folder(pid: str):
-    """在资源管理器里打开这个项目的成片目录（<保存位置>/<项目名>）。"""
+def open_folder(pid: str, dir: str = ""):
+    """在资源管理器里打开这个项目的成片目录（<保存位置>/<项目名>）。
+
+    dir：可选，调用方当前输入框里的保存位置。出片中途用户可能改了路径还没落盘，
+    传进来就能打开「实际保存到」提示的那个目录；不传就沿用项目里存的位置。
+    只用来算要打开的目录，不写回项目（不改出片设置）。
+    """
     p = core.load(pid)
     if not p:
         raise HTTPException(404, "项目不存在")
-    target = core.batch_out_dir(p)
+    picked = (dir or "").strip()
+    if picked:
+        probe = dict(p)
+        probe["batch"] = dict((p.get("batch") or {}), save_dir=picked)
+        target = core.batch_out_dir(probe)
+    else:
+        target = core.batch_out_dir(p)
     os.makedirs(target, exist_ok=True)
     try:
         if os.name == "nt":
@@ -2359,5 +2862,187 @@ def open_folder(pid: str):
 
             subprocess.Popen(["xdg-open", target])
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"打不开文件夹：{exc}") from exc
+        raise HTTPException(500, "打不开这个文件夹，请检查位置是否还在") from exc
     return {"ok": True, "path": target}
+
+
+# ── 选视频直接出片（2026-11-17）───────────────────────────────────────────
+# 独立入口，内部是一个打了 direct 标记的 batch 项目，复用转写/导入/检测/
+# 对时/出片的全套现成链路。直出项目不进左侧项目列表，只在这个面板里管。
+class DirectCreateBody(BaseModel):
+    paths: list[str] = []
+    name: str = ""
+
+
+class DirectReuseBody(BaseModel):
+    pid: str = ""
+
+
+class DirectEpisodeBody(BaseModel):
+    index: int = 0
+
+
+def _direct_or_404(pid: str) -> dict:
+    p = core.load(pid)
+    if not p or not direct.is_direct(p):
+        raise HTTPException(404, "直出项目不存在")
+    return p
+
+
+@app.post("/api/direct/create")
+def direct_create(body: DirectCreateBody, request: Request):
+    """选一个或多个视频/文件夹，建直出项目并自动开始转写。"""
+    me = auth.current_user(request)
+    try:
+        p = direct.create(body.paths, body.name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    audit.log_event(me, "direct.create", target=f"project:{p['id']}",
+                    payload={"name": p["name"], "episodes": len(p["episodes"]),
+                             "paths": body.paths}, request=request, status_code=200)
+    return p
+
+
+@app.get("/api/direct/list")
+def direct_list():
+    """列出所有直出项目（最新在前），给面板「最近用过」用。"""
+    rows = []
+    for pid in os.listdir(core.PROJECTS):
+        p = core.load(pid)
+        if not p or not direct.is_direct(p):
+            continue
+        rows.append({
+            "id": p["id"], "name": p["name"],
+            "created_at": p.get("created_at") or 0,
+            "episodes": len(p.get("episodes") or []),
+            "task": core.get_task(p["id"]),
+        })
+    rows.sort(key=lambda r: -(r.get("created_at") or 0))
+    return rows[:8]
+
+
+@app.get("/api/direct/{pid}")
+def direct_get(pid: str):
+    p = _direct_or_404(pid)
+    # 直出面板靠 task 显示「正在整理第几集 / 百分之多少」并决定要不要继续轮询。
+    # 以前这里直接把 project.json 原样返回，而进度只存在 core 的内存槽里、不落盘，
+    # 于是页面永远读到 task=None：进度条不显示、轮询第一轮就停、卡在「0/N 等待」。
+    # 和主项目 /api/projects/{pid} 一样，读的时候把内存里的任务状态附上去。
+    p["task"] = core.get_task(pid)
+    return p
+
+
+@app.post("/api/direct/{pid}/open-source")
+def direct_open_source(pid: str, body: DirectEpisodeBody):
+    """用系统默认播放器打开选中的原视频（只认本项目里的文件，不接受任意路径）。
+
+    跨目录多选的项目会把素材复制进直出素材目录，这里打开的就是实际出片用的那份。
+    """
+    p = _direct_or_404(pid)
+    ep = next((e for e in (p.get("episodes") or [])
+               if int(e.get("index") or 0) == int(body.index)), None)
+    if not ep:
+        raise HTTPException(404, "项目里没有这个视频")
+    path = os.path.join(p["src_dir"], str(ep.get("file") or ""))
+    if not os.path.isfile(path):
+        raise HTTPException(404, "这个视频已经不在原来的位置了")
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # noqa: S606 —— 本机工具，打开用户自己选的视频
+        else:
+            import subprocess
+
+            subprocess.Popen(["xdg-open", path])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, "打不开这个视频，检查一下有没有装播放器") from exc
+    return {"ok": True, "path": path}
+
+
+@app.post("/api/direct/{pid}/remove-episode")
+def direct_remove_episode(pid: str, body: DirectEpisodeBody, request: Request):
+    """从这次出片里移除一个视频：只清项目记录，不删磁盘上的原视频和成片。"""
+    me = auth.current_user(request)
+    try:
+        p = direct.remove_episode(pid, body.index)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    audit.log_event(me, "direct.remove_episode", target=f"project:{pid}",
+                    payload={"index": body.index,
+                             "episodes": len(p.get("episodes") or [])},
+                    request=request, status_code=200)
+    return p
+
+
+@app.post("/api/direct/{pid}/reselect")
+def direct_reselect(pid: str, body: DirectCreateBody, request: Request):
+    """重选素材：换视频、清台词/检测/成片，重新转写。"""
+    me = auth.current_user(request)
+    try:
+        p = direct.reselect(pid, body.paths)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    audit.log_event(me, "direct.reselect", target=f"project:{pid}",
+                    payload={"episodes": len(p["episodes"]), "paths": body.paths},
+                    request=request, status_code=200)
+    return p
+
+
+@app.post("/api/direct/{pid}/analyze")
+def direct_analyze(pid: str):
+    """识别每集字幕区域并按原片字幕对齐台词时间（后台任务）。"""
+    p = _direct_or_404(pid)
+    if not core.start_task(pid, "analyze_direct", lambda: direct.analyze(pid)):
+        raise HTTPException(409, "这个项目已有任务在跑，等它跑完再试")
+    return {"ok": True}
+
+
+@app.post("/api/direct/{pid}/render")
+def direct_render(pid: str, request: Request, body: RenderPlansBody | None = None):
+    """出片：每个视频一条成片，现场换字幕 + 套画面设置。
+
+    复用出片接口 do_render_plans（BGM 解析、单条失败隔离、进度、成片列表全现成），
+    只在这里补直出专属的前置校验，并强制 src_ver=live。
+    """
+    me = auth.current_user(request)
+    try:
+        p, fx = direct.ready_to_render(pid)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # 「一个视频出几份」（2026-11-18）：份数变了就重建计划——多份时每份是独立的
+    # 套编号，出片的随机种子按编号算，这样几份的画面/镜像/调色/字幕动效才不一样。
+    want = 0
+    if body is not None:
+        try:
+            want = int(body.copies or 0)
+        except (TypeError, ValueError):
+            want = 0
+    p = _apply_direct_copies(pid, p, want)
+    # 直出面板的画面设置走请求体传进来（readFx("d-")），这里必须真的用上：
+    # 以前只用 ready_to_render 从 fx_default 取的默认，前端改的「全自动随机开关 /
+    # 调色 / 字幕样式」全被忽略，随机其实一直靠 RenderFx 缺省兜底。
+    # 只覆盖前端显式设过的字段（pydantic v1/v2 兼容写法），别把缺省值盖到项目上；
+    # src_ver 仍由直出场景强制 live，不接受前端覆盖。
+    if body and body.fx:
+        sent = getattr(body.fx, "model_fields_set",
+                       getattr(body.fx, "__fields_set__", None)) or set()
+        dumped = body.fx.model_dump() if hasattr(body.fx, "model_dump") else body.fx.dict()
+        for k in sent:
+            if k == "src_ver":
+                continue
+            fx[k] = dumped.get(k)
+    fx["src_ver"] = "live"
+    fx_model = RenderFx(**fx)
+    rb = RenderPlansBody(
+        save_dir=((body.save_dir if body else "") or "").strip(),
+        fx=fx_model,
+        sets_fx=(body.sets_fx if body else None),
+    )
+    result = do_render_plans(pid, rb)
+    audit.log_event(me, "direct.render", target=f"project:{pid}",
+                    payload={"episodes": len(p.get("episodes") or [])},
+                    request=request, status_code=200)
+    return result

@@ -91,11 +91,11 @@ def parse(raw: str) -> tuple[list[tuple[str, str]], list[str]]:
             if not w:
                 continue
             if w == good:
-                bad.append(f"第 {ln} 行左右一样（{w}），已跳过")
+                bad.append(f"第 {ln} 行左右一样（{w}），已忽略")
                 continue
             if w in good:
                 # 例：清棠 = 顾清棠 —— 每替换一次文本就变长，会把整篇台词改烂
-                bad.append(f"第 {ln} 行「{w}」是「{good}」的一部分，会把名字越替越长，已跳过")
+                bad.append(f"第 {ln} 行「{w}」是「{good}」的一部分，会把名字越替越长，已忽略")
                 continue
             pairs.append((w, good))
     # 长的先替换：表里同时有「顾清唐」和「清唐」时，整词先被换掉，短规则不会再切一半

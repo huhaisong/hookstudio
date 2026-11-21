@@ -111,7 +111,7 @@ def set_role(uid: int, body: RoleBody, request: Request):
     me = auth.require_admin(request)
     role = (body.role or "").strip()
     if role not in ("user", "admin"):
-        raise HTTPException(400, "角色只能是 user 或 admin")
+        raise HTTPException(400, "角色只能是普通用户或管理员")
     row = _admin_row(uid)
     if row["role"] == role:
         return {"ok": True, "user": _admin_view(row)}

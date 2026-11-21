@@ -149,7 +149,12 @@ def sig_of(cfg: dict, episodes: list[dict] | None = None,
         for ln in (e.get("lines") or []):
             h.update(f"{ln.get('start')}|{ln.get('end')}|{ln.get('text')}\n"
                      .encode("utf-8", "replace"))
-    return f"{base}|{h.hexdigest()[:10]}"
+    # |S1 是**烧字口径**版本（2026-11-19：一条超过 15 字就按标点拆成几条上屏）。
+    # 特意只加在带台词的这一版里：settings 指纹（cfg_sig，前端比对 + 副本复用判定）
+    # 到上面就 return 了、不含它，所以前端不会误报「副本设置变了」；而出片的
+    # ver_sig 用的是带台词这版（batch.py 里 ns.sig + burn_sig / live+sig_of(cfg,eps)），
+    # 含它 → 旧成片判过期重渲，不会拿旧观感的片子充数。
+    return f"{base}|{render.CAP_VER}|{h.hexdigest()[:10]}"
 
 
 def _out_name(ep: dict) -> str:
@@ -296,7 +301,7 @@ def _encode(src: str, dst: str, graph: str, duration: float,
                 os.remove(part)
             except OSError:
                 pass
-    raise RuntimeError(f"这一集处理失败：{last[-300:].strip() or '未知原因'}")
+    raise RuntimeError("这一集处理失败，请重试")
 
 
 def _detect_key(p: dict, episodes: list[dict]) -> str:
@@ -351,7 +356,7 @@ def _detect(p: dict, episodes: list[dict], on_msg=None, force: bool = False) -> 
 
 
 def _spans(p: dict, episodes: list[dict], band: dict | None = None,
-           on_msg=None, force: bool = False) -> dict:
+           on_msg=None, force: bool = False) -> tuple[dict, list[str]]:
     """逐集量「字幕实际出现的矩形」（宽高都贴合字），按素材指纹缓存。
 
     跟 _detect 的分工：_detect 只量「整部剧的那一条」（给滑杆用），
@@ -367,13 +372,18 @@ def _spans(p: dict, episodes: list[dict], band: dict | None = None,
     key = _detect_key(p, episodes)
     old = prev.get("spans") or {}
     if not force and old.get("key") == key and isinstance(old.get("by_ep"), dict):
-        return old["by_ep"]
+        # 两处调用（run / ensure_spans）都按 (by_ep, fails) 二元组解包，
+        # 命中缓存也必须返回同样的形状——只返回 by_ep 会让解包炸成
+        # `too many values to unpack (expected 2)`（2026-11-19 实测，40 集全缓存时必现）。
+        return old["by_ep"], []
     out: dict[str, dict] = {}
+    fails: list[str] = []          # 2026-11-18 C：逐集识别失败要可见，不再静默吞掉
     total = len(episodes)
     for i, e in enumerate(episodes):
         fname = str(e.get("file") or "")
         src = os.path.join(p["src_dir"], fname)
         if not os.path.isfile(src):
+            fails.append(f"第 {i + 1} 集找不到视频文件")
             continue
         if on_msg:
             on_msg(f"正在识别字幕区域 {i + 1}/{total}…")
@@ -393,12 +403,17 @@ def _spans(p: dict, episodes: list[dict], band: dict | None = None,
             except Exception:  # noqa: BLE001
                 b = band
             r = subdetect.detect_spans(src, dur, b)
-        except Exception:  # noqa: BLE001 —— 单集识别失败就退回整条替换
+        except Exception as exc:  # noqa: BLE001 —— 单集失败只记这一集、继续
+            fails.append(f"第 {i + 1} 集：{str(exc)[:80] or type(exc).__name__}")
             continue
         if r and r.get("spans"):
             out[fname] = {"spans": r["spans"], "union": r["union"],
                           "count": r["count"], "band": b}
-    return out
+        else:
+            # 没抛异常但一句都没框出（真的没字幕 / 画面太亮）：也算「没量到」，
+            # 出片会退回固定位置抹除，得让用户知道这一集不是精准抹的。
+            fails.append(f"第 {i + 1} 集没框出字幕区域，出片时用固定位置抹除")
+    return out, fails
 
 
 def ensure_spans(pid: str, on_msg=None) -> dict:
@@ -425,12 +440,14 @@ def ensure_spans(pid: str, on_msg=None) -> dict:
     old_d = st.get("detect") or {}
     old_s = st.get("spans") or {}
     need_d = not (old_d.get("key") == key and old_d.get("pos"))
-    need_s = not (old_s.get("key") == key
-                  and isinstance(old_s.get("by_ep"), dict)
-                  and bool(old_s.get("by_ep")))
+    # 缓存命中条件：by_ep 非空（量到了字），或上次虽没量到但已记下失败（fail 字段在），
+    # 两者都算「这批检测跑过」。否则全片真没字幕的项目每次出片都会重扫一遍。
+    done_before = (isinstance(old_s.get("by_ep"), dict)
+                   and (bool(old_s.get("by_ep")) or "fail" in old_s))
+    need_s = not (old_s.get("key") == key and done_before)
     if not (need_d or need_s):
         return {"cfg": st.get("cfg") or cfg, "detect": old_d,
-                "by_ep": old_s.get("by_ep") or {}}
+                "by_ep": old_s.get("by_ep") or {}, "fail": old_s.get("fail") or []}
 
     # 位置变了，逐句窗口也得重算——两个一起强制，别留下「新位置 + 旧窗口」的混合态
     detect = _detect(p, eps, on_msg=on_msg, force=True)
@@ -441,12 +458,18 @@ def ensure_spans(pid: str, on_msg=None) -> dict:
                        0.50, detect["pos"] + detect["size"] / 2.0)), 4))
     band = detect if detect.get("pos") else {
         "pos": cfg["pos"], "size": cfg["size"], "fill": cfg["fill"]}
-    by_ep = _spans(p, eps, band, on_msg=on_msg, force=True)
-    st.update({"detect": detect, "spans": {"key": key, "by_ep": by_ep},
-               "cfg": cfg})
+    by_ep, fails = _spans(p, eps, band, on_msg=on_msg, force=True)
+    span_cache = {"key": key, "by_ep": by_ep}
+    if fails:                      # C：失败集落盘，界面能显示「哪几集是固定位置抹的」
+        span_cache["fail"] = fails
+        if on_msg:
+            on_msg(f"有 {len(fails)} 集没量到字幕区域，出片时会用固定位置抹除")
+        print(f"[nosub] 字幕区域识别失败 {len(fails)} 集：{'；'.join(fails[:5])}",
+              flush=True)
+    st.update({"detect": detect, "spans": span_cache, "cfg": cfg})
     p["nosub"] = st
     core.save_merge(p, ["nosub"])
-    return {"cfg": cfg, "detect": detect, "by_ep": by_ep}
+    return {"cfg": cfg, "detect": detect, "by_ep": by_ep, "fail": fails}
 
 
 def run(pid: str) -> None:
@@ -486,32 +509,20 @@ def run(pid: str) -> None:
     # 逐集量「字幕实际占的矩形」：只有柔和抹掉需要（裁掉是整帧变换，没有局部可留）。
     # 放在 sig 之前不要紧——它的结果由素材内容决定，不进参数指纹。
     spans_by_ep: dict[str, dict] = {}
+    span_fails: list[str] = []
     if cfg["mode"] == "soft":
         band = detect if detect.get("pos") else {
             "pos": cfg["pos"], "size": cfg["size"], "fill": cfg["fill"]}
-        spans_by_ep = _spans(p, episodes, band,
-                             on_msg=lambda m: core.set_task(pid, "nosub", 0.5, m))
+        spans_by_ep, span_fails = _spans(
+            p, episodes, band,
+            on_msg=lambda m: core.set_task(pid, "nosub", 0.5, m))
+        if span_fails:
+            print(f"[nosub] 字幕区域识别失败 {len(span_fails)} 集："
+                  f"{'；'.join(span_fails[:5])}", flush=True)
 
-    # 字幕时间按原片对齐（2026-11-16 用户定：不再单独点一次按钮）。
-    # 放在这里是因为「尺子」——每集每条字幕的真实出现时刻——刚量完，正好能用；
-    # 台词时间当场排准，同一趟编码直接烧上去，不用先跑一遍拿位置、再校正、再跑。
-    # 前面的 _spans 本来就要扫，所以这一步只多花「词级对齐」的时间（有缓存时几秒）。
-    if cfg.get("retime") and spans_by_ep:
-        from . import retime
-        stat = retime.apply_to(
-            p, spans_by_ep,
-            on_msg=lambda i, n, ep: core.set_task(
-                pid, "nosub", i / max(1, n) * RETIME_PCT,
-                f"对齐第 {ep['index']} 集字幕时间（{i + 1}/{n}）"))
-        if stat["fixed"] or stat["skipped"]:
-            # skipped 也要落盘：老项目只有「原始时间备份」、没有尺子指纹，
-            # 补上指纹才不会每次都判成「没对过」。
-            core.save_merge(p, ["episodes"])
-            print(f"[nosub] 字幕时间已按原片对齐 {stat['fixed']} 集"
-                  f"（本来就对过的 {stat['skipped']} 集跳过）", flush=True)
-        if stat["errors"]:
-            print(f"[nosub] 这几集台词对不上原片字幕，时间没动：{stat['errors']}",
-                  flush=True)
+    # 字幕时间对齐已挪到第 1 步转写末尾（2026-11-19 用户定）——
+    # 转写完紧接着按原片字幕对齐，台词一出来时间就是准的。这里只抹画面，不再动时间码。
+    # spans_by_ep 照样要量（抹字幕要用），但它命中第 1 步存的缓存，不重复扫。
 
     # 副本只负责「把原字幕抹干净」（2026-11-16 用户定，见 REFERENCE「抹一次多套复用」）。
     # 指纹因此只算填充/位置/柔和度，**不算字幕样式和台词**——改了字幕动效或台词，
@@ -540,10 +551,13 @@ def run(pid: str) -> None:
     # 一开始就写 False 的话，跑到一半崩了/被中止，项目里就记着「底片是干净的」，
     # 而磁盘上还有一堆旧的带字副本，出片不会拦，结果叠出两层字。
     # 所以先沿用上一次的结论（第一次做 → 当作带字），全部做完才改成 False。
+    span_cache_out = {"key": _detect_key(p, episodes), "by_ep": spans_by_ep}
+    if span_fails:
+        span_cache_out["fail"] = span_fails
     state = {"sig": sig, "burn_sig": burn_sig,
              "burned": bool(prev["burned"]) if "burned" in prev else True,
              "cfg_sig": sig_of(cfg), "cfg": cfg, "detect": detect,
-             "spans": {"key": _detect_key(p, episodes), "by_ep": spans_by_ep},
+             "spans": span_cache_out,
              "files": files, "errors": errors,
              "retime": bool(cfg.get("retime")),
              "total": total, "updated": ""}

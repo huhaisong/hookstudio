@@ -1507,7 +1507,7 @@ def shots_run(pid: str, count: int, duration: int, aspect: str = "9:16",
         return
     script = (script or "").strip()
     if not script and not (p.get("episodes") or []):
-        raise RuntimeError("还没有转写结果，请先转写；或者在「素材来源」里选「我自己提供剧情素材」并粘贴素材")
+        raise RuntimeError("还没有整理好的台词，请先整理台词；或者在「素材来源」里选「我自己提供剧情素材」并粘贴素材")
     count = max(1, min(10, count))
     duration = 60 if int(duration) >= 60 else (30 if int(duration) >= 30 else 15)
     # 段长只能是 15 / 30；整条比段还短（15 秒整条 + 30 秒段）就退回 15，
@@ -1528,7 +1528,7 @@ def shots_run(pid: str, count: int, duration: int, aspect: str = "9:16",
     # 4 字串比对不该被「12. (16.1-18.4)」这些前缀干扰。
     text = script or analyze._all_text(p, plain=True)
     if not text.strip():
-        raise RuntimeError("这个项目还没有转写结果，读不到台词；请先转写，或改用「我自己提供剧情素材」")
+        raise RuntimeError("这个项目还没有整理好的台词；请先整理台词，或改用「我自己提供剧情素材」")
     conc_cap = core.max_concurrent()      # 一次读、整批用，中途改设置不影响这一批
     core.set_task(pid, "shots", 8,
                   f"整理{'剧情素材' if script else '台词'}（{len(text)} 字），组装创作提示词")

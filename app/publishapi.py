@@ -474,7 +474,7 @@ def add_account(body: AccountBody, request: Request):
 
 
 @router.post("/api/publish/accounts/{aid}/login")
-def account_login(aid: str, request: Request, force: bool = False):
+def account_login(aid: str, request: Request, force: bool = False, reopen: bool = False):
     """把这个号的登录页在**可见浏览器窗口**里弹出来（2026-11-14 用户定：
     登录一律弹窗口手动做，界面里不再显示二维码——平台登录页自带快捷登录卡、
     换码、过期刷新，用户对着真窗口比自己截一张码清楚得多）。
@@ -482,12 +482,14 @@ def account_login(aid: str, request: Request, force: bool = False):
     `force=1`：「重登」= 换一个微信登录。先把浏览器里上一次的登录态清掉再开
     登录页；不清的话平台快捷登录卡一键就把旧微信又登回来了，界面看上去就是
     「点了重登没反应」（2026-11-13 用户反馈）。
+    `reopen=1`：「再开一次窗口」= 上一个窗口被用户关了，强制起一个全新可见窗口，
+    不复用残留的空白标签页（2026-11-16 修复「再开一次没反应」）。
     """
     _require(request)
     if not publisher.get_account(aid):
         raise HTTPException(404, "这个账号已经不在了")
     try:
-        r = wxbot.session(aid).open_login(force=force)
+        r = wxbot.session(aid).open_login(force=force, reopen=reopen)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, _wx_msg(exc)) from exc
     if force:
@@ -495,6 +497,15 @@ def account_login(aid: str, request: Request, force: bool = False):
         # 别还挂着「已登录」骗用户。
         publisher.update_account(aid, state="pending",
                                  last_check=publisher.fmt(publisher.now()))
+    if r.get("logged_in"):
+        # 开窗口的途中登录已经续上了（残留标签页或刚好被别的流程救活）。
+        # 前端拿到 logged_in=true 会直接收摊（loginDone），**不会再轮询
+        # login-state**，所以这里必须顺手把号坐实成 online——否则状态就卡在
+        # 上一个值（expired/pending）永远不动（2026-11-16 用户报：大海登录
+        # 成功了状态却不更新）。
+        publisher.mark_online(aid, wx_name=r.get("wx_name") or "",
+                              avatar=r.get("avatar") or "")
+        _fill_profile_async(aid, force=True)
     return {"logged_in": bool(r.get("logged_in"))}
 
 
@@ -506,39 +517,87 @@ def accounts_state(request: Request):
     （页面刷新、轮询被打断、浏览器崩了），库里就永远停在「待扫码」，
     而实际早就登录好了——用户看到的就是「明明登录了还说要扫码」。
     打开页面时对一次账，这条路就通了。
+
+    两类号分开查：
+      · pending / unknown / expired —— 每次都查（轻量 state()，不导航）。
+        它们本该被纠正成 online，查到就坐实。
+      · online —— 也要定期复查，但要 hard 真导航 + 节流。为什么不能跳过：
+        会话被平台静默踢下线后（不切号、页面一直开着），本地 state 仍停在
+        online，旧标签页残留会把轻量 state() 也骗过去。所以每隔
+        ONLINE_RECHECK_GAP 用 hard 真导航核对一次，识破「假已登录」。
+        节流是必须的：本接口每 45 秒被前端调一次，对每个 online 号都硬导航
+        会反复起浏览器、还可能顶掉正在扫码的窗口。
     """
     me = _require(request)
     fixed = []
+    now_ts = time.time()
     for acc in publisher.load_accounts():
         aid = acc.get("id")
         if not aid:
             continue
         st = (acc.get("state") or "")
-        # 只查「还没坐实」的那几类：pending / unknown / expired。
-        # 已经是 online 的不去碰 —— 每开一次页面都要起一个浏览器，
-        # 对着好账号反复查纯属浪费，还可能把正在扫码的窗口顶掉。
+        if st == "online":
+            # online 号定期 hard 复查（节流），揪出被平台静默踢掉的假 online。
+            # 正在可见窗口（用户扫码/看着）的号跳过——导航会把窗口顶掉。
+            # 正在发布（有 queued/publishing 任务）的号也跳过——导航会搅乱上传。
+            if now_ts - _ONLINE_RECHECK.get(aid, 0) < ONLINE_RECHECK_GAP:
+                continue
+            try:
+                sess = wxbot.session(aid)
+                if sess.is_visible():
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            if _account_busy(aid):
+                continue
+            _ONLINE_RECHECK[aid] = now_ts
+            try:
+                s = wxbot.session(aid).state(hard=True)
+            except Exception:  # noqa: BLE001  对账失败不是致命错，跳过这个号
+                continue
+            if not s.get("logged_in"):
+                publisher.mark_expired(aid)
+                fixed.append({"id": aid, "from": "online",
+                              "wx_name": acc.get("wx_name") or ""})
+            continue
         if st not in ("pending", "unknown", "expired"):
             continue
+        # expired 号坐实成 online 必须 hard 真导航（2026-11-16 用户报：没登录的
+        # 「狼王华少」切个号就变「已登录」，过一会又变回「登录过期」——来回横跳）。
+        # 根因：轻量 state() 会被浏览器 profile 里残留的旧「后台页」标签骗过去
+        # （地址栏停在 /platform 不含 /login、登录墙的二维码框还没挂出来、残留 DOM
+        # 还带着昵称元素），把「没登录」误报成「已登录」。只有 hard 真导航一次，
+        # cookie 死了会被弹回登录墙、二维码框挂出来，才能识破。
+        # pending / unknown 保持轻量：它们可能是刚扫完码、正等着坐实，hard 导航
+        # 会把正在进行的登录顶掉。
+        want_hard = (st == "expired")
+        # expired 号也别每 45 秒就 hard 导航一次：加节流，反复开浏览器没意义。
+        # 但用比 online 复查短得多的节流（60 秒）——登录成功是重要事件，得及时坐实。
+        if want_hard:
+            if now_ts - _EXPIRED_RECHECK.get(aid, 0) < EXPIRED_RECHECK_GAP:
+                continue
+            try:
+                if wxbot.session(aid).is_visible():
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            if _account_busy(aid):
+                continue
+            _EXPIRED_RECHECK[aid] = now_ts
         try:
-            s = wxbot.session(aid).state()
+            s = wxbot.session(aid).state(hard=want_hard)
         except Exception:  # noqa: BLE001  对账失败不是致命错，跳过这个号
             continue
         if s.get("logged_in"):
-            now = publisher.fmt(publisher.now())
-            patch = {"state": "online", "last_check": now, "last_ok": now}
-            if s.get("wx_name"):
-                patch["wx_name"] = s["wx_name"][:30]
-            if s.get("avatar"):
-                patch["avatar"] = s["avatar"]
-            publisher.update_account(aid, **patch)
+            publisher.mark_online(aid, wx_name=s.get("wx_name") or "",
+                                  avatar=s.get("avatar") or "")
             fixed.append({"id": aid, "from": st,
-                          "wx_name": patch.get("wx_name") or acc.get("wx_name") or ""})
+                          "wx_name": (s.get("wx_name") or acc.get("wx_name") or "")})
             # 对账把号坐实成 online = 登录这回事刚被证实，号资料也重新拉一遍
             # （2026-11-14 用户定：每次登录之后都重取，别拿旧昵称/旧 ID）。
             _fill_profile_async(aid, force=True)
         elif st == "expired":
-            publisher.update_account(aid, state="expired",
-                                     last_check=publisher.fmt(publisher.now()))
+            publisher.mark_expired(aid)
     # 只有「真的把状态改过来了」才留一条日志。
     # 每次开页都调一次这个接口，如果每次都记，后台日志全是「查了一下没变化」，
     # 真正有意义的那条（扫完码但前端没赶上，程序自己纠正的）反而被淹掉。
@@ -553,11 +612,12 @@ def accounts_state(request: Request):
 
 @router.get("/api/publish/accounts/{aid}/login-state")
 def account_login_state(aid: str, request: Request, diag: int = 0, hard: int = 0):
-    """前端每 2 秒问一次。登录成功后把微信昵称/头像写回账号并置 online。
+    """前端登录轮询每 10 秒问一次。登录成功后把微信昵称/头像写回账号并置 online。
 
     `?hard=1`：对「看着像登录」的旧标签页做一次真导航验证（2026-11-14 加）。
-    读取候选失败后前端用它对账——旧标签页会把死会话误报成已登录，不真导航
-    一次就永远查不出「账号卡亮着已登录、实际每个读取都撞登录墙」这种局。
+    登录轮询用它防残留标签页把死会话误报成已登录。后端 `_state(hard=True)`
+    对「登录确认进行中」（oauth 回调/二维码框还挂着）会放行不导航，所以每 10 秒
+    的轮询不会把正在扫码的窗口顶掉。
     `?diag=1` 时额外返回浏览器内部状态（有哪些标签、停在哪个网址、帧列表）。
     登录失败时外面只能看到 `logged_in: false`，分不清「窗口被关了」「停在别的
     页上」「微信拦了自动化」，没有这个就只能猜。
@@ -567,21 +627,27 @@ def account_login_state(aid: str, request: Request, diag: int = 0, hard: int = 0
     if not acc:
         raise HTTPException(404, "这个账号已经不在了")
     try:
-        st = wxbot.session(aid).state(hard=bool(hard))
+        acc_state = (acc.get("state") or "")
+        # 这个接口被两类场景共用：① 登录轮询（新号/重登= pending、过期号自动
+        # 弹窗= expired），目的是「用户扫成功了没」；② 切号验号/失败兜底
+        # （号是 online），目的是「识破假已登录」。
+        # 只有 online 才允许 hard 真导航。pending/unknown/expired 一律轻量：
+        # 刚扫完码已经进了后台 SPA，hard 导航会在冷加载那几秒把登录态判丢，
+        # 号就永远卡在待登录（2026-11-18 用户报：浏览器历史已 oauth 回调进
+        # post/list，账号库 last_check 却一直是空的）。这类号「识破假登录」
+        # 的职责交给对账接口 accounts_state（它带节流且跳过可见窗口号），
+        # 不在登录轮询里顶正在进行的扫码。
+        use_hard = bool(hard) and acc_state == "online"
+        st = wxbot.session(aid).state(hard=use_hard)
     except Exception as exc:  # noqa: BLE001
         return {"logged_in": False, "error": _wx_msg(exc),
                 "account": publisher.public_accounts()}
     if st.get("logged_in"):
-        now = publisher.fmt(publisher.now())
         was_online = (acc.get("state") or "") == "online"
-        patch = {"state": "online", "last_check": now, "last_ok": now}
-        if st.get("wx_name"):
-            patch["wx_name"] = st["wx_name"][:30]
-        if st.get("avatar"):
-            patch["avatar"] = st["avatar"]
-        acc = publisher.update_account(aid, **patch)
+        acc = publisher.mark_online(aid, wx_name=st.get("wx_name") or "",
+                                    avatar=st.get("avatar") or "")
         # 昵称/头像上面已按这次读到的覆盖；视频号 ID/粉丝数要从 auth_data 拉 →
-        # 后台补一次（不堵这个 2 秒轮询）。2026-11-14 用户定：**每次登录之后都
+        # 后台补一次（不堵这个轮询）。2026-11-14 用户定：**每次登录之后都
         # 重新拉一遍号资料**——以前只在 ID 缺失时补一次，换了微信或改了号名
         # 界面就一直显示旧值。刚从非 online 翻过来 = 这次轮询亲眼看到的登录
         # 成功，绕过 10 分钟节流；切号验号这类平时探测仍按节流来，别为资料
@@ -594,8 +660,7 @@ def account_login_state(aid: str, request: Request, diag: int = 0, hard: int = 0
     elif (acc.get("state") or "") == "online":
         # 之前是好的，现在掉到登录页了 = 登录态过期（微信那边会踢）。标出来让人重扫，
         # 别等发布失败了才说「未登录」。
-        acc = publisher.update_account(aid, state="expired",
-                                       last_check=publisher.fmt(publisher.now()))
+        acc = publisher.mark_expired(aid)
     out = {"logged_in": bool(st.get("logged_in")), "account": acc,
            "accounts": publisher.public_accounts()}
     if diag and not st.get("logged_in"):
@@ -623,8 +688,34 @@ def rename_account(aid: str, body: AccountPatch, request: Request):
 
 
 @router.delete("/api/publish/accounts/{aid}")
-def del_account(aid: str, request: Request):
+def del_account(aid: str, request: Request, fresh: int = 0):
+    """删号。`fresh=1` 是「新加的空壳号登录中途取消」专用通道。
+
+    为什么要分通道（2026-11-18 用户报：重登后状态没更新，原来几个号全没了）：
+    前端「取消登录」以前只要看到 `state=pending` 就 DELETE。但 pending 有两个
+    来源——① 刚 add 的空壳号；② **重登把老号清成 pending**。后者被当成空壳
+    删掉，等于把用户已经登录过的真实账号连同登录态一起抹掉。现在前端取消时
+    只对「本会话刚 add 的新号」带 fresh=1，这里再按账号真实履历兜底核验：
+    只有**从未登录成功过**（没有任何微信昵称/视频号 ID/上次成功时间）的号
+    才允许走 fresh 通道删除。老号哪怕前端误判，这里也一律 409 拦下。
+    用户主动点 × 删除不带 fresh，行为不变（仍受下面排队任务拦截约束）。
+    """
     me = _require(request)
+    acc = publisher.get_account(aid)
+    if not acc:
+        raise HTTPException(404, "这个账号已经不在了")
+    if fresh:
+        # 履历里只要有过一样「登录成功过」的证据，就不是空壳，禁止借 fresh 删。
+        ever_ok = bool((acc.get("wx_name") or "").strip()
+                       or (acc.get("finder_id") or "").strip()
+                       or (acc.get("last_ok") or "").strip()
+                       or (acc.get("fans") or 0))
+        if ever_ok:
+            audit.log_event(me, "hookcut.publish", target=f"account:{aid}",
+                            payload={"op": "del_account_refused", "reason": "not_fresh"},
+                            request=request, route="/api/publish/accounts", status_code=409)
+            raise HTTPException(409, "这是个已经登录过的账号，不能当作没登录的新号删掉；"
+                                    "要删请用账号卡片上的「删除」")
     # 删号前只拦一件事：这个号还有没传完的任务在排队（2026-11-14 起不再锁号，
     # 但删号会让排队任务失去目标，还是得先取消）。
     inflight = [j for j in publisher.queue().get("jobs", [])
@@ -637,8 +728,8 @@ def del_account(aid: str, request: Request):
     wxbot.drop(aid, remove_profile=True)
     publisher.remove_account(aid)
     audit.log_event(me, "hookcut.publish", target=f"account:{aid}",
-                    payload={"op": "del_account"}, request=request,
-                    route="/api/publish/accounts", status_code=200)
+                    payload={"op": "del_account", "fresh": bool(fresh)},
+                    request=request, route="/api/publish/accounts", status_code=200)
     return {"ok": True, "accounts": publisher.public_accounts()}
 
 
@@ -1151,6 +1242,28 @@ _PROF_BUSY: set = set()
 _PROF_TRIED: dict = {}
 _PROF_GAP = 600          # 同一个号补资料失败后，10 分钟内不再试（别每 2 秒开一次浏览器）
 
+# online 号的对账复查节流：每 10 分钟才允许 hard 真导航核对一次。
+# 对账接口每 45 秒被前端调一次，不节流会把每个 online 号反复硬导航。
+_ONLINE_RECHECK: dict = {}
+ONLINE_RECHECK_GAP = 600
+
+# expired 号重新变 online 是「用户刚重新登录」这种重要事件，值得更快核对
+# （2026-11-16 用户报：大海登录成功了状态却迟迟不更新——就是被 10 分钟节流
+# 拖住了）。expired 号单独用更短的节流，登录成功后约 1 分钟内就能被对账纠正。
+_EXPIRED_RECHECK: dict = {}
+EXPIRED_RECHECK_GAP = 60
+
+
+def _account_busy(aid: str) -> bool:
+    """这个号有没有正在排队/发布的任务。有的话不能 hard 导航复查——
+    导航会把发布 worker 正要用的页面顶走，把排到一半的上传搅乱。"""
+    try:
+        jobs = (publisher.queue() or {}).get("jobs") or []
+    except Exception:  # noqa: BLE001
+        return False
+    return any(j.get("account_id") == aid
+               and j.get("status") in ("queued", "publishing") for j in jobs)
+
 
 def _fill_profile_async(aid: str, force: bool = False) -> None:
     """登录成功后补一次视频号资料（ID/粉丝数/昵称头像）。放后台线程：
@@ -1233,6 +1346,26 @@ def publish_stat_sample(request: Request, aid: str = ""):
         return snap
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, _wx_msg(exc)) from exc
+
+
+@router.get("/api/publish/notify")
+def publish_notify(request: Request, aid: str = ""):
+    """通知记录：读这个号上次采样时平台发的通知（小v猫「通知记录」）。纯读缓存。"""
+    _require(request)
+    cur = _require_current(aid, "看通知记录")
+    return wxstat.notify_records(cur)
+
+
+@router.post("/api/publish/stat/clear")
+def publish_stat_clear(request: Request, aid: str = ""):
+    """清空这个号的采样记录（小v猫「清空数据」）。只删本号缓存，不碰别的号。"""
+    me = _require(request)
+    cur = _require_current(aid, "清空数据")
+    r = wxstat.clear_data(cur)
+    audit.log_event(me, "hookcut.publish.stat_clear", target=f"account:{cur}",
+                    payload={"removed": bool(r.get("removed"))},
+                    request=request, route="/api/publish/stat/clear", status_code=200)
+    return r
 
 
 @router.get("/api/publish/diag")

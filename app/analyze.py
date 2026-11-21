@@ -7,13 +7,36 @@ import re
 
 import requests
 
-from . import core
+from . import core, reuse
 
 PROMPT_DIR = core.PROMPTS
 _PLACEHOLDER = re.compile(r"\{(\w+)\}")
 # 单次调用最多等多久。10 分钟结构这种长 JSON，慢模型（qwen3.8-max 实测）
 # 会超过 5 分钟，默认放宽到 10 分钟；环境变量 LLM_TIMEOUT 可覆盖。
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT") or 600)
+
+
+def _eps_label(eps) -> str:
+    """把选集压成「第 20–40 集」这种短写法，给进度文案用。
+
+    只写「选中的 21 集」会被读成「第 21 集」——带上真实范围就不会误解。
+    不连续的集压成「第 1、3、7 集」；整段连续才写区间。
+    """
+    arr = sorted(set(int(x) for x in (eps or [])))
+    if not arr:
+        return ""
+    if len(arr) == 1:
+        return f"第 {arr[0]} 集"
+    parts: list[str] = []
+    s = prev = arr[0]
+    for v in arr[1:] + [None]:
+        if v is not None and v == prev + 1:
+            prev = v
+            continue
+        parts.append(str(s) if s == prev else f"{s}–{prev}")
+        if v is not None:
+            s = prev = v
+    return "第 " + "、".join(parts) + " 集"
 
 
 def _custom_prompt_path(name: str) -> str:
@@ -54,7 +77,10 @@ FIXED_TAIL_MARKS: dict[str, str] = {}
 #     真 JSON），强解析会误判。只验括号配平 + 关键键名还在——这两样坏了才是真坏。
 _SCHEMA_STRICT = {"shots_schema.txt": "episodes"}
 _SCHEMA_KEYS = {
-    "plans_schema.txt": ("plans", "segments", "from", "to", "rating", "hook", "bgm"),
+    # 2026-11-21 用户定：剪辑结构不再要 label / rating / core / hook / bgm，
+    # 一段只要 from/to（不挑高光，按剧情顺序装填）。这里的必检键随之收窄，
+    # 否则用户在界面上保存这份格式会被「少了 rating」拦下。
+    "plans_schema.txt": ("plans", "segments", "from", "to"),
     "hooks_schema.txt": ("hooks", "ep", "from", "to", "hook"),
 }
 
@@ -217,8 +243,39 @@ def system_prompt() -> str:
         return _DEFAULT_SYSTEM
 
 
-def _all_text(p: dict, gid: bool = False, pos: bool = False, plain: bool = False) -> str:
+def select_eps(p: dict, eps=None) -> tuple[list[int], list[int]]:
+    """把外部传来的集号收成「项目里真实存在、且有台词」的集。
+
+    返回 (选中的集, 被剔除的集)。eps 为空 = 全部有台词的集。
+    剔除的分两种：项目里没有这个集号；有集号但还没整理出台词（选了也切不出东西）。
+
+    为什么要单独一个函数：`_all_text`、`_global_lines`、`_to_segs`、reuse 记账
+    必须用**同一份**选集口径，否则模型看到的编号和程序换算的位置会错位。
+    """
+    have = sorted(int(ep["index"]) for ep in p["episodes"] if ep.get("lines"))
+    if not eps:
+        return have, []
+    want: list[int] = []
+    for x in eps:
+        try:
+            i = int(x)
+        except (TypeError, ValueError):
+            continue
+        if i not in want:
+            want.append(i)
+    sel = sorted(set(want) & set(have))
+    drop = sorted(set(want) - set(sel))
+    return sel, drop
+
+
+def _all_text(p: dict, gid: bool = False, pos: bool = False, plain: bool = False,
+              eps=None) -> str:
     """全剧台词拼成一段文本。
+
+    eps 给定 = 只拼这些集（2026-11-19 选集生成）。编号 n 在**选集内**从 1 连续，
+    模型要引用的编号空间从 1225 个缩到几百个，串号概率随之下降。
+    但「全剧第几分几秒」仍按原片真实时间轴累计——跳过的集照样占时间，
+    模型才知道第 20 集离全剧开头有多远。
 
     gid=True 时用**全局连续编号**：把 27 集当成一条时间轴通读，模型可以用一个
     区间跨集选段（第 3 集末句 → 第 4 集开头），这正是短剧真实的叙事单位。
@@ -237,8 +294,14 @@ def _all_text(p: dict, gid: bool = False, pos: bool = False, plain: bool = False
     buf = []
     n = 0
     at = 0.0          # 累计到这一集为止的全剧秒数
+    sel = {int(x) for x in eps} if eps else None
     for ep in p["episodes"]:
         lines = ep.get("lines") or []
+        if sel is not None and int(ep["index"]) not in sel:
+            # 不参与这批的集：不写进台词块，但它占的时间照算——否则后面几集的
+            # 「全剧第几分几秒」会整体前移，模型对位置的判断就假了。
+            at += float(ep["duration"])
+            continue
         if not lines:
             if plain:
                 buf.append(f"\n【第{ep['index']:02d}集】【无对白】")
@@ -276,11 +339,21 @@ def ep_offsets(p: dict) -> dict[int, float]:
     return out
 
 
-def _global_lines(p: dict) -> list[dict]:
-    """全局编号 -> 真实位置：gid / ep / start / end（集内秒）/ gs / ge（全局秒）。"""
+def _global_lines(p: dict, eps=None) -> list[dict]:
+    """全局编号 -> 真实位置：gid / ep / start / end（集内秒）/ gs / ge（全局秒）。
+
+    eps 给定 = 只编号这些集，gid 在选集内从 1 连续（和 `_all_text(eps=)` 同一口径）。
+    **gs/ge 仍按原片真实时间轴算**（`ep_offsets` 用完整 p，不按选集重排）——
+    这是选集最容易踩的坑：如果按选集重排时间轴，第 3 集和第 5 集之间就不再有
+    第 4 集的时长，`_stitch_blocks` 会认为两段「只隔几秒」把它们缝成一场戏，
+    剪出来就会跨过一整集、剧情直接断掉。
+    """
     off = ep_offsets(p)
+    sel = {int(x) for x in eps} if eps else None
     out = []
     for ep in p["episodes"]:
+        if sel is not None and int(ep["index"]) not in sel:
+            continue
         for ln in ep.get("lines") or []:
             out.append({
                 "ep": ep["index"], "start": ln["start"], "end": ln["end"],
@@ -431,7 +504,7 @@ def _call(prompt: str, system: str | None = None, json_mode: bool = True,
         except requests.RequestException as exc:
             if cfg["key"]:
                 raise RuntimeError(f"连不上 AI 接口：{exc}") from exc
-            raise RuntimeError("体验服务暂时连不上，请稍后再试，或在设置里填自己的百炼 Key") from exc
+            raise RuntimeError("体验服务暂时连不上，请稍后再试，或换成你自己的服务") from exc
 
     resp = _post(body)
     # 欠费/没开通/Key 错这类错误，摘参数重发也还是同一个错，白等三四轮
@@ -476,10 +549,9 @@ def _call(prompt: str, system: str | None = None, json_mode: bool = True,
             # 429 有两种来源：体验代理的「次数用完」和自己 Key 的「账号级限流」，
             # 提示必须分开——自己的 Key 报「明天再试」会让人以为 Key 坏了。
             if cfg["key"]:
-                raise RuntimeError("接口限流了（429）：同一账号同时请求太多，等一两分钟再试，"
-                                   "或换一个模型。")
+                raise RuntimeError("用的人有点多，请稍后再试")
             raise RuntimeError("这个网络今天用得太频繁了（同一网络共用额度），请稍后再试；"
-                               "填自己的 Key 不受这个限制。")
+                               "用你自己的服务不受这个限制。")
         raise RuntimeError(_http_error(resp.status_code, resp.text, cfg))
     choice = resp.json()["choices"][0]
     content = choice.get("message", {}).get("content") or ""
@@ -537,6 +609,12 @@ _THINK_KEYS = ("glm", "minimax", "step-5", "stepfun", "kimi-k3", "kimi/k3", "dee
 
 def _is_thinker(model: str) -> bool:
     m = (model or "").lower()
+    # deepseek-v4.1-flash 虽然名字命中 deepseek-v4 / v4.1-flash，但实测关思考
+    # 会退化成「换标题重剪」：2026-11-19 同一部剧横评，关思考套间重合 96%
+    # （套1与套3有 33/35 块完全相同），保留思考只有 47%（优于 GLM-5.2 的 72%）。
+    # 故此处精确排除，让 _call / probe 都不给它加 enable_thinking=False。
+    if "v4.1-flash" in m:
+        return False
     return any(k in m for k in _THINK_KEYS)
 
 
@@ -814,13 +892,13 @@ def _pipeline(p: dict, kind: str, tpl_name: str, strict: bool, variation: str = 
     target = float(p["target_minutes"]) * 60
     eps = [ep for ep in p["episodes"] if ep.get("lines")]
     if not eps:
-        raise RuntimeError("没有转写文本，请先转写")
+        raise RuntimeError("还没有台词，请先整理台词")
 
     src_total = sum(ep["duration"] for ep in eps)
     per_ep = int(target / max(1, len(eps)))
     text = _all_text(p)
-    core.set_task(pid, kind, 5, "整理台词，准备送模型")
-    core.set_task(pid, kind, 30, f"模型正在读 {len(text)} 字台词，挑选片段")
+    core.set_task(pid, kind, 5, "正在整理台词，准备挑选片段")
+    core.set_task(pid, kind, 30, f"正在读 {len(text)} 字台词，挑选片段")
     data = _call(_fill(
         _read_prompt(tpl_name),
         name=p["name"], n_ep=len(p["episodes"]), src_min=round(src_total / 60, 1),
@@ -882,7 +960,7 @@ def _core_gs(seg: dict, glines: list[dict], off: dict[int, float]) -> float | No
     return None
 
 
-def _to_segs(p: dict, data: dict, min_len: float = 3.0) -> list[dict]:
+def _to_segs(p: dict, data: dict, min_len: float = 3.0, eps=None) -> list[dict]:
     """把模型的片段池 JSON 落到真实时间轴，附上评分。
 
     两种格式都吃：
@@ -890,6 +968,10 @@ def _to_segs(p: dict, data: dict, min_len: float = 3.0) -> list[dict]:
       旧（集内编号）：{"ep": 3, "from": 12, "to": 20, ...}
     每片都带 blk（同一块的编号）、gs/ge（全局秒），组装时靠它们判断「是否紧挨着」。
     一块跨集时拆成多片，但 blk 相同：渲染时仍是连续画面，只是分文件切。
+
+    eps 给定 = 本批只认这些集：gid 按选集编号解析（和 `_all_text(eps=)` 同口径），
+    模型如果越界引用了没参与的集，整片丢弃——宁可少一块，也不让成片里冒出
+    用户明确排除掉的集。
     """
     # 模型不一定守规矩：qwen-max 实测把 segments 写成了字符串数组，
     # 直接 .get() 会抛 'str' object has no attribute 'get'，整批白跑。
@@ -912,10 +994,13 @@ def _to_segs(p: dict, data: dict, min_len: float = 3.0) -> list[dict]:
 
     by_index = {ep["index"]: ep for ep in p["episodes"]}
     off = ep_offsets(p)
-    glines = _global_lines(p)
+    glines = _global_lines(p, eps)
+    sel = {int(x) for x in eps} if eps else None
     out = []
 
     def _push(ep_i, a_line, b_line, meta, blk):
+        if sel is not None and int(ep_i) not in sel:
+            return
         ep = by_index.get(ep_i)
         if not ep or not ep.get("lines"):
             return
@@ -923,25 +1008,31 @@ def _to_segs(p: dict, data: dict, min_len: float = 3.0) -> list[dict]:
         end = min(ep["duration"], b_line["end"] + 0.30)
         if end - start < 2.0:
             return
-        out.append({
+        item = {
             "ep": ep_i,
             "start": round(start, 3), "end": round(end, 3),
             "gs": round(off[ep_i] + start, 3), "ge": round(off[ep_i] + end, 3),
             "blk": blk,
-            "label": meta["label"], "rating": meta["rating"],
+            "label": meta["label"],
             # 这块「最狠那一句」的时刻（全局秒）。模型给了就用它当收紧的锚点，
             # 没给就留空，程序退回「居中裁」——见 _cap_quota。
             "core": meta.get("core"),
-        })
+        }
+        # 模型没给评分就不写这个键（2026-11-21）：造一个 5 分会让界面每块都挂
+        # 「5分」，还会被 _fit_target 当成「整套都是缓冲块」。
+        if "rating" in meta:
+            item["rating"] = meta["rating"]
+        out.append(item)
 
     for idx, seg in enumerate(segs_in):
         if not isinstance(seg, dict):
             continue
-        try:
-            rating = max(1.0, min(10.0, float(seg.get("rating") or 5)))
-        except (TypeError, ValueError):
-            rating = 5.0
-        meta = {"label": str(seg.get("label") or "")[:40], "rating": rating}
+        meta = {"label": str(seg.get("label") or "")[:40]}
+        if seg.get("rating") is not None:
+            try:
+                meta["rating"] = max(1.0, min(10.0, float(seg["rating"])))
+            except (TypeError, ValueError):
+                pass
         blk = f"b{idx + 1}"
 
         ep_i = None
@@ -1036,7 +1127,13 @@ MIN_PIECE = 1.2       # 秒：跨集切分后边缘不足这么长的碎片丢�
 # 这不违反「只挑整块、不裁块」：整集块本身就是一个没剪过的原材料，不是一场戏。
 # 从一整集里取出那场交锋，跟把一场戏砍半是两件事——块还是完整的，只是不再把
 # 整集塞进来。收窗后套总长会掉，_fit_target 会多挑几块补回，块数自然上去。
-WHOLE_RATIO = 0.72    # 块长 ≥ 集长×72% 且 ≥ 30 秒，视为「一集基本没剪」
+# 2026-11-21 用户要求「每块不短于 60 秒，不够就接相邻集的同一场戏续段」，
+# 判定必须跟着改：「块够长就算整集」改成「**真的覆盖了整集**」。
+# 原因：60 秒的块跨集拆成两片（如上一集后 20 秒 + 下一集前 40 秒），单片很容易
+# ≥ 集长×0.72（46-60 秒的剧几乎必中），老判定会把它当整集收回 28 秒——
+# 等于提示词写 60 秒、程序又缩回去，改动等于没做。
+# 收窗的目的只有「别把一集原封不动播一遍」，所以只认贴着集首又贴着集尾的块。
+WHOLE_EDGE = 2.0      # 秒：片起点 ≤2 秒且终点 ≥ 集尾-2 秒，才算「整集没剪」
 WHOLE_MIN = 30.0      # 秒：块短于这个就不收——35 秒以内本来就可能是一场完整的戏
 WIN_BEFORE = 10.0     # 秒：锚点前留多少（对方那句挑事的台词、起因）
 WIN_AFTER = 18.0      # 秒：锚点后留多少（反应、还嘴、对方愣住的收尾）
@@ -1044,13 +1141,14 @@ WIN_MIN = 15.0        # 秒：窗口下限，再短就不像一场交锋了
 WIN_MAX = 35.0        # 秒：窗口上限。用户说过「超过 30 秒完全可能」，别硬卡 30
 GROW_CAP = 0.72       # _grow_to 延长后不得超集长×此值，否则又长回整集
 
-# 套间重复率上限（2026-11-12 用户定 80%）。**提示词和程序用同一个数**：
-# plans.txt 第 5 条按它写（占位符 {max_share}），batch._overlap 事后按它核算
+# 套间重复率上限（2026-11-12 用户定 80%，2026-11-16 收紧到 70%）。**提示词和程序用同一个数**：
+# plans.txt 第 5 条的全片限额写 0.7，batch._overlap 事后按它核算
+# （2026-11-20 已删掉模板里把比例换算成秒数的「自查」行，本常量仍供 batch 核算）
 # （重合秒数 ÷ 较短那套的素材秒数）。**只核算、只上报、不拦截**（用户明确：
 # 「原来程序只在事后上报重复率，不拦截。我不需要你去拦截」）——同一部剧剪 N 套，
 # 素材复用是必然的，硬卡只会让某几套凑不够时长，一套 2.9 分钟的片子发不出去，
 # 比重复更糟（见 _fit_target 的 spare 借块注释）。分数超线由前端标红提示。
-OVERLAP_CAP = 0.8
+OVERLAP_CAP = 0.7
 
 
 def _stitch_blocks(p: dict, segs: list[dict],
@@ -1089,13 +1187,15 @@ def _stitch_blocks(p: dict, segs: list[dict],
             e = edges.setdefault(s["ep"], [float(s["gs"]), float(s["ge"])])
             e[0] = min(e[0], float(s["gs"]))
             e[1] = max(e[1], float(s["ge"]))
-        blocks.append({
+        blk_out = {
             "gs0": float(ps[0]["gs"]), "ge0": float(ps[-1]["ge"]),
             "edges": edges,
-            "rating": float(head.get("rating") or 5),
             "label": head.get("label") or "",
             "core": head.get("core"),
-        })
+        }
+        if "rating" in head:            # 模型没给评分就不带这个键
+            blk_out["rating"] = float(head["rating"])
+        blocks.append(blk_out)
     blocks.sort(key=lambda b: b["gs0"])
 
     # 2) 贪心缝合：间隙够小、缝完不超长 → 连成一块；否则保留独立两块
@@ -1109,7 +1209,7 @@ def _stitch_blocks(p: dict, segs: list[dict],
                 for ep, (a, z) in b["edges"].items():
                     e = cur["edges"].setdefault(ep, [a, z])
                     e[0], e[1] = min(e[0], a), max(e[1], z)
-                if b["rating"] > cur["rating"]:
+                if "rating" in b and float(b["rating"]) > float(cur.get("rating") or 0):
                     cur["rating"], cur["label"] = b["rating"], b["label"]
                 continue
         merged.append({**b, "edges": {k: list(v) for k, v in b["edges"].items()}})
@@ -1128,15 +1228,18 @@ def _stitch_blocks(p: dict, segs: list[dict],
             z = min(z, off.get(ep_i, 0.0) + dur.get(ep_i, 0.0))
             if z - a < MIN_PIECE:
                 continue
-            out.append({
+            piece = {
                 "ep": ep_i,
                 "start": round(a - off.get(ep_i, 0.0), 3),
                 "end": round(z - off.get(ep_i, 0.0), 3),
                 "gs": round(a, 3), "ge": round(z, 3),
                 "blk": blk,
-                "label": b["label"], "rating": round(b["rating"], 1),
+                "label": b["label"],
                 "core": b.get("core"),
-            })
+            }
+            if "rating" in b:
+                piece["rating"] = round(float(b["rating"]), 1)
+            out.append(piece)
     out.sort(key=lambda s: (s["ep"], s["start"]))
     return out
 
@@ -1167,7 +1270,13 @@ def _trim_whole(p: dict, segs: list[dict]) -> list[dict]:
         a0, z0 = float(s["start"]), float(s["end"])
         dur = z0 - a0
         # 太短的集（30 秒以下）本来就只能整块用，收窗没有意义
-        if ep_dur < 30.0 or dur < WHOLE_MIN or dur < ep_dur * WHOLE_RATIO:
+        if ep_dur < 30.0 or dur < WHOLE_MIN:
+            out.append(s)
+            continue
+        # 只收「整集没剪」的块：必须同时贴着集首和集尾。不看长度比例——
+        # 60 秒的块在 46-60 秒的剧里占比必然超标，按比例收会把跨集拼块的
+        # 每一片都打断（2026-11-21，见上方 WHOLE_EDGE 注释）。
+        if a0 > WHOLE_EDGE or z0 < ep_dur - WHOLE_EDGE:
             out.append(s)
             continue
         lines = ep.get("lines") or []
@@ -1349,7 +1458,8 @@ def _min_len_of(s: dict, min_sec: float) -> float:
 
 def _fit_target(p: dict, segs: list[dict], target: float, min_sec: float = 10.0,
                 avoid: list[list[dict]] | None = None,
-                spare: list[dict] | None = None) -> list[dict]:
+                spare: list[dict] | None = None,
+                usage: dict | None = None) -> list[dict]:
     """把**一套**收到 target 秒：**只挑整块，不裁块**。AI 编排多套时用。
 
     为什么需要程序兜底：AI 一次给出 6 套、上百个区间，它算不准总秒数——让它保证
@@ -1381,8 +1491,22 @@ def _fit_target(p: dict, segs: list[dict], target: float, min_sec: float = 10.0,
     """
     if not segs or target <= 0:
         return segs
+    usage = usage or {}
     total = _segs_sec(segs)
-    if target * 0.82 <= total <= target * 1.08:
+    # 2026-11-21：plans_schema 不再要 rating（一段只要 from/to，不挑高光）。
+    # 这时原来那套「爆点先挑、缓冲块留 22% 预算」失去依据——所有块都会被当成
+    # 5 分的缓冲块，一套只能装出两成时长。改成按剧情顺序装填。
+    # 判定看「有没有一块带真实评分」：老结构（1-10 分）仍走原逻辑，互不影响。
+    no_rate = not any("rating" in s for s in segs)
+
+    def _floor(s: dict) -> float:
+        # 无评分时不能按「缓冲块 5 秒」放行，否则顺序装填会把碎块也装进来
+        return min_sec if no_rate else _min_len_of(s, min_sec)
+
+    # 台账里已经有块用满时，不能走「够长就直接用」这条快路径：那条路一块都不换，
+    # 跨批次的重复就是这么漏掉的（2026-11-17）。只有全部新鲜时才允许直接放行。
+    fresh = not any(reuse.is_capped(reuse.count(usage, s)) for s in segs)
+    if fresh and target * 0.82 <= total <= target * 1.08:
         # 够长就直接用，只清碎片：AI 偶尔给 3-4 秒的块（「失语」一个眼神那种），
         # 播出去就是闪一下，观众只觉得卡了。这条原来漏在 early return 之外，
         # 实测第 3 套保留了一块 3.6 秒的（2026-11-02）。
@@ -1390,7 +1514,7 @@ def _fit_target(p: dict, segs: list[dict], target: float, min_sec: float = 10.0,
         # 一套只有 2.9 分钟也照样放行）；高于 108% 要往下挑块（改这个门槛时
         # 一度写成「≥82% 就返回」，第 1 套直接出了 9.89 分钟，2026-11-02）。
         keep = [s for s in segs
-                if float(s["end"]) - float(s["start"]) >= _min_len_of(s, min_sec)]
+                if float(s["end"]) - float(s["start"]) >= _floor(s)]
         return _drop_slivers(keep or segs, min_sec)
     avoid = avoid or []
     flat = [x for a in avoid for x in a]
@@ -1399,12 +1523,25 @@ def _fit_target(p: dict, segs: list[dict], target: float, min_sec: float = 10.0,
         dur = float(s["end"]) - float(s["start"])
         return bool(flat) and dur > 0 and _ovl_one(s, flat) > dur * 0.5
 
+    def _used(s: dict) -> int:
+        return reuse.count(usage, s)
+
     # 排序：分数高的先挑；同分先挑**短**的——长块吃预算多，先挑短的能让这套
     # 多装几块、结构更完整；长块装不下就不装，也不会被砍成半场。
-    ranked = sorted(segs, key=lambda s: (-float(s.get("rating") or 5),
-                                         float(s["end"]) - float(s["start"])))
-    uniq = [s for s in ranked if not _dup(s)]
-    dup = [s for s in ranked if _dup(s)]
+    # 复用台账（2026-11-17）：按「用过几次」降权，跨批次不再反复用同几场戏。
+    # 只降权不删除——用过 1 次的块仍可能是这套唯一能用的戏，一刀切会凑不够时长。
+    # 无评分（2026-11-21）= 不挑高光，改成**按剧情顺序**（全局秒）装填：块按时间
+    # 从小到大装，装到目标时长为止。套与套的差异由下面的 avoid 承担（前面套用过
+    # 过半的块第一轮不挑），模型自己也会给不同套挑不同的段落。
+    if no_rate:
+        ranked = sorted(segs, key=lambda s: float(s.get("gs") or 0))
+    else:
+        ranked = sorted(segs, key=lambda s: (-(_rt(s) * reuse.weight(_used(s))),
+                                             float(s["end"]) - float(s["start"])))
+    # 重复块（跟前面几套撞过半 / 台账里已用满）第一轮一律不挑，只有独有块
+    # 凑不够长度时才回用——和 avoid 同一套降级逻辑，宁可重复也别出 2.9 分钟的片。
+    uniq = [s for s in ranked if not _dup(s) and not reuse.is_capped(_used(s))]
+    dup = [s for s in ranked if _dup(s) or reuse.is_capped(_used(s))]
 
     chosen: set[int] = set()
     picked: list[dict] = []
@@ -1416,7 +1553,7 @@ def _fit_target(p: dict, segs: list[dict], target: float, min_sec: float = 10.0,
             if id(s) in chosen:
                 continue
             dur = float(s["end"]) - float(s["start"])
-            if dur < (floor if floor is not None else _min_len_of(s, min_sec)):
+            if dur < (floor if floor is not None else _floor(s)):
                 continue           # 太碎：观众还没进戏就被切走
             if used + dur > cap:
                 continue
@@ -1434,10 +1571,15 @@ def _fit_target(p: dict, segs: list[dict], target: float, min_sec: float = 10.0,
             used += dur
 
     # 先给缓冲块留出预算，再挑爆点——顺序反过来，缓冲永远抢不到位置。
-    boom = [s for s in uniq if _rt(s) >= SOFT_RATING]
-    soft = [s for s in uniq if _rt(s) < SOFT_RATING]
+    # 无评分时（2026-11-21）没有「爆点/缓冲」之分，全部按顺序装填，不预留预算。
     cap = target * 1.05
-    soft_cap = min(cap * 0.22, _segs_sec(soft))
+    if no_rate:
+        boom, soft = uniq, []
+        soft_cap = 0.0
+    else:
+        boom = [s for s in uniq if _rt(s) >= SOFT_RATING]
+        soft = [s for s in uniq if _rt(s) < SOFT_RATING]
+        soft_cap = min(cap * 0.22, _segs_sec(soft))
     _fill(boom, cap - soft_cap)
     if soft:
         _fill(soft, min(cap, used + soft_cap * 1.1), SOFT_MIN)
@@ -1583,8 +1725,12 @@ def _clean_bgm(raw) -> str:
 
 def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
                 model: str | None = None, progress: tuple | bool | None = None,
-                timeout: int | None = None) -> list[dict]:
+                timeout: int | None = None, eps=None) -> list[dict]:
     """调一次 API，直接从**全剧台词**生成 count 套互相不同的剪辑结构。
+
+    eps 给定 = 本批只在这些集里排（2026-11-19 用户定）。台词块只拼选中的集、
+    编号在选集内重新连续，素材总时长也按选集算。**时间轴仍用原片真实位置**，
+    所以跨到未选中的集不会被误缝（见 `_global_lines` 的注释）。
 
     progress=False = 静默：多组并发时各组不能自己写同一个项目的进度条
     （会来回跳），由 batch.ai_plan_multi 统一按「已完成 N/M 组」推进。
@@ -1597,9 +1743,17 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
     返回 [{"name": 套名, "segments": [...]}, ...]，每套已按目标时长裁过。
     """
     pid = p["id"]
-    total = sum(float(ep.get("duration") or 0) for ep in p["episodes"])
+    sel: list[int] | None = None
+    if eps:
+        sel, drop = select_eps(p, eps)
+        if not sel:
+            raise RuntimeError("选中的集都还没整理出台词——先在第 1 步整理台词，或把选集放宽一点")
+    sel_set = set(sel) if sel else None
+    total = sum(float(ep.get("duration") or 0) for ep in p["episodes"]
+                if sel_set is None or int(ep["index"]) in sel_set)
     if total < 60:
-        raise RuntimeError("素材太短（不足 1 分钟），无法编排")
+        raise RuntimeError(
+            f"选中的素材只有 {total:.0f} 秒，太短了没法编排——多勾几集，或者把每套时长调短")
 
     def _tick(local_pct: float, msg: str) -> None:
         if progress is False:
@@ -1613,38 +1767,30 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
             core.set_task(pid, "plan", local_pct, msg)
     avg = (min_minutes + max_minutes) / 2 * 60
     need = avg * count
-    # 每套约几块：按「一场交锋 32 秒」估，再乘 1.9 让它**多给**（备选量）。
-    # 系数从 1.5 提到 1.9 是实测调的：块长放开之后模型每套只给 4-9 块，
-    # 第 5 套「亲情线」只找到 4 块 → 只出 2.76 分钟，发不出去。
-    # 把备选量要足，_fit_target 才有多余的块可挑（它只挑整块、不裁块）。
-    #
-    # 这里原来按 22 秒估（当时提示词里写着「一块 15-30 秒」），结果是 4.5 分钟被
-    # 提示成 17 块、均块 17 秒——而代码里 MAX_BLOCK=60、MERGE_GAP=9 早就允许
-    # 一场戏长到 40-60 秒。提示词按 30 秒卡上限、程序却往 60 秒缝，模型被夹在中间，
-    # 只能把一整场戏切成两三块。用户 2026-11-02 定：块长没有上限，一场戏多长就留多长；
-    # 2026-11-07 已把提示词里那句「15-30 秒 / 50-60 秒」彻底删掉（不再给时长限制），
-    # 这里只保留程序估算备选块数的除数，不再和任何提示词数字挂钩。
-    #
-    # 为什么要多给：程序裁切时要先削掉跟别套重复的块（见 _fit_target 的 avoid），
-    # 模型给得刚好够，一撞素材就没得选，只能整块留着——实测第 6 套排出 82% 重合。
-    # 反过来，如果提示词强调「宁可短」，它会真把套削到两分钟（实测第 2-4 套 2 分钟）。
-    # 两个极端都试过了，正解是「模型给富余，程序做取舍」。
-    per_blocks = max(5, round(avg * 1.9 / 32))
+    # 2026-11-21：plans.txt 删掉了「每套给约 N 块备选」（用户不再挑高光，块数由模型
+    # 按「一场戏一块、每块 60 秒以上」自己决定）。估算块数的 per_blocks 一并删除，
+    # 不留死代码；要恢复「模型给富余、程序做取舍」时再从 _backup_prompts_20261121 取回。
+    # 选集时集数/时长都按选集报：明明只给 8 集台词，却告诉它「共 40 集」，
+    # 模型只会去猜没给出的那些集，或者反复引用不存在的编号。
+    n_ep_in = len(sel) if sel else len(p["episodes"])
+    # 2026-11-20 用户定：可用集清单不再单列一段——集数/时长和首行重复、
+    # 禁令和 plans.txt 第 1 条重复，只留集号并进台词区标题（紧贴台词，指代更清楚）。
     # 台词标题由程序统一拼（模板/编辑框里不出现「## 全剧台词」，
     # 用户自定义模板末尾残留这行也会被剥掉，避免出现两遍标题）
     prompt = _fill(
         _strip_dialogue_tail(_read_prompt("plans.txt")),
-        name=p["name"], n_ep=len(p["episodes"]), count=count,
+        name=p["name"], n_ep=n_ep_in, count=count,
         total_min=f"{total / 60:.1f}", total_sec=f"{total:.0f}",
         min_sec=f"{min_minutes * 60:.0f}", max_sec=f"{max_minutes * 60:.0f}",
         avg_sec=f"{avg:.0f}", need_sec=f"{need:.0f}",
-        reuse=f"{need / max(1.0, total):.2f}", blocks=per_blocks,
-        # 提示词第 6 条的自查数字：一套 N 秒 × 70%，两套重合别超这个秒数
-        max_share=f"{avg * OVERLAP_CAP:.0f}",
+        reuse=f"{need / max(1.0, total):.2f}",
     ) + "\n\n" + _read_prompt("plans_schema.txt") \
-      + "\n\n## 全剧台词\n" + _all_text(p, gid=True, pos=True)
+      + (f"\n\n## 本批台词（第 {'、'.join(str(i) for i in sel)} 集）\n"
+         if sel else "\n\n## 全剧台词\n") \
+      + _all_text(p, gid=True, pos=True, eps=sel)
 
-    _tick(6, f"AI 正在通读全剧 {total / 60:.0f} 分钟，编排 {count} 套不同剪法")
+    _tick(6, (f"AI 正在通读选中的这 {len(sel)} 集（{_eps_label(sel)}，{total / 60:.0f} 分钟），编排 {count} 套不同剪法"
+              if sel else f"AI 正在通读全剧 {total / 60:.0f} 分钟，编排 {count} 套不同剪法"))
     # model 不为空 = 这次编排单独指定模型（第 2 步的多模型对比：每个模型各自出几套），
     # Key/路由仍走 core.route 同一条规则，探针、结构、分镜的行为完全一致。
     data = _call(prompt, model=model or None, timeout=timeout)
@@ -1656,7 +1802,7 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
     # 裁第 3 套时要看得到前两套用了哪些素材，才能把重复部分先削掉。
     staged: list[dict] = []
     for pl in raw[:count]:
-        b0 = _stitch_blocks(p, _to_segs(p, pl, 6.0))
+        b0 = _stitch_blocks(p, _to_segs(p, pl, 6.0, eps=sel))
         # 缝合之后再收整集块：缝合可能把两段并成「从集首到集尾」，所以顺序不能反。
         segs = _trim_whole(p, b0)
         if segs:
@@ -1674,10 +1820,13 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
         spare.extend(st["segments"])
 
     # 第二阶段：逐套收到目标时长，收的时候避开前面已经用掉的素材
+    # 台账在这里只读一次：本批各套之间的重复由 avoid 管，台账管的是「以前用过」。
+    usage = reuse.load(p)["keys"]
     out: list[dict] = []
     accepted: list[list[dict]] = []
     for i, st in enumerate(staged, 1):
-        segs = _fit_target(p, st["segments"], avg, 10.0, avoid=accepted, spare=spare)
+        segs = _fit_target(p, st["segments"], avg, 10.0, avoid=accepted,
+                           spare=spare, usage=usage)
         # 裁完还不到目标的 85%，说明 AI 给这套的素材本身就少——把块向两头延一延，
         # 补到能发出去的长度（不新增素材，只让每场戏更完整）。
         segs = _grow_to(p, segs, avg * 0.85)
@@ -1690,6 +1839,8 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
               f"已编排 {i}/{len(staged)} 套，正在收紧时长")
     if not out:
         raise RuntimeError("AI 给出的结构都不可用（时长不足或编号越界），请重试")
+    # 台账不在这里记：编排可能重跑/整套被丢，计划阶段记账会把没人看过的块也耗掉次数。
+    # 真正的记账在出片成功那一刻（batch.render_plans → reuse.record）。
     return out
 
 

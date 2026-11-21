@@ -35,7 +35,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from . import core
+from . import audiofp, core
 
 # ── 平台约束（上线前用真账号实测校准，代码只认这几个常量）─────────────────
 LEAD_MIN = 10          # 最早：距现在至少 10 分钟
@@ -295,6 +295,27 @@ def get_account(aid: str) -> dict | None:
     return None
 
 
+def mark_online(aid: str, wx_name: str = "", avatar: str = "") -> dict:
+    """把号坐实成 online。**这是「登录成功」写库的唯一入口**（2026-11-16 重构）。
+
+    所有判定登录成功的地方（对账、轮询、开窗）都只调用这一个函数，避免三处
+    各自拼 patch、各自记时间戳，节流和写库逻辑互相打架。
+    返回更新后的账号 dict。
+    """
+    now_s = fmt(now())
+    patch = {"state": "online", "last_check": now_s, "last_ok": now_s}
+    if wx_name:
+        patch["wx_name"] = str(wx_name)[:30]
+    if avatar:
+        patch["avatar"] = str(avatar)
+    return update_account(aid, **patch)
+
+
+def mark_expired(aid: str) -> dict:
+    """把号坐实成 expired（登录态掉了）。同样收敛成单一写库入口。"""
+    return update_account(aid, state="expired", last_check=fmt(now()))
+
+
 def remove_account(aid: str) -> None:
     save_accounts([r for r in load_accounts() if r.get("id") != aid])
     # 删掉的号不能继续当「当前发到」——否则刷新后界面还指着它，
@@ -413,6 +434,7 @@ def _ledger_add(q: dict, job: dict) -> None:
         "submit_started_at": str(job.get("submit_started_at") or ""),
         "scheduled_at": str(job.get("scheduled_at") or ""),
         "left_at": fmt(now()),
+        "afp": str(job.get("afp") or ""),   # 音频内容指纹：跨平台查重只提示不拦
     }
     q["ledger"] = [x for x in (q.get("ledger") or [])
                    if x.get("job_id") != rec["job_id"]]
@@ -766,7 +788,7 @@ def scan_dir(path: str, recursive: bool = True) -> list[dict]:
     """
     path = os.path.abspath(str(path or ""))
     if not os.path.isdir(path):
-        raise PublishError(f"这个文件夹不存在：{path}")
+        raise PublishError("这个文件夹不存在，请重新选一下")
     found = []
     if recursive:
         for root, _dirs, files in os.walk(path):
@@ -872,6 +894,9 @@ def add_jobs(files: list[str] | None = None, sets: list[int] | None = None,
         # 模板里没填话题才自动生成；填了就按用户填的来（别覆盖人家的设置）
         if not job["topics"]:
             job["topics"] = auto_topics(pname)
+        # 音频内容指纹（多号查重用，只提示不拦）。120s 音频约 0.3s，同步算不卡界面；
+        # 算不出来（无音轨/损坏）就留空，按原来的文件名口径查重，绝不影响入队。
+        job["afp"] = audiofp.compute(it["path"])
         q["jobs"].append(job)
         added.append(job["id"])
 
@@ -1129,7 +1154,7 @@ def build_plan(first_at: str, interval_min: int, n: int,
             if any(abs((t - o).total_seconds()) < 600 for o in taken):
                 warns.append({
                     "code": "conflict", "level": "warn",
-                    "msg": f"{fmt(t)} 这条和已有排期撞了（10 分钟内），建议错开",
+                    "msg": f"{fmt(t)} 这条和已定时的内容撞了（10 分钟内），建议错开",
                 })
                 break
 
@@ -1162,31 +1187,82 @@ def repost_conflicts(jobs: list[dict], q: dict | None = None) -> list[dict]:
     """
     q = q or queue()
     prev: dict[str, list[dict]] = {}
+    # 内容指纹台账：只收带 afp 且不是取消/跳过的记录，供「不同文件但同源」比对
+    fp_hist: list[dict] = []
     for rec in (q.get("ledger") or []):
         f = _norm_file(rec.get("file"))
         st = str(rec.get("status") or "")
         if not f or st in ("cancelled", "skipped"):
             continue
+        at = str(rec.get("scheduled_at") or rec.get("submit_started_at")
+                 or rec.get("left_at") or "")
+        title = str(rec.get("title") or "")[:60]
+        aid = str(rec.get("account_id") or "")
         prev.setdefault(f, []).append({
-            "status": st,
-            "at": str(rec.get("scheduled_at") or rec.get("submit_started_at")
-                      or rec.get("left_at") or ""),
-            "title": str(rec.get("title") or "")[:60],
+            "status": st, "at": at, "title": title,
         })
+        if rec.get("afp"):
+            fp_hist.append({"afp": rec["afp"], "file": f,
+                            "title": title, "at": at, "account_id": aid})
+    # 队列里还没发的也纳入：一次加好几条、发到不同号时，彼此同源也要能查出来。
+    for jb in (q.get("jobs") or []):
+        if str(jb.get("status") or "") in ("skipped",):
+            continue
+        if jb.get("afp"):
+            fp_hist.append({
+                "afp": jb["afp"], "file": _norm_file(jb.get("file")),
+                "title": str(jb.get("title") or "")[:60],
+                "at": str(jb.get("created_at") or ""),
+                "account_id": str(jb.get("account_id") or ""),
+                "job_id": str(jb.get("id") or ""),
+            })
     out = []
     for j in jobs:
         hits = prev.get(_norm_file(j.get("file"))) or []
-        if not hits:
-            continue
         hits.sort(key=lambda x: x["at"], reverse=True)
-        out.append({
+        # 内容级命中：先整片相似度筛，再对最像的一条做**段级定位**（2026-11-17）。
+        # 为什么要定位：我们的成片是同一批块拼的，两套共用 60% 时整片相似度会被
+        # 稀释到 0.7x 以下，只按 MIN_SIM 判会漏；命中了还得说得出「撞了哪几秒」，
+        # 否则用户没法改。定位只跑最像的一条，不拿 500 条历史全做窗口比对。
+        content = None
+        jafp = str(j.get("afp") or "")
+        if jafp:
+            my_id = str(j.get("id") or "")
+            scored = [(audiofp.similarity(jafp, h["afp"]), h) for h in fp_hist
+                      if h.get("job_id", "") != my_id]   # 别跟自己比
+            near = [(s, h) for s, h in scored if s >= audiofp.NEAR_SIM]
+            if near:
+                s, h = max(near, key=lambda x: x[0])
+                loc = audiofp.locate_files(str(j.get("file") or ""),
+                                           str(h.get("file") or ""))
+                if loc["method"] == "unavailable":
+                    # 历史文件被移走/删掉了：只能退回存下来的指纹（整片级）
+                    loc = audiofp.locate(jafp, h["afp"])
+                if s >= audiofp.MIN_SIM or loc["ratio"] >= audiofp.MIN_RATIO:
+                    span = (loc["spans"][0]["a"] if loc["spans"] else [])
+                    content = {"title": h["title"], "at": h["at"],
+                               "sim": s, "ratio": loc["ratio"],
+                               "overlap": loc["overlapSeconds"], "span": span,
+                               "account_id": h["account_id"]}
+        if not hits and not content:
+            continue
+        row = {
             "job_id": str(j.get("id") or ""),
             "file": os.path.basename(str(j.get("file") or "")),
-            "prev_status": hits[0]["status"],
-            "prev_at": hits[0]["at"],
-            "prev_title": hits[0]["title"],
             "times": len(hits),
-        })
+        }
+        if hits:
+            row.update({"kind": "file", "prev_status": hits[0]["status"],
+                        "prev_at": hits[0]["at"], "prev_title": hits[0]["title"]})
+        if content:
+            # 文件名也命中时以文件名口径为准（同一条，别重复提示），
+            # 否则才算内容命中——提示语走「画面内容相同」，不说技术词。
+            if not hits:
+                row.update({"kind": "content", "prev_status": "content",
+                            "prev_at": content["at"], "prev_title": content["title"],
+                            "sim": content["sim"], "ratio": content["ratio"],
+                            "overlap": content["overlap"], "span": content["span"]})
+        out.append(row)
     return out
 
 
@@ -1324,7 +1400,7 @@ def reset_stuck_publishing() -> int:
         else:
             j["status"] = "queued"
             j["attempts"] = 0
-            j["error"] = "程序中途退出，已自动重新排队"
+            j["error"] = "程序中途退出，已自动重新加入等待上传"
         n += 1
     if n:
         save_queue(q)
@@ -1364,7 +1440,7 @@ def mark(jid: str, action: str, note: str = "") -> dict:
         ok = action == "resolved_published"
         job["status"] = "published" if ok else "skipped"
         job["done_at"] = fmt(datetime.now())
-        job["error"] = "" if ok else "核实后台没有这条，结束"
+        job["error"] = "" if ok else "核实后台没有这条，已停止"
         job["resolved_by"] = "user"
         if ok:
             job["verified_at"] = job["done_at"]
@@ -1480,3 +1556,85 @@ def jobs_of_project(pid: str) -> int:
     """这个项目还有多少条视频在发布队列里（删项目前提醒用）。"""
     return len([j for j in queue()["jobs"]
                 if j.get("pid") == pid and j.get("status") in OPEN_STATUS])
+
+
+# 删项目时可以安全移除的作业状态。publishing / uncertain 可能已经交到平台，
+# 留着才能继续追踪；submit_started_at 非空同理，一律不动。
+PURGE_JOB_STATUS = ("draft", "queued", "failed", "manual")
+
+
+def purge_project(pid: str) -> dict:
+    """把某个项目的发布痕迹从全局队列/归档/备份里摘掉。
+
+    ledger（提交台账）没有 pid 字段，是防重复发的证据，**不删**。
+    返回各处的清理数量给接口回话。
+    """
+    res: dict = {"queue": 0, "archive": 0, "backups": 0, "kept": 0}
+    q = queue()
+    keep, removed = [], []
+    for j in q["jobs"]:
+        if (j.get("pid") == pid and j.get("status") in PURGE_JOB_STATUS
+                and not j.get("submit_started_at")):
+            removed.append(j)
+        else:
+            keep.append(j)
+    if removed:
+        for j in removed:
+            _ledger_add(q, j)   # 走前留一笔，别把「可能已经提交过」的证据抹掉
+        q["jobs"] = keep
+        save_queue(q)           # 注意：这一步可能新写一份 queue_backup 快照
+        res["queue"] = len(removed)
+    res["kept"] = len([j for j in q["jobs"] if j.get("pid") == pid])
+
+    # 归档：按次分批，只摘掉匹配 job，批次壳留着（归档语义是「那次归档」）
+    try:
+        with open(ARCHIVE_FILE, encoding="utf-8") as f:
+            old = json.load(f)
+    except Exception:  # noqa: BLE001
+        old = []
+    if isinstance(old, dict):
+        old = [old]
+    batches, n = [], 0
+    for b in (old if isinstance(old, list) else []):
+        if not isinstance(b, dict):
+            continue
+        jobs = b.get("jobs") or []
+        left = [j for j in jobs
+                if not (isinstance(j, dict) and j.get("pid") == pid)]
+        n += len(jobs) - len(left)
+        b = dict(b)
+        b["jobs"] = left
+        batches.append(b)
+    if n:
+        try:
+            with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
+                json.dump(batches, f, ensure_ascii=False, indent=1)
+            res["archive"] = n
+        except OSError:
+            pass
+
+    # 队列备份：save_queue 刚可能又写了一份新的，所以必须在它之后再扫。
+    # 备份里只摘 jobs，ledger / batch / template 没 pid 归属，原样留着。
+    bdir = os.path.join(core.DATA_DIR, "queue_backup")
+    if os.path.isdir(bdir):
+        for fn in os.listdir(bdir):
+            if not (fn.startswith("queue_") and fn.endswith(".json")):
+                continue
+            path = os.path.join(bdir, fn)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    d = json.load(f)
+                jobs = d.get("jobs") or []
+                left = [j for j in jobs
+                        if not (isinstance(j, dict) and j.get("pid") == pid)]
+                if len(left) == len(jobs):
+                    continue
+                d["jobs"] = left
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(d, f, ensure_ascii=False, indent=1)
+                os.replace(tmp, path)
+                res["backups"] += 1
+            except Exception:  # noqa: BLE001
+                pass
+    return res

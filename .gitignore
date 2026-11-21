@@ -15,9 +15,10 @@ build_tools/
 # 部署凭证：server.json 里是服务器明文口令，绝不入库
 deploy/server.json
 
-# 打包产物与字节码
+# 打包产物与字节码（build3/ 是 580MB 的 NSIS 安装包目录，漏挡过一次）
 dist/
 build/
+build*/
 __pycache__/
 *.pyc
 
@@ -26,3 +27,11 @@ _tmp_asr/
 _tmp_asr2/
 example/
 output/
+_hlkit*/
+
+# 本地改前备份与一次性脚本，不进仓库
+_backup*
+_extract_hl.py
+
+# 配乐素材：11 首约 57MB，本地放好即可，条目见 bgm/library.json
+bgm/audio/

@@ -364,10 +364,10 @@ def encode(src: str, dst: str, cfg: dict, spans: list, sub_tail: str,
         core.wait_cancelable(enc, 600)
         errf.close()
         if dec.returncode not in (0, None):
-            raise RuntimeError("解码失败：" + _tail(errpath))
+            raise RuntimeError("读取这一集失败，请重试")
         if enc.returncode != 0 or not os.path.isfile(part) \
                 or os.path.getsize(part) < 1024:
-            raise RuntimeError("编码失败：" + _tail(errpath))
+            raise RuntimeError("这一集处理失败，请重试")
         os.replace(part, dst)
         # 成功就把错误日志清掉（失败时留着，排查要用）
         try:

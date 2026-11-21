@@ -14,13 +14,14 @@ import hashlib
 import math
 import os
 import re
+import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 
-from . import analyze, core, nosub, render
+from . import analyze, core, nosub, render, reuse
 
-# 套间重复率上限（80%）：**只用于提示和前端标色，不拦截落盘**（2026-11-12 用户：
+# 套间重复率上限（2026-11-12 定 80%，2026-11-16 收紧到 70%）：**只用于提示和前端标色，不拦截落盘**（2026-11-12 用户：
 # 「原来程序只在事后上报重复率，不拦截。我不需要你去拦截」）。
 # 同一部剧剪 N 套，素材复用是必然的——6 套 × 4.5 分钟要 27 分钟素材，全剧只有 21 分钟。
 # 数字的**唯一来源是 analyze.OVERLAP_CAP**：plans.txt 第 5 条按它给模型下约束，
@@ -37,12 +38,13 @@ PLAN_JOB_TIMEOUT = 300
 # 进度文案里的预计时间：本地 4 次任务实测每次调用平均 194 秒 ≈ 3 分钟。
 PLAN_EST_MIN = 3
 
-# 用户可见的「档位名」，与 web/app.js 的 MODEL_LABEL 必须同步维护。
-# 后端 note / 报错里也不许再出现模型代号（2026-11-07 界面清理定的规矩）。
+# 用户可见的模型名，与 web/app.js 的 MODEL_LABEL 必须同步维护。
+# 2026-11-19 用户定：全界面统一写真实模型代号，不再翻成「快速/精细」档位。
 MODEL_LABELS = {
-    "qwen3.5-plus": "默认", "ZHIPU/GLM-5.2": "快速",
-    "ZHIPU/GLM-5.3": "快速·长剧本", "deepseek-v4-pro": "精细",
-    "deepseek-flash": "轻快", "qwen-max": "备用",
+    "qwen3.5-plus": "qwen3.5-plus", "ZHIPU/GLM-5.2": "ZHIPU/GLM-5.2",
+    "ZHIPU/GLM-5.3": "ZHIPU/GLM-5.3", "deepseek-v4-pro": "deepseek-v4-pro",
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+    "deepseek-flash": "deepseek-flash", "qwen-max": "qwen-max",
 }
 
 
@@ -232,20 +234,22 @@ def _anchor_hit(a: list[dict], b: list[dict], tol: float = 3.0) -> int:
 
 def ai_plan_run(pid: str, count: int, min_minutes: float = 4.0,
                 max_minutes: float = 5.0, order: str = ORDER_CHRONO,
-                model: str | None = None) -> None:
+                model: str | None = None, eps=None) -> None:
     """第 2 步：让 AI 一次看完整部剧，直接排出 N 套结构（单模型入口）。
 
+    eps 不为空 = 本批只在这些集里排（选集生成，见 ai_plan_multi）。
     model 不为空 = 这次编排单独指定模型（第 2 步的「选模型」下拉/输入框）；
     路由仍走 core.route 同一条规则。多模型各配参数走 ai_plan_multi。
     """
     return ai_plan_multi(pid, [{
         "model": model or "", "count": count,
         "min_minutes": min_minutes, "max_minutes": max_minutes,
-    }], order)
+    }], order, eps=eps)
 
 
 def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
-                  append: bool = False) -> None:
+                  append: bool = False, eps=None, new_batch: bool = False,
+                  task_kind: str = "plan") -> None:
     """第 2 步（多模型版）：jobs 里每个模型各配一套 {model, count, min/max_minutes}，
     各走 1 次 API（多组时按设置里的「同时生成几条」并行），所有套落到同一个项目里、index 连续编号、
     每套带 model 标记。
@@ -267,21 +271,42 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
     旧套的 edl，这样新套的重复度会跟全部旧套一起算，点名里的套号也是全局的。
     batch.plan_result 记本次「要几套 / 到手几套 / 哪几组没出来（带可重跑参数）」，
     界面据此显示提示条和补跑按钮；全部成功时 failed 为空，提示条自动消失。
+
+    eps（2026-11-19 用户定）：本批只在这些集里排。同一部剧可以**反复分批生成**——
+    这次勾 1-8 出 3 套、下次勾 5-11 再出 3 套，套全部攒在同一个项目里，
+    每套记着自己属于第几批、这批用了哪些集。出片时跨批随便勾，每套按自己的
+    edl 切自己的集，渲染链路一行不用改。
+    new_batch=True 表示这是用户主动开的新一批（批号 +1）；补跑沿用上一批的批号，
+    因为补跑补的就是「那一批里没出来的组」。
     """
     p = core.load(pid)
     if not p:
         return
     if not (p.get("episodes") or []):
-        raise RuntimeError("还没有转写结果，请先转写")
+        raise RuntimeError("还没有整理好的台词，请先整理台词")
     if not jobs:
         raise RuntimeError("没有指定任何模型")
     existing: list[dict] = list(p.get("plans") or []) if append else []
     if append and any(pl.get("mode") == "hook" for pl in existing):
         raise RuntimeError("当前是单集钩子结构，不能往里追加混剪的套")
-    total_all = sum(float(ep.get("duration") or 0) for ep in p["episodes"])
+    # 选集：只在这几集里排。不带 eps = 全集，老请求体的行为一字不变。
+    sel, dropped = analyze.select_eps(p, eps)
+    if not sel:
+        raise RuntimeError("选中的集都还没整理出台词——先在第 1 步整理台词，或把选集放宽一点")
+    scope_eps = sel if eps else None        # None = 告诉 build_plans「按全集排」
+    sel_set = set(sel)
+    total_all = sum(float(ep.get("duration") or 0) for ep in p["episodes"]
+                    if int(ep["index"]) in sel_set)
     plans: list[dict] = list(existing)   # 旧套先入列，index = len(plans)+1 天然连续
     accepted: list[list[dict]] = [pl["edl"] for pl in existing if pl.get("edl")]
     fresh_start = len(existing)
+    # 批号：同一部剧可以反复分批生成（这次勾 1-8、下次勾 5-11），套靠批号分组显示。
+    # 补跑沿用上一批的号（补的就是那批没出来的组），用户主动开新一批才 +1。
+    _hist = list((p.get("batch") or {}).get("plan_batches") or [])
+    _last_no = max([int(x.get("no") or 0) for x in _hist] + [0])
+    batch_no = ((int((p.get("batch") or {}).get("plan_batch_no") or _last_no or 1)
+                 if (append and not new_batch) else _last_no + 1)
+                if append else 1)   # 覆盖式重排 = 从头算一批
     job_summ: list[dict] = []       # 每个模型的产出小结（写进 note）
     budget_notes: list[str] = []
     total_sets = sum(max(1, min(20, int(j.get("count") or 1))) for j in jobs)
@@ -326,12 +351,12 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
     def _one(it: dict):
         # 池子里的子线程没有 start_task 设的上下文，AI 请求认不出自己属于
         # 哪个任务，中止标记就查不到（2026-11-16）。绑一次，finally 里解绑。
-        core.bind_call_ctx(pid, "cuts")
+        core.bind_call_ctx(pid, core._group_of(task_kind))
         try:
             return analyze.build_plans(
                 p, it["count"], it["mn"], it["mx"], model=it["label"] or None,
                 progress=False if multi else (it["base"], it["span"] * 0.92, it["prefix"]),
-                timeout=PLAN_JOB_TIMEOUT if multi else None)
+                timeout=PLAN_JOB_TIMEOUT if multi else None, eps=scope_eps)
         except Exception as exc:  # noqa: BLE001
             return exc
         finally:
@@ -341,7 +366,7 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
     if multi:
         conc = min(core.max_concurrent(), n_jobs)
         batches = math.ceil(n_jobs / conc)
-        core.set_task(pid, "plan", 3,
+        core.set_task(pid, task_kind, 3,
                       f"共 {n_jobs} 组，预计约 {batches * PLAN_EST_MIN} 分钟")
         pool = ThreadPoolExecutor(max_workers=conc)
         try:
@@ -352,7 +377,7 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
                 finished += 1
                 left = math.ceil((n_jobs - finished) / conc) * PLAN_EST_MIN
                 tail = f" · 预计还需约 {left} 分钟" if left else " · 正在整理结果"
-                core.set_task(pid, "plan", 3 + 89 * finished / n_jobs,
+                core.set_task(pid, task_kind, 3 + 89 * finished / n_jobs,
                               f"已完成 {finished}/{n_jobs} 组{tail}")
         finally:
             # 原来 with 的 __exit__ 是 wait=True：只要有一组抛 TaskCancelled，
@@ -415,7 +440,9 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
                     run = 0
 
             gaps = [b["gs"] - a["ge"] for a, b in zip(edl, edl[1:]) if b["gs"] - a["ge"] > 3.0]
-            eps = sorted({s["ep"] for s in edl})
+            # 本套**实际用到**的集（不是本批勾选的集，那是 sel）。名字别用 eps——
+            # 会盖掉函数入参 eps，后面想回头查「本批勾了哪些集」就查不到了。
+            ep_used = sorted({s["ep"] for s in edl})
             # 整集块：从 0:00 圈到集尾。模型很容易把「这一集正好是一场戏」当成「一块」，
             # 于是 4.5 分钟只装得下 5 集——等于把这 5 集重播一遍，混剪就没了意义
             # （2026-11-02 实测：块长一放开就往这个方向过冲）。这里**只统计、只上报**，
@@ -439,7 +466,11 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
                 "edl_text": analyze.edl_text(edl),
                 "target_sec": round((mn + mx) / 2 * 60, 1),
                 "sec": round(sec, 1),
-                "eps": [eps[0], eps[-1]] if eps else [],
+                "eps": [ep_used[0], ep_used[-1]] if ep_used else [],
+                # 这批勾了哪些集、属于第几批：界面按 batch_no 分组显示，
+                # 出片前也能一眼看出「这套是从哪一批、哪几集里排出来的」
+                "batch_no": batch_no,
+                "batch_eps": list(sel),
                 "style": f"AI 编排 · {name}",
                 # 开场钩子卡文案（出片时黑屏大字用）。AI 没给就留空，出片时用套名兜底
                 "hook": st.get("hook") or "",
@@ -465,10 +496,10 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
             if multi:
                 # 并发时进度只往前走：各组结果已经收齐，这里按组顺序整理，
                 # 不能再用「第 N 组占一截」的算法（会倒退回前面组的位置）。
-                core.set_task(pid, "plan", 92 + 7 * (ji + 1) / n_jobs,
+                core.set_task(pid, task_kind, 92 + 7 * (ji + 1) / n_jobs,
                               f"正在整理第 {ji + 1}/{n_jobs} 组的结果")
             else:
-                core.set_task(pid, "plan", base + span * (0.92 + 0.08 * i / max(1, len(sets))),
+                core.set_task(pid, task_kind, base + span * (0.92 + 0.08 * i / max(1, len(sets))),
                               f"{prefix}已整理 {done_sets + i}/{total_sets} 套")
             job_plans.append(plans[-1])
             done_sets += 1
@@ -503,8 +534,10 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
             f"（均 {sum(x['sec'] for x in j['plans']) / len(j['plans']) / 60:.1f} 分钟）"
             for i, j in enumerate(job_summ, 1) if j["plans"])
         over = [pl for pl in fresh if pl["overlap"] > MAX_OVERLAP]
+        read_what = (f"选中的 {len(sel)} 集（第 {'、'.join(str(i) for i in sel)} 集，"
+                     f"{total_all / 60:.1f} 分钟）" if scope_eps else f"全剧 {total_all / 60:.1f} 分钟")
         note = ("；".join(budget_notes) + " " if budget_notes else "") + (
-            f"AI 通读全剧 {total_all / 60:.1f} 分钟：{desc}；套间平均重合 {avg_ov * 100:.0f}%")
+            f"AI 通读{read_what}：{desc}；套间平均重合 {avg_ov * 100:.0f}%")
         if over:
             detail = "、".join(f"第{pl['index']}套与第{pl['vs']}套 {pl['overlap'] * 100:.0f}%"
                                for pl in over)
@@ -525,8 +558,13 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
             note += f"；{detail}，中间缺缓冲，看着会累"
     if job_errors:
         note += "；有组没生成成功（其它组的套都在）：" + "；".join(job_errors)
-    if append:
+    if dropped:
+        # 用户勾了但还没整理出台词的集：必须说出来，否则他以为这集被排进去了
+        note += f"；第 {'、'.join(str(i) for i in dropped)} 集还没整理出台词，这批没用上"
+    if append and not new_batch:
         note = "补跑：" + note
+    elif append and fresh:
+        note = f"第 {batch_no} 批（选集 {'、'.join(str(i) for i in sel) if scope_eps else '全部'}）：" + note
 
     p = core.load(pid) or p
     if append and fresh_start:
@@ -536,8 +574,16 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
         latest_old = list(p.get("plans") or [])
         if len(latest_old) == fresh_start:
             plans = latest_old + plans[fresh_start:]
-    gen = int(p.get("plan_gen") or 0) + 1
-    p["plan_gen"] = gen
+    # gen（结构版本）决定「哪些成片是当前结构的」。追加新套（append+new_batch）
+    # 只是往现有结构尾部加套，旧套和正在渲的成片都还是这一版的，**绝不能 bump**：
+    # 一旦 gen 变了，出片开头快照的旧 gen 写回的 sets 会被前端判成「旧结构」全部隐藏
+    # （白渲），续跑判据也跟着乱。只有覆盖式重排（换了一整套结构）才 bump。
+    # 补跑缺套（append 但非 new_batch）沿用原批号，同样不 bump。
+    if append:
+        gen = int((p.get("batch") or {}).get("gen") or p.get("plan_gen") or 0)
+    else:
+        gen = int(p.get("plan_gen") or 0) + 1
+        p["plan_gen"] = gen
     p["plans"] = plans
     # 上一次可能是「单集钩子前置」：切回混剪要显式记下模式，否则前端还按钩子
     # 模式的卡片和出片按钮显示（结构已经被下面这份 plans 覆盖了，界面就自相矛盾）。
@@ -549,10 +595,26 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
     new_mx = max(j["mx"] for j in job_summ)
     # 补跑只是往这批结构里添几套：参数面板仍回填最初那次的配置；出片进度也不能清零，
     # done 归零会让已经出片的套被重渲一遍。
-    saved_jobs = (old.get("jobs") or new_jobs) if append else new_jobs
-    saved_mn = old.get("min_minutes", new_mn) if append else new_mn
-    saved_mx = old.get("max_minutes", new_mx) if append else new_mx
-    p["batch"] = {
+    # 「再开一批」是用户主动改了集选/模型再生成，面板要回填**这次**的参数，
+    # 否则他下次打开看到的还是第一批的配置，会以为自己改的没生效。
+    keep_old = append and not new_batch
+    saved_jobs = (old.get("jobs") or new_jobs) if keep_old else new_jobs
+    saved_mn = old.get("min_minutes", new_mn) if keep_old else new_mn
+    saved_mx = old.get("max_minutes", new_mx) if keep_old else new_mx
+    # 批次台账：界面按它分组显示「第 N 批 · 用了哪些集 · 出了几套」。
+    # 覆盖式重排时清空重来，否则旧批次会留下永远点不到的孤儿记录。
+    hist = list(old.get("plan_batches") or []) if append else []
+    if fresh:
+        rec = next((x for x in hist if int(x.get("no") or 0) == batch_no), None)
+        if rec:
+            rec["sets"] = int(rec.get("sets") or 0) + len(fresh)
+            rec["eps"] = list(sel)
+        else:
+            hist.append({"no": batch_no, "eps": list(sel), "sets": len(fresh),
+                         "all": not bool(scope_eps)})
+        hist.sort(key=lambda x: int(x.get("no") or 0))
+    # 结构相关的字段（两档共用）。
+    struct_fields = {
         "count": len(plans),
         "cut_mode": "mix",
         "hook_sec": old.get("hook_sec") or 15,
@@ -560,22 +622,41 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
         "min_minutes": saved_mn,
         "max_minutes": saved_mx,
         "order": order, "plan_note": note,
+        # 下次打开回填的选集：就是这次实际用的那些集（全集时也存，前端不用再猜）
+        "plan_eps": list(sel),
+        "plan_batch_no": batch_no,
+        "plan_batches": hist,
         "summary": " / ".join(pl.get("ai_name") or f"第{pl['index']}套" for pl in plans[:8]),
         # count 记用户填的套数，不记实际产出。产出少一套时回填会把输入框改掉。
         "jobs": saved_jobs,
-        "done": old.get("done", 0) if append else 0, "gen": gen, "by": "ai",
+        "by": "ai",
         # 本次生成的结构化结果：前端提示条与「只补跑没出来的套」按钮的唯一数据来源
         "plan_result": {
             "requested": total_sets,
             "got": len(fresh),
             "total": len(plans),
             "append": bool(append),
+            "batch_no": batch_no,
             "failed": failed_jobs,
         },
     }
+    if append:
+        # 追加（含补跑）：以磁盘此刻最新的 batch 为底，只覆盖结构字段。
+        # 出片可能正在并行跑，它写的 run_id/done/failures/save_dir/gen 必须原样保住——
+        # 整块替换会让正在渲的套换指纹、进度清零、被判旧结构，等于白渲。
+        # 这里**再 load 一次**而不是用 569 行那份 old：追加跑了几分钟，
+        # 那期间出片每渲完一套都在写 done/run_id，old 早就过时了。
+        newest = core.load(pid) or p
+        newest_batch = dict(newest.get("batch") or {})
+        p["batch"] = newest_batch | struct_fields
+    else:
+        # 覆盖式重排：整套换血，done 归零（旧片本来就作废了）。
+        p["batch"] = struct_fields | {"done": 0, "gen": gen}
     core.set_task(pid, None)
     # 只写结构相关的字段：第 3 步分镜可能正在并行保存，整份覆盖会把分镜清掉。
-    core.save_merge(p, ["plan_gen", "plans", "batch"])
+    # 追加时 gen 不 bump，plan_gen 也别写（保持和出片快照一致）。
+    save_keys = ["plan_gen", "plans", "batch"] if not append else ["plans", "batch"]
+    core.save_merge(p, save_keys)
 
 
 # ── 单集钩子前置（2026-11-06）──────────────────────────────────────────────
@@ -732,7 +813,7 @@ def hookcut_run(pid: str, eps: list[int] | None = None, hook_sec: float = 15,
         return
     eps_all = [int(e["index"]) for e in p["episodes"]]
     if not eps_all:
-        raise RuntimeError("还没有转写结果，请先转写")
+        raise RuntimeError("还没有整理好的台词，请先整理台词")
     want: set[int] = set()
     for x in (eps or []):
         try:
@@ -825,7 +906,7 @@ def hookcut_run(pid: str, eps: list[int] | None = None, hook_sec: float = 15,
 
     if not plans:
         core.set_task(pid, None)
-        raise RuntimeError("没有可用的集，请检查转写结果")
+        raise RuntimeError("没有可用的集，请检查台词是否整理好了")
 
     note = (f"AI 通读 {len(sel)} 集台词，给每集挑了一个 {hk} 秒钩子；"
             f"成片 = 钩子 + 本集完整正片（钩子那段在正片里会再出现一次），共 {len(plans)} 条")
@@ -897,10 +978,10 @@ def _pic_sig(fx: dict) -> str:
     if fx.get("mirror"):
         out.append("M")
     # 开头镜像（2026-11-12）：开关和方向都得进指纹，否则勾上 / 换方向再出片，
-    # 进度一闪而过拿到的还是没翻的旧片。默认关 → 空串，老项目指纹不变。
+    # 进度一闪而过拿到的还是没翻的旧片。默认开+上下翻（2026-11-18），方向缺省 v。
     if fx.get("first_mirror"):
-        d = str(fx.get("first_mirror_dir") or "h").strip().lower()
-        out.append("FH" if d != "v" else "FV")
+        d = str(fx.get("first_mirror_dir") or "v").strip().lower()
+        out.append("FH" if d == "h" else "FV")
     try:
         st = float(fx.get("stretch") or render.FX_DEFAULTS["stretch"])
     except (TypeError, ValueError):
@@ -937,7 +1018,8 @@ def _pic_sig(fx: dict) -> str:
 
 
 def render_plans(pid: str, save_dir: str | None = None,
-                 fx: dict | None = None, sets_fx: dict | None = None) -> None:
+                 fx: dict | None = None, sets_fx: dict | None = None,
+                 only: list[int] | None = None) -> None:
     """只渲染勾选的套。每套完成立即落盘，中断重启自动续跑未完成的。
 
     save_dir：这批成片存哪个文件夹（用户自己指定）。不传就沿用上次记下的，
@@ -948,7 +1030,7 @@ def render_plans(pid: str, save_dir: str | None = None,
     "hook_sec": 卡片时长, "buffer_speed": 缓冲段加速 1.15×,
     "bgm": 混入背景音乐, "bgm_path": 本地音乐路径（手选，或自动配乐由曲库解析所得）,
     "bgm_vol": BGM 音量（0.05-0.6，默认 0.22，台词响时程序自动压低音乐）}，
-    前四项缺省都开，bgm 缺省关（不开就不碰音乐文件）。
+    前四项缺省都开，bgm 缺省也开（2026-11-18 用户定，自动配乐默认铺）。
     段间音频淡入淡出不设开关——60/120 毫秒听不出来，只把切口的「咔」声磨掉。
 
     钩子卡文案：每套 pl["hook"]（AI 第 2 步随结构给的，前端可改）；
@@ -967,6 +1049,10 @@ def render_plans(pid: str, save_dir: str | None = None,
     if not p:
         return
     plans = [pl for pl in (p.get("plans") or []) if pl.get("on", True)]
+    if only:
+        # 只渲指定套（新追加的套单独出片）：读最新 plans 再筛，不用任务开头那份快照。
+        want = set(int(i) for i in only)
+        plans = [pl for pl in plans if int(pl.get("index") or 0) in want]
     if not plans:
         raise RuntimeError("没有勾选任何结构，请先勾选要出片的套")
 
@@ -1003,28 +1089,40 @@ def render_plans(pid: str, save_dir: str | None = None,
         现在「每套都能单独设」——第 3 套不要钩子卡、第 4 套换一首 BGM，都是
         在 setfx 里带 title/hook_card/bgm… 覆盖掉全局值。
 
-        缺省语义（2026-11-05 晚按用户要求改）：看点字幕、开场钩子卡**默认关**，
-        放大、缓冲加速默认开，BGM 默认关。缺省值必须和前端面板、RenderFx 三处一致，
-        否则「面板显示关、出片却烧了字幕」这种错最难查。
+        缺省语义（2026-11-18 用户定）：看点字幕、开场钩子卡**默认关**，
+        放大、缓冲加速、BGM、镜头转场、开头闪镜（上下翻）默认开。缺省值必须和前端
+        面板、RenderFx 三处一致，否则「面板显示关、出片却烧了字幕」这种错最难查。
         """
         try:
             hs = float(px.get("hook_sec") or base_hook_sec)
         except (TypeError, ValueError):
             hs = base_hook_sec
+        # 段间转场时长（2026-11-18 默认开）：没存过用 TRANS_SEC(0.7)，显式 0 才是关。
+        # 前端/项目里存的字符串也认。
+        raw_ts = px.get("trans_sec", render.TRANS_SEC)
+        try:
+            ts = float(raw_ts)
+        except (TypeError, ValueError):
+            ts = render.TRANS_SEC
+        ts = 0.0 if ts <= 0 else min(1.5, max(0.4, ts))
         has_bgm = bool(px.get("bgm"))
         bp = (px.get("bgm_path") or "").strip() if has_bgm else ""
         try:
-            bv = min(0.6, max(0.05, float(px.get("bgm_vol") or 0.22)))
+            bv = min(0.6, max(0.05, float(px.get("bgm_vol") or 0.35)))
         except (TypeError, ValueError):
-            bv = 0.22
+            bv = 0.35
         return {
             "title": bool(px.get("title", False)),
             "zoom": px.get("zoom", True) is not False,
             "hook": bool(px.get("hook_card", False)),
             "speed": px.get("buffer_speed", True) is not False,
             "hook_sec": min(4.0, max(1.0, hs)),
+            "trans_sec": ts,
             "bgm_path": bp,
-            "bgm_vol": bv if bp else 0.22,
+            "bgm_vol": bv if bp else 0.35,
+            # 去掉原片背景音乐（2026-11-19 用户定默认开）：缺省当开，只有显式 false 才关。
+            # 代价是首次出片多几分钟，同样素材再出走缓存。
+            "voice_iso": px.get("voice_iso") is not False,
             # 指纹强度（2026-11-12）：每套按这个档位抽自己的画面参数。
             # 认不出的值一律落回「标准」，别让前端传个怪字符串把整批带崩。
             "fp_level": (str(px.get("fp_level") or "").strip().lower()
@@ -1034,8 +1132,12 @@ def render_plans(pid: str, save_dir: str | None = None,
 
     def _speed_of(seg: dict) -> float:
         # 缓冲块（评分 5-6）加速 1.15×：反应、沉默、过场收紧，爆点块保持原速
+        # 2026-11-21：结构不再要求评分（只要 from/to），没有「缓冲块」这个概念了。
+        # 原来写 `or 0`——缺评分会被当成 0 分，全套块都吃 1.15 倍速、成片短一截。
         try:
-            return render.BUFFER_SPEED if float(seg.get("rating") or 0) <= 6 else 1.0
+            if seg.get("rating") is None:
+                return 1.0
+            return render.BUFFER_SPEED if float(seg["rating"]) <= 6 else 1.0
         except (TypeError, ValueError):
             return 1.0
 
@@ -1086,113 +1188,221 @@ def render_plans(pid: str, save_dir: str | None = None,
     if _needs_spans():
         nosub.ensure_spans(pid, on_msg=lambda m: core.set_task(pid, "batch", 0, m))
 
+    # ── 阶段 1：主线程串行准备每一套的参数（纯计算 + 读项目，很快）──────────
+    # 原来的大循环把「算参数 / 渲染 / 写回」搅在一起，没法并行。拆开后：
+    #   · 准备与写回都留在主线程 → 多套同时写 sets/batch 互相覆盖的竞态彻底消失；
+    #   · 只有最耗时的 render_edl 丢线程池 → 26 套能同时渲染，按机器核心数封顶。
+    jobs: list[dict] = []
     for k, pl in enumerate(plans):
-        p = core.load(pid) or p
-        sets = p.setdefault("sets", [])
-        # 这一套实际用的参数：全局默认 + 单套覆盖（请求里带的优先，其次项目里存的）
         ov = {}
         if isinstance(sets_fx, dict):
             ov = sets_fx.get(str(pl["index"])) or sets_fx.get(pl["index"]) or {}
         if not ov:
             ov = pl.get("fx") or {}
         setfx = dict(fx)
-        # 注意变量名：外层 k 是套序号，这里不能用 k 覆盖（否则下面进度回调拿到字符串）
         for fk, fv in (ov or {}).items():
             if fv is not None:
                 setfx[fk] = fv
-        # 开关按套算（2026-11-05）：单套可以关掉标题/放大/钩子卡/变速，或换自己的 BGM
         fl = _flags(setfx)
-        # 开场钩子卡文案：AI 给的优先，没有就用套名兜底（第 2 步之前的项目没这个字段）
         this_hook = ""
         if fl["hook"]:
             this_hook = (pl.get("hook") or "").strip() or (pl.get("ai_name") or "").strip()
-        # 出片参数指纹：片头/标题/画面/素材版本/变速/BGM 任一开关变了，旧成片就不算这次的结果，
-        # 必须重渲——否则用户打开钩子卡点「出片」，进度一闪而过，拿到的还是
-        # 上一版没有片头的片子。前四位依次是 标题/变速/钩子/缩放。
-        # 老记录没有 fx 字段，按「有标题、有变速、无钩子、无缩放」(1101|) 算。
-        # BGM 部分追加在第二个 | 后（音量+文件路径）；没开 BGM 就不加这一段，
-        # 老的无 BGM 记录指纹不变，不会被误判成要重渲。
-        bgm_sig = (f"B{round(fl['bgm_vol'] * 100):03d}{fl['bgm_path']}"
-                   if fl["bgm_path"] else "")
+
+        # 指纹（与旧逻辑逐字一致）：变了就必须重渲
+        bgm_sig = (("I1" if fl["voice_iso"] else "")
+                   + (f"{render.BGM_MIX_VER}"
+                      f"B{round(fl['bgm_vol'] * 100):03d}{fl['bgm_path']}"
+                      if fl["bgm_path"] else ""))
         pic_sig = _pic_sig(setfx)
-        # 这一套用了去字幕版：副本本身的参数指纹也要算进来。用户把副本从
-        # 「裁掉」重做「柔和抹掉」后点出片，必须重渲，不能拿旧版素材出的片充数。
         _ver = str(setfx.get("src_ver") or "").strip()
         if _ver == "nosub":
-            # 副本指纹 + 烧字指纹（2026-11-16）：副本只负责抹，台词和字幕样式是
-            # 出片时才烧上去的。只算副本指纹的话，改了台词/样式点出片会被判成
-            # 「没变」直接跳过，用户拿回的还是旧字的片子。
             ns = p.get("nosub") or {}
-            ver_sig = (str(ns.get("sig") or "") + "|"
-                       + str(ns.get("burn_sig") or ""))
+            ver_sig = str(ns.get("sig") or "") + "|" + str(ns.get("burn_sig") or "")
         elif _ver == "live":
-            # 现场做：抹除参数 + 新字幕风格 + 每集台词内容都由 sig_of 算，
-            # 改了任一项都必须重渲（台词改了字幕就得跟着变）
             ver_sig = "live" + nosub.sig_of((p.get("nosub") or {}).get("cfg") or {},
                                             p.get("episodes") or [])
         else:
             ver_sig = ""
         fx_sig = (f"{int(fl['title'])}{int(fl['speed'])}"
                   f"{int(bool(this_hook))}{int(fl['zoom'])}|{this_hook[:40]}"
-                  # 指纹批次号 + 强度档：换了批次（又重新点了出片）或改了档位，
-                  # 这套的旧成片就不再是这次要的结果，必须重渲
                   + f"|R{fl['fp_level']}{run_id}"
+                  + ("|F1" if fl["zoom"] else "")
                   + (f"|{bgm_sig}" if bgm_sig else "")
                   + (f"|P{pic_sig}" if pic_sig else "")
-                  + (f"|V{ver_sig}" if ver_sig else ""))
-        done = next((s for s in sets if s.get("index") == pl["index"] and s.get("output")
+                  + (f"|V{ver_sig}" if ver_sig else "")
+                  + (f"|T{fl['trans_sec']:.2f}" if fl["trans_sec"] > 0 else ""))
+
+        # 这一套已有合格成片就跳过（续跑）
+        done = next((s for s in (p.get("sets") or [])
+                     if s.get("index") == pl["index"] and s.get("output")
                      and int(s.get("gen") or 0) == gen
                      and (s.get("fx") or "1101|") == fx_sig), None)
         if done:
-            # 续跑跳过的前提是成片文件真的还在**且就在这次的目标目录里**。
-            # 换过保存位置（含 2026-11-02 起「根目录/项目名」这层子目录）后，
-            # 旧记录指向的是别处的文件，继续当「已完成」会让人以为这片子是刚出的。
             old = core.abs_output(done["output"])
             same_dir = os.path.normcase(os.path.dirname(os.path.normpath(old))) == \
                 os.path.normcase(os.path.normpath(target))
             if os.path.isfile(old) and same_dir:
                 continue
-            sets.remove(done)
-        edl = pl["edl"]
-        # 单集钩子前置：文件名固定成「第03集_钩子版.mp4」（不带时间戳）——
-        # 每集本来就是一条独立成片，带时间戳的话重渲一次就在文件夹里多一条，
-        # 用户分不清哪条是新的。重渲由 fx 指纹判定，直接覆盖同名文件。
         name = (pl.get("out_name")
                 or f"{p['name']}_混剪set{pl['index']:02d}_{time.strftime('%m%d%H%M%S')}.mp4")
-        # 进度文案的单位：混剪是「套」，钩子前置是「条」（一条 = 一集）
         unit = pl.get("tag") or f"set{pl['index']:02d}"
         kind = "条" if pl.get("mode") == "hook" else "套"
+        jobs.append({
+            "k": k, "pl": pl, "setfx": setfx, "fl": fl, "this_hook": this_hook,
+            "fx_sig": fx_sig, "name": name, "unit": unit, "kind": kind,
+        })
+
+    total = len(jobs) if jobs else total  # 进度按实际要渲染的套数算
+    # 本趟队列（顺序 = 结构顺序）：进度上报时整份送给前端，「出片进度」列表才能
+    # 区分「排队中 / 正在出 / 已出片」。光靠 msg 只有编号最小的那套，2 路并发时
+    # 另一套在前端完全看不出来（2026-11-21 用户定：这是进度视图，要能看到整张表）。
+    queue = [(job["k"], int(job["pl"]["index"])) for job in jobs]
+    n_cpu = os.cpu_count() or 4
+    # 路数封顶 2（2026-11-21）：ffmpeg 每套多线程 + 人声分离（10 线程 ONNX）
+    # 叠加瞬时内存峰值，3 路并行曾让人声分离的大数组分配偶发 OOM 失败
+    # （"Unable to allocate 40.4 MiB"）。降到 2 路减小峰值；voiceiso 另有重试兜底。
+    conc = max(1, min(2, n_cpu // 3, max(1, len(jobs))))
+
+    # ── 阶段 2：渲染并行 + 每套渲完立即写回（2026-11-21 A1）─────────────────
+    # 以前 26 套全渲完才在阶段 3 统一写 sets：渲染中哪怕前几套已成片，界面仍全
+    # 显示「待生成」，中途崩了这几套还得重渲。现在每渲完一套就由主线程写回一次
+    # ——写回仍串行（多套同时写 sets 会互相覆盖），但穿插在渲染里，前端轮询立刻
+    # 能看到状态变化，中止续跑也不会重渲已落盘的套。
+    # 进度聚合：每套贡献 0~100（渲染 0~95、写回完成记 100），按总套数取平均；
+    # 高水位钳制只增不减。worker 回调只报数、不检查中止（否则 _abort 会被
+    # _render_one 当成「单套失败」）；主线程写回后的那次报数才检查中止。
+    _rp_lock = threading.Lock()
+    _rp: dict[int, dict] = {}   # job k -> {pct(0-95), msg, done, written, idx}
+    _rp_high = [0.0]            # 全局进度高水位，保证单调不减
+
+    def _queue_rows() -> list[dict]:
+        """本趟每一套的实时状态（调用方必须已持 _rp_lock）。
+
+        没进 _rp 的就是「还没开渲」，仍在池子里排队——这是前端唯一能区分
+        「等待出片」和「还没出片」的依据（后者根本不在这一趟里）。
+        """
+        out = []
+        for k, idx in queue:
+            r = _rp.get(k)
+            if r is None:
+                out.append({"index": idx, "state": "wait", "pct": 0.0, "msg": "排队中"})
+            elif r["written"] or r["done"]:
+                out.append({"index": idx, "state": "done",
+                            "pct": 100.0 if r["written"] else 95.0,
+                            "msg": r["msg"] or "已成片"})
+            else:
+                out.append({"index": idx, "state": "run",
+                            "pct": round(min(95.0, float(r["pct"] or 0)), 1),
+                            "msg": r["msg"] or "渲染中"})
+        return out
+
+    def _report_render(check_cancel: bool = False):
+        with _rp_lock:
+            rows = list(_rp.values())
+            qrows = _queue_rows()
+        if not rows:
+            return
+        done_n = sum(1 for r in rows if r["written"])
+        # 单套贡献：已写回=100，渲完待写回=95，渲染中=其 pct（封顶 95）
+        unit = sum(100.0 if r["written"] else (95.0 if r["done"]
+                   else min(95.0, float(r["pct"] or 0))) for r in rows)
+        pct = min(100.0, unit / max(1, total))
+        pct = max(_rp_high[0], pct)
+        _rp_high[0] = pct
+        # 文案锁定「编号最小的未完成套」，并发时不会 successive 回调跳字
+        live = [r for r in rows if not r["written"]]
+        if live:
+            lead = min(live, key=lambda r: r["idx"])
+            # 「本趟」写清楚：这行只有百分比和进度，项目的成片总数在列表顶上另报，
+            # 写成「已完成 0/8」会被读成「项目一套都没出」（明明十几套在列着）。
+            msg = (f"本趟完成 {done_n}/{total} 套（同时 {conc} 套）"
+                   f" · 第{lead['idx']}套 {lead['msg']}")
+        else:
+            msg = f"本趟 {done_n}/{total} 套已成片"
+        core.set_task(pid, "batch", pct, msg, ignore_cancel=not check_cancel,
+                      extra={"queue": qrows, "total": total, "conc": conc})
+
+    def _mk_progress(k: int, idx):
+        """给 render_edl 的进度回调：只更新共享状态，再统一聚合上报。"""
+        def _cb(pct, msg):
+            with _rp_lock:
+                cur = _rp.setdefault(k, {"pct": 0.0, "msg": "准备渲染",
+                                         "done": False, "written": False, "idx": idx})
+                cur["pct"] = float(pct or 0)
+                if msg:
+                    cur["msg"] = str(msg)
+            _report_render()
+        return _cb
+
+    def _render_one(job: dict):
+        # 池子线程没有 start_task 设的上下文，绑一次才能查到中止标记。
+        core.bind_call_ctx(pid, "cuts")
         try:
+            k = job["k"]
+            pl, fl, setfx = job["pl"], job["fl"], job["setfx"]
             info = render.render_edl(
-                p, edl, name, cleanup=False, out_dir=target,
-                # 顶部标题：每块烧一行它的 label（去【分类】前缀），见 render._title_text
+                p, pl["edl"], job["name"], cleanup=False, out_dir=target,
                 title_of=render._title_text if fl["title"] else None,
-                # 缓冲加速只对多套混剪有意义（它按 rating≤6 判缓冲段）。单集钩子
-                # 前置的两段是「钩子 + 整集」，加速会把整集正片变快、钩子却是爆点，
-                # 所以这个模式强制原速（前端对应选项也置灰）。
                 speed_of=_speed_of if (fl["speed"] and pl.get("mode") != "hook") else None,
-                hook=this_hook or None, hook_sec=fl["hook_sec"],
+                hook=job["this_hook"] or None, hook_sec=fl["hook_sec"],
+                trans_sec=fl["trans_sec"],
                 zoom=render.ZOOM if fl["zoom"] else 1.0,
                 bgm_path=fl["bgm_path"] or None, bgm_vol=fl["bgm_vol"],
+                voice_iso=fl["voice_iso"],
                 fx=setfx, grade_seed=f"{pid}:{pl['index']}:{gen}",
-                # 指纹随机：一套一个种子（含本次批次号），整批里每套各不相同；
-                # fp_pos 按套号用黄金分割铺开，保证十几套的放大倍率不撞在同一档
                 fp_level=fl["fp_level"],
                 fp_seed=f"{pid}:{pl['index']}:{gen}:{run_id}",
                 fp_pos=(int(pl["index"]) * 0.6180339887) % 1.0,
-                progress=lambda pct, msg, k=k, total=total: core.set_task(
-                    pid, "batch", (k + pct / 100.0) / total * 100,
-                    f"第 {k + 1}/{total} {kind}（{unit}）：{msg}"))
-        except Exception as exc:  # noqa: BLE001 —— 单套失败必须与整批隔离
+                auto_fx=(setfx.get("auto_fx") is not False),
+                progress=_mk_progress(k, pl["index"]),
+                work_tag=str(pl["index"]))
+            with _rp_lock:
+                # 正常情况 render_edl 一路回调过、k 已在 _rp 里；setdefault 兜住
+                # 「一次进度都没报就成功返回」的边界，别让 KeyError 把成功套误判成失败
+                st = _rp.setdefault(k, {"pct": 0.0, "msg": "已成片",
+                                        "done": False, "written": False,
+                                        "idx": pl["index"]})
+                st["pct"] = 95.0
+                st["done"] = True
+            _report_render()
+            return k, info, None
+        except Exception as exc:  # noqa: BLE001 —— 单套失败带回主线程，不中断整批
+            with _rp_lock:
+                _rp.setdefault(job["k"], {"pct": 0.0, "msg": "渲染失败",
+                                          "done": False, "written": False,
+                                          "idx": job["pl"]["index"]})
+                _rp[job["k"]]["done"] = True
+            _report_render()
+            return job["k"], None, exc
+        finally:
+            core.bind_call_ctx(None, None)
+
+    def _writeback(job: dict, info, exc):
+        """主线程逐套写回：渲完一套立刻落盘，前端轮询随即能看到状态变化。
+
+        2026-11-21 A1：以前写回压在「全部渲完」之后，渲染中哪怕已成片也全显示
+        「待生成」，中途崩了还得整批重渲。现在每套完成（含失败）就在这里收口，
+        中止/续跑判据不变——有 output 且 gen/fx 对得上的套仍会被跳过。
+        check_cancel=True 保留主线程的中止检查点：worker 报数用 ignore_cancel，
+        但这套落盘后的报数必须能响应「中止」。
+        """
+        nonlocal ok, p
+        pl = job["pl"]
+        k = job["k"]
+        if exc is not None:
             msg = (str(exc) or type(exc).__name__).strip()[:200]
             failures.append({"index": pl["index"], "error": msg})
             p = core.load(pid) or p
             p.setdefault("batch", {})["failures"] = failures
-            core.set_task(pid, "batch", (k + 1) / total * 100,
-                          f"第 {k + 1}/{total} {kind}（{unit}）失败：{msg[:80]}，跳过继续")
             core.save_merge(p, ["batch"])
-            time.sleep(1)
-            continue
+            with _rp_lock:
+                st = _rp.setdefault(k, {"pct": 95.0, "msg": "渲染失败",
+                                        "done": True, "written": False,
+                                        "idx": pl["index"]})
+                st["done"] = True
+                st["written"] = True  # 失败套也走完，进度得往前，不能永远卡住
+            _report_render(check_cancel=True)
+            return
         if pl.get("mode") == "hook":
             hs, he = (list(pl.get("hook_span") or [0, 0]) + [0, 0])[:2]
             notes = "；".join(filter(None, [
@@ -1204,24 +1414,69 @@ def render_plans(pid: str, save_dir: str | None = None,
         else:
             notes = "；".join(filter(None, [
                 f"主题：{pl['ai_name']}" if pl.get("ai_name") else "",
-                f"{len(edl)} 段 / {info['duration'] / 60:.1f} 分钟（目标 {pl.get('target_sec', 0) / 60:.1f}）",
+                f"{len(pl['edl'])} 段 / {info['duration'] / 60:.1f} 分钟（目标 {pl.get('target_sec', 0) / 60:.1f}）",
                 pl.get("style") or "",
             ]))
-        sets = [s for s in sets if s.get("index") != pl["index"] or int(s.get("gen") or 0) != gen]
+        # 每套写回前重读最新项目：并行的第 3 步分镜可能刚写了别的字段。
+        p = core.load(pid) or p
+        sets = p.setdefault("sets", [])
+        sets[:] = [s for s in sets
+                   if s.get("index") != pl["index"] or int(s.get("gen") or 0) != gen]
         sets.append({
-            "index": pl["index"], "gen": gen, "fx": fx_sig,
+            "index": pl["index"], "gen": gen, "fx": job["fx_sig"],
             "tag": pl.get("tag") or "",
-            "edl": edl, "edl_text": pl.get("edl_text", ""),
+            "edl": pl["edl"], "edl_text": pl.get("edl_text", ""),
             "notes": notes, "output": os.path.join(target, info["name"]),
             "output_duration": info["duration"], "output_size": info["size"],
         })
         sets.sort(key=lambda s: s.get("index") or 0)
-        p["sets"] = sets
         ok += 1
         p.setdefault("batch", {})["done"] = ok
-        core.set_task(pid, "batch", (k + 1) / total * 100, f"已完成 {ok}/{total} {kind}")
-        # p 是这一轮开头 load 的快照，从这里整份 save 会把并行的第 3 步分镜清掉。
+        with _rp_lock:
+            st = _rp.setdefault(k, {"pct": 95.0, "msg": "已成片",
+                                    "done": True, "written": False,
+                                    "idx": pl["index"]})
+            st["done"] = True
+            st["written"] = True
         core.save_merge(p, ["sets", "batch"])
+        _report_render(check_cancel=True)
+        # 素材复用台账：出片成功才记
+        if pl.get("mode") != "hook" and pl.get("edl"):
+            try:
+                reuse.record(p, [(f"{gen}:{pl['index']}", pl["edl"])])
+            except Exception:  # noqa: BLE001 —— 台账坏了不能挡出片
+                pass
+
+    if len(jobs) <= 1:
+        if jobs:
+            # 单套也要先把队列摆出来：否则第一次进度回调之前，前端只能显示
+            # 「还没出片」，看着像没在跑。
+            core.set_task(pid, "batch", 0, f"开始出片 {len(jobs)} 套",
+                          extra={"queue": [{"index": idx, "state": "wait",
+                                            "pct": 0.0, "msg": "排队中"}
+                                           for _, idx in queue],
+                                 "total": len(jobs), "conc": conc})
+        for job in jobs:
+            _, info, exc = _render_one(job)
+            _writeback(job, info, exc)
+    else:
+        core.set_task(pid, "batch", 0, f"开始并行渲染 {len(jobs)} 套（同时 {conc} 套）",
+                      extra={"queue": [{"index": idx, "state": "wait", "pct": 0.0,
+                                        "msg": "排队中"} for _, idx in queue],
+                             "total": len(jobs), "conc": conc})
+        pool = ThreadPoolExecutor(max_workers=conc)
+        try:
+            futs = {pool.submit(_render_one, job): job for job in jobs}
+            for fut in as_completed(futs):
+                job = futs[fut]
+                try:
+                    _, info, exc = fut.result()
+                except Exception as ferr:  # noqa: BLE001 —— 中止时未开渲的套被 cancel，当这一套失败收口
+                    _, info, exc = job["k"], None, ferr
+                _writeback(job, info, exc)
+        finally:
+            # 中止时 cancel_futures=True，别让没开渲的套拖住退出（同 plan 并行口径）。
+            pool.shutdown(wait=False, cancel_futures=True)
 
     # 整批只清一次临时目录（复用覆盖写，见 render_edl 的 cleanup 说明）
     p = core.load(pid) or p
@@ -1229,6 +1484,10 @@ def render_plans(pid: str, save_dir: str | None = None,
         p["batch"]["failures"] = failures
     core.save_merge(p, ["batch"])
     if failures and not ok:
+        # 全失败也是「这一批结束了」：先清任务标记再抛错。否则 task.json 残留
+        # {"kind":"batch"}，服务一重启就被当成「上次中断正在续跑」，界面永久卡在
+        # 「正在出片 0%」、出片按钮禁用（2026-11-18 用户卡死的根因）。
+        core.set_task(pid, None)
         what = "条" if (plans[0].get("mode") == "hook") else "套"
         raise RuntimeError(f"全部 {total} {what}都失败了，第一条的原因：{failures[0]['error']}")
     core.set_task(pid, None)
