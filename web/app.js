@@ -713,26 +713,47 @@ $("#auto-proj-toggle").addEventListener("click", () => {
   const show = box.classList.toggle("hidden") === false;   // toggle 后是隐藏就 show=false
   btn.textContent = show ? "收起 ▴" : "设置 ▾";
   if (show && !box.dataset.ready) {
-    box.innerHTML = autoParamsHTML("ap_");
+    box.innerHTML = '<div class="hint" id="ap-preview"></div>' + autoParamsHTML("ap_");
     autoBind("ap_");
     box.dataset.ready = "1";
   }
   if (show) {
     const saved = (ST.proj && ST.proj.autopipe && ST.proj.autopipe.cfg) || ST.autoCfg;
     autoFillCfg("ap_", saved);
+    apRefreshPreview();
   }
 });
+/* 预演卡（2026-11-23，借鉴竞品的「点击前任务摘要」）：全自动参数面板展开时，
+   用纯计算接口把这一单的规模摆出来。失败静默清空——预演是锦上添花，不能挡操作。 */
+async function apRefreshPreview() {
+  const el = document.getElementById("ap-preview");
+  const p = ST.proj;
+  if (!el || !p) return;
+  let cfg = null;
+  try { cfg = autoReadCfg("ap_", false); } catch (_) { /* 面板没填好就用项目存的 */ }
+  el.textContent = "估算这一单的规模…";
+  try {
+    const pv = await api(`/api/projects/${p.id}/autopipe/preview`,
+      { method: "POST", body: JSON.stringify(cfg ? { cfg } : {}) });
+    if (!pv || pv.error) { el.textContent = ""; return; }
+    el.textContent = `预计：生成 ${pv.sets} 套 · 选 ${pv.eps} 集 · 调模型 ${pv.ai_calls} 次 · ` +
+      `排结构约 ${pv.est_plan_min || 0} 分钟 + 出片约 ${pv.est_render_min} 分钟` +
+      (pv.resume ? " · 结构沿用上次，不重复花钱" : "");
+  } catch (_) { el.textContent = ""; }
+}
+
 $("#btn-autopipe").addEventListener("click", async () => {
   const p = ST.proj; if (!p) return;
   // 面板没展开就先展开并填好（用项目存的 cfg，没有就用全局上次）
   const box = $("#auto-proj-params");
   if (box && !box.dataset.ready) {
-    box.innerHTML = autoParamsHTML("ap_");
+    box.innerHTML = '<div class="hint" id="ap-preview"></div>' + autoParamsHTML("ap_");
     autoBind("ap_");
     box.dataset.ready = "1";
     box.classList.remove("hidden");
     const saved = (p.autopipe && p.autopipe.cfg) || ST.autoCfg;
     autoFillCfg("ap_", saved);
+    apRefreshPreview();
     const tg = $("#auto-proj-toggle"); if (tg) tg.textContent = "收起 ▴";
   }
   const cfg = autoReadCfg("ap_", false);
@@ -745,14 +766,34 @@ $("#btn-autopipe").addEventListener("click", async () => {
   const jobLine = cfg.jobs.map((j) => `${j.model} ${j.count} 套`).join("、");
   const j0 = cfg.jobs[0] || {};
   const mins = j0.min_minutes ? `${j0.min_minutes}-${j0.max_minutes} 分钟` : "";
+  // 预演（2026-11-23）：把面板上还没保存的参数也送过去算，拿到调用次数/耗时/
+  // 素材预警再确认。失败退回原静态文案——预演绝不能挡启动。
+  let pv = null;
+  try {
+    pv = await api(`/api/projects/${p.id}/autopipe/preview`,
+      { method: "POST", body: JSON.stringify({ cfg }) });
+  } catch (_) { /* 预演失败不挡启动 */ }
+  const bodyLines = [
+    "会从整理台词一路做到出片，中间不用你点：整理台词 → 抹原字幕 → 生成剪辑结构 → 出片。",
+    `模型：${jobLine}，共 ${total} 套${mins ? `，每套 ${mins}` : ""}。`,
+  ];
+  if (pv && !pv.error) {
+    const bd = pv.ai_breakdown || {};
+    const planTxt = pv.resume ? `沿用上次结构（0 次，${pv.reuse_sets} 套已生成）`
+      : `排结构 ${bd.plan || 0} 次`;
+    bodyLines.push(`预计调模型 ${pv.ai_calls} 次（${planTxt} + 台词校对 ${bd.proof || 0} 次）；` +
+      `排结构约 ${pv.est_plan_min || 0} 分钟、出片约 ${pv.est_render_min} 分钟` +
+      (pv.source_minutes ? `（素材 ${pv.source_minutes} 分钟）` : "") + "。");
+    if (pv.eps_no_lines) {
+      bodyLines.push(`选中的 ${pv.eps} 集里还有 ${pv.eps_no_lines} 集没台词，会先补转写。`);
+    }
+    (pv.budget_warn || []).forEach((w) => bodyLines.push("⚠️ " + w));
+  }
+  bodyLines.push(cfg.save_dir ? `成片存到：${cfg.save_dir}` : "成片存到项目自己的默认目录。");
+  bodyLines.push("跑的过程中会调 AI、占电脑（出片时比较卡），跑完前别关这个窗口。");
   const go = await askConfirm({
     title: "一键全自动：跑完整个流程？",
-    body: [
-      "会从整理台词一路做到出片，中间不用你点：整理台词 → 抹原字幕 → 生成剪辑结构 → 出片。",
-      `模型：${jobLine}，共 ${total} 套${mins ? `，每套 ${mins}` : ""}。`,
-      cfg.save_dir ? `成片存到：${cfg.save_dir}` : "成片存到项目自己的默认目录。",
-      "跑的过程中会调 AI、占电脑（出片时比较卡），跑完前别关这个窗口。",
-    ],
+    body: bodyLines,
     okText: "开始全自动",
   });
   if (!go) return;
@@ -2296,6 +2337,13 @@ $("#btn-open-folder").addEventListener("click", async () => {
   }
 });
 
+/* 导出出片清单 CSV（2026-11-23）：套号/状态/时长/错误，直链下载。 */
+$("#btn-sets-export").addEventListener("click", () => {
+  const p = ST.proj;
+  if (!p) return;
+  window.location.href = "/api/projects/" + p.id + "/render-report";
+});
+
 /* 用系统默认播放器打开某一套（不在浏览器里开页面） */
 $("#sets-list").addEventListener("click", async (e) => {
   const play = e.target.closest("[data-play]");
@@ -2385,6 +2433,8 @@ function renderSets() {
   });
   const fails = {};
   ((p.batch || {}).failures || []).forEach((f) => { fails[Number(f.index)] = f; });
+  // 待复核（2026-11-23）：上批被中止没出完的套——按停 ≠ 失败，单独标出来。
+  const reviewSet = new Set((((p.batch || {}).review) || {}).indexes || []);
   // 行来源 = 结构表 + 已有成片 + 本趟队列。队列里可能有结构表里没有的套号
   // （出片中场改过结构/勾选），那种也必须出现，否则「正在出」在列表里查无此人。
   const idxs = Array.from(new Set([
@@ -2398,7 +2448,7 @@ function renderSets() {
     const q = qMap[i];
     if (q && q.state !== "done") actRows.push({ i, s, q });
     else if (s.output) doneRows.push({ i, s });
-    else todoRows.push({ i, s, fail: fails[i] });
+    else todoRows.push({ i, s, fail: fails[i], rev: reviewSet.has(i) });
   });
   // 单集钩子前置的一「套」就是一集：列表里写「第 3 套」会让人以为还有第 4 套没出
   const labelOf = (i) => {
@@ -2415,6 +2465,7 @@ function renderSets() {
   // 顶部口径分开写：项目一共出了多少 / 这一趟在跑多少。只写本趟的 0/N 会被读成
   // 「项目一套没出」——明明 13 套成片在下面列着。
   const tally = $("#b3-tally");
+  const revN = todoRows.filter((r) => r.rev && !r.fail).length;
   if (tally) {
     const txt = total
       ? `项目已出片 ${ready}/${total} ${unitName}`
@@ -2423,6 +2474,7 @@ function renderSets() {
         + (actRows.length && !queueUnknown
           ? `　·　本趟 ${actRows.length} ${unitName}：正在出 ${nRun}、排队 ${nWait}` : "")
         + (todoRows.length ? `　·　还没出 ${todoRows.length} ${unitName}` : "")
+        + (revN && !runOn ? `　·　${revN} ${unitName}待复核（点「出片」补做）` : "")
       : "";
     if (tally.textContent !== txt) tally.textContent = txt;
   }
@@ -2436,6 +2488,16 @@ function renderSets() {
       : "整批成片都在同一个文件夹里")
       + (stale.length ? `　另有 ${stale.length} 个旧结构的成片记录（文件仍在原目录，不在本列表里）` : "");
     if ($("#sets-folder-note").textContent !== noteTxt) $("#sets-folder-note").textContent = noteTxt;
+  }
+  // 出片清单导出（2026-11-23）：CSV 直链下载。有结构就给按钮（没出片也能导，
+  // 全是「未出片」的清单对排查「为什么没出」同样有用）。
+  const expBtn = $("#btn-sets-export");
+  if (expBtn) {
+    const href = "/api/projects/" + p.id + "/render-report";
+    if (expBtn.getAttribute("data-href") !== href) {
+      expBtn.setAttribute("data-href", href);
+      expBtn.style.display = plans.length ? "" : "none";
+    }
   }
   // 排队/正在出的那一句人话：排队说位置，正在出说这一套在干什么
   const actHint = (r) => (r.q.state === "run"
@@ -2460,9 +2522,11 @@ function renderSets() {
     </div>`;
   const rowTodo = (r) => `<div class="setrow">
       <b>${labelOf(r.i)}</b>
-      ${r.fail
-        ? `<span class="hint bad">失败：${esc((r.fail.error || "").slice(0, 60))}</span>`
-        : `<span class="hint">${queueUnknown ? "这一趟还在跑，跑完再单套补出" : "还没出片"}</span>`}
+      ${(r.rev && !r.fail)
+        ? `<span class="badge wait">⏸ 已停止 · 待复核</span><span class="hint">上批被中止，这套没出完</span>`
+        : (r.fail
+          ? `<span class="hint bad">失败：${esc((r.fail.error || "").slice(0, 60))}</span>`
+          : `<span class="hint">${queueUnknown ? "这一趟还在跑，跑完再单套补出" : "还没出片"}</span>`)}
       ${(!queueUnknown || r.fail)
         ? `<button class="ghost" data-render="${r.i}">出片 ▸</button>` : ""}
     </div>`;
@@ -2473,7 +2537,7 @@ function renderSets() {
     p.id, curGen, stale.length, bdir, queueUnknown ? 1 : 0,
     doneRows.map((r) => [r.i, r.s.output || "", r.s.output_size || 0].join(":")).join(","),
     actRows.map((r) => `${r.i}:${r.q.state}`).join(","),
-    todoRows.map((r) => `${r.i}:${r.fail ? "F" : ""}`).join(","),
+    todoRows.map((r) => `${r.i}:${r.fail ? "F" : (r.rev ? "R" : "")}`).join(","),
   ].join("//");
   const list = $("#sets-list");
   const keepTop = list ? list.scrollTop : 0;
@@ -4561,6 +4625,7 @@ function fxPanelHTML(p) {
     <p class="fx-tip hidden" id="${p}voiceisotip"></p>
     <div class="fx-bgm hidden" id="${p}bgmbox">
       <div class="fx-sub-h">放什么音乐</div>
+      <p class="fx-tip hint bad hidden" id="${p}bgmtip"></p>
       <div class="fx-bgm-modes">
         <label class="chk"><input type="radio" name="${p}bgmmode" id="${p}bgmfolder" value="folder" checked> 从我的文件夹随机挑</label>
         <label class="chk"><input type="radio" name="${p}bgmmode" id="${p}bgmmanual" value="file"> 指定一首歌</label>
@@ -4885,8 +4950,21 @@ function fxSync(p) {
   }
   const grade = el("grade") ? el("grade").value : "";
   const tip = el("gtip");
-  if (tip) tip.textContent = fxGradeTip(grade, g ? Number(g.value) / 100 : 0);
   const isRand = grade === "rand";
+  // 自选 LUT 优先（2026-11-23，借鉴竞品的「冲突项提前置灰」）：填了 .cube 路径
+  // 时调色档位和强度都不生效（渲染端先吃 LUT），置灰 + 就地说明，别让用户调的
+  // 档位被悄悄盖掉；清空 LUT 路径即恢复。三处面板（fx-/sx-/d-）同一份模板。
+  const gradeEl = el("grade"), lutEl = el("lut");
+  const lutOn = !!(lutEl && (lutEl.value || "").trim());
+  if (gradeEl) gradeEl.disabled = lutOn;
+  if (g) g.disabled = lutOn;
+  if (tip) {
+    if (lutOn) {
+      tip.innerHTML = "已用自选 LUT：<b>调色档位和强度都不生效</b>，出片按 LUT 文件调色。想用档位就清空上面的 LUT 路径。";
+    } else {
+      tip.textContent = fxGradeTip(grade, g ? Number(g.value) / 100 : 0);
+    }
+  }
   const box = el("randbox"), rtip = el("rtip");
   if (box) box.classList.toggle("hidden", !isRand);
   if (rtip) rtip.classList.toggle("hidden", !isRand);
@@ -4899,6 +4977,19 @@ function fxSync(p) {
   if (manualBox) manualBox.classList.toggle("hidden", bgmMode !== "file");
   const folderBox = el("bgmfolderbox");
   if (folderBox) folderBox.classList.toggle("hidden", bgmMode !== "folder");
+  // 配乐路径缺失就地提示（2026-11-23）：原来只在点「开始出片」时硬校验报错，
+  // 现在面板里提前亮出来——开了配乐但路径没填，别等出片才发现。
+  const bgmTip = el("bgmtip");
+  if (bgmTip) {
+    const bgmOn = el("bgm") && el("bgm").checked;
+    const miss = bgmOn && (bgmMode === "file"
+      ? !(el("bgmpath") && (el("bgmpath").value || "").trim())
+      : !(el("bgmdir") && (el("bgmdir").value || "").trim()));
+    bgmTip.textContent = miss
+      ? "还没选" + (bgmMode === "file" ? "音乐文件" : "音乐文件夹") + "，出片时会被拦下来——现在选好即可。"
+      : "";
+    bgmTip.classList.toggle("hidden", !miss);
+  }
   // 整幅镜像勾选框在随机卡里，但「能不能翻」由素材定：原始视频带原字翻了会反 → 禁用并取消勾选；
   // 干净底片没字、出片时才烧 → 可勾。随机开着时按集自动决定，勾选框不当最终值，只作关掉后的固定值。
   const pickv = el("srcver") ? String(el("srcver").value) : "";
@@ -5109,6 +5200,83 @@ function saveFxDefault() {
       });
     } catch (e) { /* 存不上不打断调参，出片时会再校验 */ }
   }, 700);
+}
+
+/* ── 出片画面预设导入/导出（2026-11-23，借鉴竞品的结构化预设思路）──────────
+   schema 就是 readFx 的那 29 个键，应用走现成的 PUT fx-default——零后端。
+   导出带 version+kind；导入先验版本、再拿 fxShort 摘要确认，取消/失败
+   一律不改现状。scope: "" = 整剧产线默认，"direct" = 直出面板默认。
+   注意 fx 里已有的 src_ver 是「用哪份视频」档位，跟这里的格式版本号无关。 */
+const FX_PRESET_VERSION = 1;
+let _fxPresetScope = "";
+
+function fxPresetExport(prefix, scope) {
+  if (!ST.proj) return;
+  const data = { version: FX_PRESET_VERSION, kind: "fx_preset", scope, fx: readFx(prefix) };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "hookstudio-出片画面预设.json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast("已导出当前出片画面预设（JSON，可直接发给同事导入）");
+}
+
+async function fxPresetImport(file, scope) {
+  if (!ST.proj) return;
+  let data = null;
+  try { data = JSON.parse(await file.text()); } catch (_) {
+    toast("文件不是合法 JSON，导入取消"); return;
+  }
+  if (!data || data.kind !== "fx_preset" || data.version !== FX_PRESET_VERSION) {
+    toast("预设格式或版本不对（需要出片画面预设 v1），导入取消"); return;
+  }
+  const fx = (data.fx && typeof data.fx === "object") ? data.fx : null;
+  if (!fx) { toast("预设里没有画面参数，导入取消"); return; }
+  const go = await askConfirm({
+    title: "导入出片画面预设？",
+    body: [
+      "将覆盖这个项目当前的出片画面默认设置：",
+      fxShort(fx) || "（全套画面参数）",
+      scope === "direct"
+        ? "应用范围：直出面板的默认设置。"
+        : "应用范围：整剧产线的默认设置（单套的 ✎ 单独覆盖不受影响）。",
+      "改错了可以再手动调回来；确认后立即生效。",
+    ],
+    okText: "导入并应用",
+  });
+  if (!go) return;
+  try {
+    await api(`/api/projects/${ST.proj.id}/fx-default`, {
+      method: "PUT", body: JSON.stringify({ fx, scope }),
+    });
+  } catch (e) {
+    toast("导入失败：" + (e.message || "")); return;
+  }
+  ST.proj = await api("/api/projects/" + ST.proj.id);
+  if (scope === "direct") writeFx("d-", ST.proj.batch.fx_default_direct || {});
+  else writeFx("fx-", ST.proj.batch.fx_default || {});
+  toast("预设已导入并应用");
+}
+
+function fxPresetPick(scope) {
+  _fxPresetScope = scope;
+  const inp = document.getElementById("in-fxpreset-file");
+  if (inp) { inp.value = ""; inp.click(); }
+}
+{
+  const inp = document.getElementById("in-fxpreset-file");
+  if (inp) inp.addEventListener("change", async () => {
+    const f = inp.files && inp.files[0];
+    if (f) await fxPresetImport(f, _fxPresetScope);
+    inp.value = "";
+  });
+  const be = $("#btn-fx-export"), bi = $("#btn-fx-import");
+  if (be) be.addEventListener("click", () => fxPresetExport("fx-", ""));
+  if (bi) bi.addEventListener("click", () => fxPresetPick(""));
+  const de = $("#btn-dp-fx-export"), di = $("#btn-dp-fx-import");
+  if (de) de.addEventListener("click", () => fxPresetExport("d-", "direct"));
+  if (di) di.addEventListener("click", () => fxPresetPick("direct"));
 }
 ["title", "zoom", "hook", "speed", "bgm", "bgmfolder", "bgmmanual", "bgmpath", "bgmdir", "bvol",
  "grade", "gint", "randmin", "randmax", "lut", "mirror", "stretch", "glow", "grain", "vig",
@@ -6324,6 +6492,23 @@ function dpRenderGate(p) {
     ? `上批有 ${fails.length} 条没成功：${String(fails[0].error || "").slice(0, 60)}`
     : ((dpEl("save-dir").value || "").trim()
       ? "成片会存到这个文件夹" : "不填则存到程序默认的成片位置"));
+  // 直出预演（2026-11-23，借鉴竞品的「点击前任务摘要」）：纯计算接口。
+  // 轮询每拍都进这里，按「视频数/台词量/份数」做签名，变了才拉一次；失败静默。
+  const pvEl = dpEl("preview");
+  if (pvEl && p && p.id) {
+    const pvSig = `${p.id}:${eps.length}:${done}:${cps ? cps.value : "1"}`;
+    if (DP.pvSig !== pvSig) {
+      DP.pvSig = pvSig;
+      pvEl.textContent = "";
+      if (eps.length) {
+        api(`/api/direct/${p.id}/preview`).then((pv) => {
+          if (!pv || pv.error || DP.pvSig !== pvSig) return;
+          pvEl.textContent = `预计：${pv.videos} 个视频 × ${pv.copies} 份 = ${pv.sets} 条 · ` +
+            `调模型 ${pv.ai_calls} 次（台词校对）· 出片约 ${pv.est_render_min} 分钟`;
+        }).catch(() => {});
+      }
+    }
+  }
 }
 
 /* 轮询：只看这个直出项目，进度任务字段和主流程一致 */

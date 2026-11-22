@@ -394,11 +394,16 @@
                 <details class="dp-settings" id="dp-fx-wrap">
                   <summary>画面设置（调色 / 镜像 / 配乐 / 字幕样式等）</summary>
                   <div class="dp-fx" id="dp-fx"></div>
+                  <div class="row" style="margin-top:8px">
+                    <button class="ghost sm" id="btn-dp-fx-export" title="把直出画面设置导出成 JSON 文件">导出预设</button>
+                    <button class="ghost sm" id="btn-dp-fx-import">导入预设</button>
+                  </div>
                 </details>
                 <div class="action-bar" style="margin-top:10px">
                   <button class="primary" id="dp-render">开始出片</button>
                   <button class="ghost sm danger hidden" id="dp-stop" title="停掉正在进行的这批出片，已经做好的成片会保留">中止出片</button>
                   <span class="hint" id="dp-render-note"></span>
+                  <div class="hint" id="dp-preview"></div>
                 </div>
                 <!-- 出片进度放这里（第 3 步出片区），不再挤在「整理台词」卡里 -->
                 <div class="dp-auto-state hidden" id="dp-render-state"></div>
@@ -617,8 +622,11 @@
                 <div class="fx-head">
                   <b>出片与画面</b>
                   <span class="hint" id="fx-pic-sum">这批套的默认设置 · 每套标题里的「✎ 设置」可单独改</span>
+                  <button class="ghost sm" id="btn-fx-export" title="把当前出片画面设置导出成 JSON 文件，发给同事导入后逐项一致">导出预设</button>
+                  <button class="ghost sm" id="btn-fx-import">导入预设</button>
                   <button class="ghost" id="btn-fx-pic">展开设置 ▾</button>
                 </div>
+                <input type="file" id="in-fxpreset-file" accept=".json,application/json" class="hidden">
                 <div class="fx-pic hidden" id="fx-pic-panel"></div>
               </div>
             </div>
@@ -643,6 +651,7 @@
             勾选只决定下一趟出哪些，改勾选不影响已经在跑的这一趟。</p>
           <div class="row" id="sets-actions" style="display:none">
             <button class="ghost" id="btn-open-folder">📂 打开成片文件夹</button>
+            <button class="ghost sm" id="btn-sets-export" style="display:none" title="导出这批的 CSV 清单：套号 / 状态 / 时长 / 错误，中止没出完的会标「待复核」">⬇ 导出清单</button>
             <span class="hint" id="sets-folder-note"></span>
           </div>
           <div id="sets-list" class="sets-list"></div>

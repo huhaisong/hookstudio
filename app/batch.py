@@ -1176,6 +1176,81 @@ def _pic_sig(fx: dict) -> str:
     return "".join(out)
 
 
+def _mark_review(pid: str, indexes) -> None:
+    """中止收口：没出完的套登记进 p["batch"]["review"]（2026-11-23）。
+
+    「待复核」语义借鉴竞品队列的六态设计：按了中止 ≠ 失败——这些套只是没出完，
+    前端标成「已停止·待复核」并保留单套补出按钮；补出成功后自动从名单移除。
+    与上一批的遗留名单取并集（连着两次中止不清掉前一批的），整批重跑成功会逐套清掉。
+    """
+    p = core.load(pid)
+    if not p:
+        return
+    b = p.setdefault("batch", {})
+    old = [int(i) for i in ((b.get("review") or {}).get("indexes") or [])]
+    merged = sorted({int(i) for i in old} | {int(i) for i in (indexes or [])})
+    if merged:
+        b["review"] = {"indexes": merged, "ts": time.time()}
+    core.save_merge(p, ["batch"])
+
+
+def render_report(pid: str) -> "tuple[str, str]":
+    """出片清单 CSV（2026-11-23）：套号/模型/目标秒/状态/时长/大小/输出文件/错误。
+
+    数据源 = plans（结构与参数）+ sets（成片记录，按最新 gen）+ batch.failures
+    + batch.review。返回 (文件名, CSV 字节串)，带 UTF-8 BOM——Excel 双击打开
+    不乱码（口径同 audit.export_logs）。"""
+    p = core.load(pid)
+    if not p:
+        raise RuntimeError("项目不存在")
+    import csv as _csv
+    import io as _io
+    plans = p.get("plans") or []
+    # sets 按套号取最新一份（copies/重渲会留下多代记录，报告只认最新的）
+    latest: dict[int, dict] = {}
+    for s in p.get("sets") or []:
+        try:
+            i = int(s.get("index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if i not in latest or int(s.get("gen") or 0) > int(latest[i].get("gen") or 0):
+            latest[i] = s
+    fails: dict[int, str] = {}
+    for f in (p.get("batch") or {}).get("failures") or []:
+        try:
+            fails[int(f.get("index") or 0)] = str(f.get("error") or "")
+        except (TypeError, ValueError):
+            continue
+    review = {int(i) for i in ((p.get("batch") or {}).get("review") or {}).get("indexes") or []}
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["套号", "标签", "模型", "目标(秒)", "状态", "时长(秒)", "大小(MB)",
+                "输出文件", "错误/备注"])
+    for pl in plans:
+        try:
+            i = int(pl.get("index") or 0)
+        except (TypeError, ValueError):
+            continue
+        s = latest.get(i) or {}
+        if s.get("output"):
+            status = "已出片"
+        elif i in fails:
+            status = "失败"
+        elif i in review:
+            status = "待复核（已停止）"
+        else:
+            status = "未出片"
+        w.writerow([i, pl.get("tag") or "", pl.get("model") or "",
+                    round(float(pl.get("sec") or pl.get("target_sec") or 0), 1),
+                    status,
+                    round(float(s.get("output_duration") or 0), 1),
+                    round(float(s.get("output_size") or 0) / 1048576, 1),
+                    s.get("output") or "", fails.get(i, "")])
+    name = f"chupian_{pid}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    data = ("\ufeff" + buf.getvalue()).encode("utf-8")
+    return name, data
+
+
 def render_plans(pid: str, save_dir: str | None = None,
                  fx: dict | None = None, sets_fx: dict | None = None,
                  only: list[int] | None = None) -> None:
@@ -1601,6 +1676,7 @@ def render_plans(pid: str, save_dir: str | None = None,
         if exc is not None:
             msg = (str(exc) or type(exc).__name__).strip()[:200]
             failures.append({"index": pl["index"], "error": msg})
+            done_idx.add(pl["index"])   # 失败也算收口：中止时它不算「待复核」
             p = core.load(pid) or p
             p.setdefault("batch", {})["failures"] = failures
             core.save_merge(p, ["batch"])
@@ -1640,6 +1716,15 @@ def render_plans(pid: str, save_dir: str | None = None,
         })
         sets.sort(key=lambda s: s.get("index") or 0)
         ok += 1
+        done_idx.add(pl["index"])
+        # 补出成功 = 复核完成：这一套从待复核名单里移除（2026-11-23）
+        rv = (p.get("batch") or {}).get("review") or {}
+        if rv.get("indexes"):
+            left = [int(i) for i in rv["indexes"] if int(i) != int(pl["index"])]
+            if left:
+                p["batch"]["review"] = {"indexes": left, "ts": rv.get("ts") or 0}
+            else:
+                p["batch"].pop("review", None)
         p.setdefault("batch", {})["done"] = ok
         with _rp_lock:
             st = _rp.setdefault(k, {"pct": 95.0, "msg": "已成片",
@@ -1656,36 +1741,47 @@ def render_plans(pid: str, save_dir: str | None = None,
             except Exception:  # noqa: BLE001 —— 台账坏了不能挡出片
                 pass
 
-    if len(jobs) <= 1:
-        if jobs:
-            # 单套也要先把队列摆出来：否则第一次进度回调之前，前端只能显示
-            # 「还没出片」，看着像没在跑。
-            core.set_task(pid, "batch", 0, f"开始出片 {len(jobs)} 套",
-                          extra={"queue": [{"index": idx, "state": "wait",
-                                            "pct": 0.0, "msg": "排队中"}
-                                           for _, idx in queue],
-                                 "total": len(jobs), "conc": conc})
-        for job in jobs:
-            _, info, exc = _render_one(job)
-            _writeback(job, info, exc)
-    else:
-        core.set_task(pid, "batch", 0, f"开始并行渲染 {len(jobs)} 套（同时 {conc} 套）",
-                      extra={"queue": [{"index": idx, "state": "wait", "pct": 0.0,
-                                        "msg": "排队中"} for _, idx in queue],
-                             "total": len(jobs), "conc": conc})
-        pool = ThreadPoolExecutor(max_workers=conc)
-        try:
-            futs = {pool.submit(_render_one, job): job for job in jobs}
-            for fut in as_completed(futs):
-                job = futs[fut]
-                try:
-                    _, info, exc = fut.result()
-                except Exception as ferr:  # noqa: BLE001 —— 中止时未开渲的套被 cancel，当这一套失败收口
-                    _, info, exc = job["k"], None, ferr
+    # 本趟已收口（成功或失败）的套。中止（TaskCancelled 是 BaseException，
+    # 不会被上面的 except Exception 拦下）会从渲染循环直接穿透出去——
+    # 那些没轮到的套就在这里收成「待复核」名单。
+    done_idx: set = set()
+
+    try:
+        if len(jobs) <= 1:
+            if jobs:
+                # 单套也要先把队列摆出来：否则第一次进度回调之前，前端只能显示
+                # 「还没出片」，看着像没在跑。
+                core.set_task(pid, "batch", 0, f"开始出片 {len(jobs)} 套",
+                              extra={"queue": [{"index": idx, "state": "wait",
+                                                "pct": 0.0, "msg": "排队中"}
+                                               for _, idx in queue],
+                                     "total": len(jobs), "conc": conc})
+            for job in jobs:
+                _, info, exc = _render_one(job)
                 _writeback(job, info, exc)
-        finally:
-            # 中止时 cancel_futures=True，别让没开渲的套拖住退出（同 plan 并行口径）。
-            pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            core.set_task(pid, "batch", 0, f"开始并行渲染 {len(jobs)} 套（同时 {conc} 套）",
+                          extra={"queue": [{"index": idx, "state": "wait", "pct": 0.0,
+                                            "msg": "排队中"} for _, idx in queue],
+                                 "total": len(jobs), "conc": conc})
+            pool = ThreadPoolExecutor(max_workers=conc)
+            try:
+                futs = {pool.submit(_render_one, job): job for job in jobs}
+                for fut in as_completed(futs):
+                    job = futs[fut]
+                    try:
+                        _, info, exc = fut.result()
+                    except Exception as ferr:  # noqa: BLE001 —— 中止时未开渲的套被 cancel，当这一套失败收口
+                        _, info, exc = job["k"], None, ferr
+                    _writeback(job, info, exc)
+            finally:
+                # 中止时 cancel_futures=True，别让没开渲的套拖住退出（同 plan 并行口径）。
+                pool.shutdown(wait=False, cancel_futures=True)
+    except core.TaskCancelled:
+        # 待复核（2026-11-23）：中止不是失败。没出完的套持久登记，
+        # 前端标「已停止·待复核」+ 保留补出按钮；补出成功自动移除。
+        _mark_review(pid, [idx for _, idx in queue if idx not in done_idx])
+        raise
 
     # 整批只清一次临时目录（复用覆盖写，见 render_edl 的 cleanup 说明）
     p = core.load(pid) or p

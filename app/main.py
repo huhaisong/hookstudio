@@ -17,7 +17,7 @@ from urllib.parse import quote
 
 from . import admin as admin_api
 from . import (aigate, autopipe, addvideos, analyze, audit, auth, batch, bgmlib, buildstamp,
-               core, db, direct, names, nosub, proof, publishapi, publisher, report,
+               core, db, direct, names, nosub, preview, proof, publishapi, publisher, report,
                render, retime, shots, shortcut, transcribe, update, vmerge, wxbot,
                wxmon, wxworker, zh)
 
@@ -1400,6 +1400,49 @@ def do_add_videos(pid: str, body: AddVideosBody | None = None):
         # 极端竞态：追加已写盘但任务没起来，如实告诉用户，别假装成功
         raise HTTPException(409, "视频已加入，但一键任务没能启动，请点「重新整理台词」继续")
     return {"ok": True, **r}
+
+
+@app.post("/api/projects/{pid}/autopipe/preview")
+def autopipe_preview(pid: str, body: AutoPipeBody | None = None):
+    """出片预演（纯计算，2026-11-23）：这一单将生成几套、调几次模型、各步骤约多久。
+
+    POST 是因为要吃面板上**还没保存**的参数（带 cfg 就用新的，口径同 do_autopipe）。
+    只读项目与参数，不写盘、不调 AI、不占任务槽。失败给空壳+原因，
+    绝不能把设置面板拉崩。"""
+    p = core.load(pid)
+    if not p:
+        raise HTTPException(404, "项目不存在")
+    cfg = (body.cfg if body else None) or (p.get("autopipe") or {}).get("cfg") \
+        or core.load_config().get("autopipe_cfg") or {}
+    try:
+        return preview.preview_autopipe(p, cfg if isinstance(cfg, dict) else None)
+    except Exception as exc:  # noqa: BLE001
+        return {"kind": "autopipe", "error": str(exc)}
+
+
+@app.get("/api/direct/{pid}/preview")
+def direct_preview(pid: str):
+    """直出预演（纯计算）：视频数、份数、校对调用次数、出片耗时估算。"""
+    p = core.load(pid)
+    if not p:
+        raise HTTPException(404, "项目不存在")
+    try:
+        return preview.preview_direct(p)
+    except Exception as exc:  # noqa: BLE001
+        return {"kind": "direct", "error": str(exc)}
+
+
+@app.get("/api/projects/{pid}/render-report")
+def render_report_csv(pid: str):
+    """出片清单 CSV（2026-11-23）：套号/模型/目标秒/状态/时长/大小/输出文件/错误。
+
+    状态含「待复核（已停止）」——中止没出完的套单独标出来（≠失败）。"""
+    try:
+        name, data = batch.render_report(pid)
+    except RuntimeError as exc:
+        raise HTTPException(404, str(exc))
+    return Response(content=data, media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @app.post("/api/projects/{pid}/autopipe")
