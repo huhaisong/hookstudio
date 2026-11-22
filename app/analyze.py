@@ -1210,9 +1210,35 @@ GROW_CAP = 0.72       # _grow_to 延长后不得超集长×此值，否则又长
 # 比重复更糟（见 _fit_target 的 spare 借块注释）。分数超线由前端标红提示。
 OVERLAP_CAP = 0.7
 
+# 套级废弃闸门（2026-11-22 防碎/防爆，借鉴零界「支线废弃」的口径）：
+# 所有补救手段（_fit_target 收时长 → _lift_blocks 补下限 → _grow_to 两头延）
+# 都做完之后**终判一次**——补救救不回来的套，硬发出去就是废片，整 套丢弃并
+# 在进度里写明原因，用户看得到为什么少了一套。
+# SET_MIN_RATIO=0.6：总时长连规格下限（min_minutes）的六成都凑不出，说明这套
+# 的素材本身就残了；六成到十成之间的仍保留——用户宁要短一点能发的片子，
+# 也不要「少一套」（与 _fit_target「宁重复不交白卷」同一哲学，只是那条管块、
+# 这条管套）。
+# SET_BLOCK_CAP=30：一块硬下限 40 秒，30 块 = 20 分钟起步，远超任何合法套
+# 规格——块数到这个量级说明 AI 的规划已经散架，渲染出来观众也看不懂。
+SET_MIN_RATIO = 0.6
+SET_BLOCK_CAP = 30
+
+
+def _merge_gap() -> float:
+    """缝合口的实际值：默认 MERGE_GAP=9 秒，可在 data/config.json 的 merge_gap
+    里调（2026-11-22 开放 6–15）。为什么给旋钮：不同剧的「一场戏」长短不同——
+    快节奏剧 6 秒不缝就是碎片，慢节奏剧 12 秒内还是同一场戏。范围卡死 6–15：
+    低于 6 退回碎片化的老毛病，高于 15 会把换场也缝进来。"""
+    try:
+        v = float((core.load_config() or {}).get("merge_gap") or MERGE_GAP)
+    except Exception:  # noqa: BLE001
+        return MERGE_GAP
+    return min(15.0, max(6.0, v))
+
 
 def _stitch_blocks(p: dict, segs: list[dict],
-                   merge_gap: float = MERGE_GAP, max_block: float = MAX_BLOCK) -> list[dict]:
+                   merge_gap: float | None = None,
+                   max_block: float = MAX_BLOCK) -> list[dict]:
     """把隔得太近的块缝成一个连续块。**只缝合，不裁切，不丢内容。**
 
     为什么缝：同一场戏里两块只隔一两句台词，中间的空洞观众只会看成跳帧。
@@ -1230,6 +1256,8 @@ def _stitch_blocks(p: dict, segs: list[dict],
     """
     if not segs:
         return segs
+    if merge_gap is None:      # 未显式传 = 走 config 可调值（见 _merge_gap）
+        merge_gap = _merge_gap()
     off = ep_offsets(p)
     dur = {ep["index"]: float(ep.get("duration") or 0) for ep in p["episodes"]}
     order = [ep["index"] for ep in p["episodes"]]
@@ -1971,6 +1999,19 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
         segs = _grow_to(p, segs, avg * 0.85)
         if not segs:
             continue
+        # 套级废弃闸门（2026-11-22 防碎/防爆）：所有补救做完后的终判。救不回来的
+        # 套整 套丢弃并在进度里写明原因，别让废片混进结果（口径见 SET_MIN_RATIO
+        # 的注释）。放在 _grow_to 之后是刻意的：它是不管怎么补、补完之后还剩
+        # 多少算多少——这里判的就是「补完之后」。
+        _sec = _segs_sec(segs)
+        if _sec < max(1.0, float(min_minutes) * 60) * SET_MIN_RATIO:
+            _tick(8 + i / max(1, len(staged)) * 55,
+                  f"第 {i} 套救不回来（{_sec:.0f}s，不足规格下限的六成），已废弃")
+            continue
+        if len(segs) > SET_BLOCK_CAP:
+            _tick(8 + i / max(1, len(staged)) * 55,
+                  f"第 {i} 套块数荒多（{len(segs)} 块，规划已散架），已废弃")
+            continue
         accepted.append(segs)
         out.append({"name": st["name"], "hook": st.get("hook") or "",
                     "bgm": st.get("bgm") or "", "segments": segs})
@@ -1980,6 +2021,88 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
         raise RuntimeError("AI 给出的结构都不可用（时长不足或编号越界），请重试")
     # 台账不在这里记：编排可能重跑/整套被丢，计划阶段记账会把没人看过的块也耗掉次数。
     # 真正的记账在出片成功那一刻（batch.render_plans → reuse.record）。
+    return out
+
+
+def local_plan_set(p: dict, count: int, min_minutes: float, max_minutes: float,
+                   eps=None) -> list[dict]:
+    """AI 全败时的本地确定性装填（2026-11-22 防呆兜底，借鉴零界的「本地确定性
+    分集回退」）。不调 API、不挑高光：把台词按「一场戏」切成块，按剧情顺序装填
+    到目标时长。产出结构与 build_plans 完全同构（batch 的装配管线直接吃），
+    所以重合度/跳切/台账等下游统计照常生效。
+
+    什么时候用它：所有模型组都失败（欠费/超时/接口挂）时，宁可给用户一套
+    「没有 AI 挑爆点、但结构完整能发」的兜底套，也不让整批白等几分钟再弹一个
+    报错。块不带 rating——_fit_target 的无评分分支就是「按剧情顺序装填」，
+    正好是这个场景的本意。真正的爆点挑选，等 AI 恢复后重排即可。
+
+    count 套怎么互不相同：块列表整体旋转（第 i 套从第 i×step 块开始顺序装填），
+    相邻套错位而不重叠太多；avoid 管本批内的重合，与 build_plans 同一条规矩。
+    """
+    sel: list[int] | None = None
+    if eps:
+        sel, _drop = select_eps(p, eps)
+        if not sel:
+            return []
+    sel_set = {int(x) for x in sel} if sel else None
+    total = sum(float(ep.get("duration") or 0) for ep in p["episodes"]
+                if sel_set is None or int(ep["index"]) in sel_set)
+    if total < 60:
+        return []
+    off = ep_offsets(p)
+    # 切块：台词行顺序累加，满 60 秒且遇到 >3 秒的间隙就收块（一场戏收尾），
+    # 满 90 秒强制收（= MAX_BLOCK，防巨块）。收块边界跟 _stitch_blocks 同一套
+    # 语义，这样兜底套的块长分布和 AI 套大体一致。
+    blocks: list[dict] = []
+    for ep in p["episodes"]:
+        if sel_set is not None and int(ep["index"]) not in sel_set:
+            continue
+        acc: list[dict] = []
+        acc_sec = 0.0
+        n_blk = 0
+        prev_end = None
+        for ln in ep.get("lines") or []:
+            s0, e0 = float(ln["start"]), float(ln["end"])
+            gap = (s0 - prev_end) if prev_end is not None else 0.0
+            if (acc and acc_sec >= 60.0 and gap > 3.0) or acc_sec >= 90.0:
+                blocks.append({"ep": ep["index"], "start": acc[0]["start"],
+                               "end": acc[-1]["end"],
+                               "gs": off[ep["index"]] + acc[0]["start"],
+                               "ge": off[ep["index"]] + acc[-1]["end"],
+                               "blk": f"L{ep['index']}_{n_blk}"})
+                n_blk += 1
+                acc, acc_sec = [], 0.0
+            acc.append({"start": s0, "end": e0})
+            acc_sec += e0 - s0
+            prev_end = e0
+        if acc:
+            blocks.append({"ep": ep["index"], "start": acc[0]["start"],
+                           "end": acc[-1]["end"],
+                           "gs": off[ep["index"]] + acc[0]["start"],
+                           "ge": off[ep["index"]] + acc[-1]["end"],
+                           "blk": f"L{ep['index']}_{n_blk}"})
+    if not blocks:
+        return []
+    blocks.sort(key=lambda b: b["gs"])
+    avg = max(30.0, (float(min_minutes) + float(max_minutes)) / 2 * 60)
+    step = max(1, len(blocks) // max(1, count))
+    accepted: list[list[dict]] = []
+    out: list[dict] = []
+    for i in range(max(1, min(20, int(count or 1)))):
+        rot = blocks[i * step % len(blocks):] + blocks[:i * step % len(blocks)]
+        segs = _fit_target(p, rot, avg, 10.0, avoid=accepted)
+        segs = _lift_blocks(p, segs, BLOCK_MIN)
+        segs = _grow_to(p, segs, avg * 0.85)
+        if not segs:
+            continue
+        _sec = _segs_sec(segs)
+        if _sec < max(1.0, float(min_minutes) * 60) * SET_MIN_RATIO or len(segs) > SET_BLOCK_CAP:
+            continue
+        accepted.append(segs)
+        out.append({"name": f"本地兜底 {len(out) + 1}", "hook": "", "bgm": "",
+                    "segments": segs})
+        if len(out) >= max(1, min(20, int(count or 1))):
+            break
     return out
 
 

@@ -511,6 +511,27 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
                     "删掉的这几套没有写回来" if gone > 0 else
                     f"生成期间多了 {-gone} 套：新套接在最新的 {fresh_start} 套后面")
 
+    # ── 本地兜底（2026-11-22，借鉴零界「防呆模式」）────────────────────────
+    # 所有模型组都失败时不再直接抛错整批作废：用 analyze.local_plan_set 把台词
+    # 按剧情顺序确定性装填出一批兜底套，作为一个**合成任务**追加到 prepared
+    # 尾部——第二阶段的装配管线原样复用（重合度/跳切/台账/进度全都不用改）。
+    # 用户拿到的是「没有 AI 挑爆点、但结构完整能发」的片子；failed_jobs 里各
+    # 组的真实报错原样保留，AI 恢复后按补跑按钮重排即可。
+    if prepared and results and all(isinstance(r, Exception) for r in results):
+        fb = analyze.local_plan_set(p, total_sets, prepared[0]["mn"],
+                                    prepared[0]["mx"], eps=scope_eps)
+        if fb:
+            core.set_task(pid, task_kind, 92,
+                          f"AI 各组均失败，本地顺序装填出 {len(fb)} 套兜底")
+            prepared.append({"ji": n_jobs, "count": len(fb),
+                             "mn": prepared[0]["mn"], "mx": prepared[0]["mx"],
+                             "label": "", "span": 8.0, "base": 92.0,
+                             "prefix": "本地兜底：" if multi else ""})
+            job_summ.append({"model": "", "plans": [], "mn": prepared[0]["mn"],
+                             "mx": prepared[0]["mx"], "count": len(fb)})
+            results.append(fb)
+            n_jobs = len(prepared)
+
     # ── 第二阶段：严格按 jobs 顺序汇总（跟老版串行逐字一致）─────────────
     for it in prepared:
         ji, label = it["ji"], it["label"]
