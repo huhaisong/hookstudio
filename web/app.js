@@ -339,6 +339,21 @@ function markDrive(path) {
     el.classList.toggle("on", String(el.dataset.path || "").slice(0, 2).toLowerCase() === cur));
 }
 
+/* 粘贴路径直达（2026-11-23 评审 P1）：素材在深层目录时逐层点太痛苦，
+   目录树又记滚动位置，重开页面还停在别处。给一个「贴路径回车直达」的口子。 */
+async function goPath() {
+  const v = $("#in-path-go").value.trim();
+  if (!v) return toast("先粘贴一个素材文件夹路径");
+  try {
+    await browse(v);
+    toast("已打开：" + v);
+  } catch (e) {
+    toast("打开失败：" + (e.message || e) + "——请确认路径存在且是文件夹");
+  }
+}
+$("#btn-path-go").addEventListener("click", goPath);
+$("#in-path-go").addEventListener("keydown", (e) => { if (e.key === "Enter") goPath(); });
+
 async function browse(path) {
   const d = await api("/api/browse?path=" + encodeURIComponent(path));
   ST.path = d.path;
@@ -1159,9 +1174,18 @@ function render() {
   };
 
   const done = p.episodes.filter((e) => e.status === "done").length;
+  // 0 台词警告（2026-11-23 评审 B3）：无人声/纯音乐素材转写完显示「已完成」，
+  // 下游编排必然失败，用户要自己排查半天——在状态里直接点名哪几集没台词。
+  // 每次刷新动态算，用户补了台词（粘贴/手改）警告自动消失，不留过期状态。
+  const emptyEps = p.episodes
+    .filter((e) => e.status === "done" && !(e.lines || []).length)
+    .map((e) => e.index);
+  const emptyWarn = emptyEps.length
+    ? ` · ⚠ 第 ${emptyEps.join("、")} 集没识别出台词（素材可能没有人声），编排会因缺台词失败`
+    : "";
   setState("#s1-state", t && t.kind === "transcribe" ? `${t.pct}% · ${t.msg}`
-    : done === p.episodes.length ? `已完成 ${done}/${p.episodes.length} 集`
-    : done ? `已完成 ${done}/${p.episodes.length} 集` : "未开始");
+    : done === p.episodes.length ? `已完成 ${done}/${p.episodes.length} 集${emptyWarn}`
+    : done ? `已完成 ${done}/${p.episodes.length} 集${emptyWarn}` : "未开始");
 
   if (isBatch) {
     syncHookState();
@@ -5530,6 +5554,7 @@ $("#btn-preset-export").addEventListener("click", async () => {
     a.download = "hookstudio-出片预设.json";
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    toast("预设已导出到浏览器下载目录");
   } catch (e) {
     toast("导出失败：" + (e.message || e));
   }

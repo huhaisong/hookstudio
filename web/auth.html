@@ -146,6 +146,11 @@ async function afterLogin(data) {
 
 $("#f-login").addEventListener("submit", async (e) => {
   e.preventDefault();
+  // 空输入先拦一道（2026-11-23 评审 P4）：后端也会拦，这里省一次往返、提示更即时
+  if (!$("#lg-user").value.trim() || !$("#lg-pwd").value) {
+    say("请输入用户名和密码", "bad");
+    return;
+  }
   const btn = $("#btn-login");
   btn.disabled = true;
   say("登录中…");

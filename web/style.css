@@ -405,7 +405,19 @@ button.sm { padding: 4px 10px; font-size: 12px; }
 .modal-body { padding: 14px 0 4px; display: flex; flex-direction: column; gap: 14px; }
 .modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding-top: 12px; }
 /* 台词导入弹窗：文本域要宽、等宽字体，方便核对时间码 */
-.lines-card { width: min(680px, 94vw); }
+.lines-card {
+  width: min(680px, 94vw);
+  /* 2026-11-23 评审 B5：弹窗内容（rows=17 的 textarea + 说明）总高 ~738px，
+     超过 86vh 视口后「保存/放弃」被推到内部滚动区底部——打开弹窗时按钮
+     完全不可见，用户改完台词找不到保存。改成 flex 三段：head / body(内部
+     滚动) / foot(恒可见)，按钮不再被内容推走。 */
+  display: flex; flex-direction: column;
+}
+.lines-card .modal-body { overflow: auto; min-height: 0; }
+.lines-card .modal-foot {
+  flex: none; border-top: 1px solid var(--line);
+  padding-top: 12px; margin-top: -2px;
+}
 .lines-card .fld textarea {
   width: 100%; min-height: 150px; resize: vertical;
   font-family: Consolas, Menlo, monospace; font-size: 12px; line-height: 1.65;

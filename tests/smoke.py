@@ -55,7 +55,9 @@ def get(path):
 for path, name in [("/api/projects", "项目列表"),
                    ("/api/publish/queue", "发布队列"),
                    ("/api/publish/accounts", "发布账号"),
-                   ("/api/config", "配置")]:
+                   ("/api/config", "配置"),
+                   # 2026-11-23 评审：新端点没进烟测，鉴权笔误 500 上线才炸——补上
+                   ("/api/config/preset", "出片预设")]:
     try:
         get(path)
         check("端点 " + name, True)
@@ -91,10 +93,25 @@ except Exception as exc:
     check("单实例锁存在", False, str(exc))
 
 # ── 7. 所有前端 JS 语法可解析（防并行编辑写坏）──────────────────────────
+import re                                                         # noqa: E402
 import subprocess                                                 # noqa: E402
 for js in sorted(glob.glob(os.path.join(ROOT, "web", "*.js"))):
     r = subprocess.run(["node", "--check", js], capture_output=True)
     check("JS 语法 " + os.path.basename(js), r.returncode == 0,
+          r.stderr.decode("utf-8", "replace")[:120])
+
+# ── 8. HTML 内联脚本语法（2026-11-23 评审补）────────────────────────────
+# auth/admin 页的 JS 是内联的，改坏了只有打开页面才发现——一并纳入语法检查。
+for html in sorted(glob.glob(os.path.join(ROOT, "web", "*.html"))):
+    blocks = re.findall(r"<script>(.*?)</script>",
+                        open(html, encoding="utf-8").read(), re.S)
+    if not blocks:
+        continue
+    tmp = html + ".check.js"
+    open(tmp, "w", encoding="utf-8").write("\n;\n".join(blocks))
+    r = subprocess.run(["node", "--check", tmp], capture_output=True)
+    os.remove(tmp)
+    check("内联脚本 " + os.path.basename(html), r.returncode == 0,
           r.stderr.decode("utf-8", "replace")[:120])
 
 print(f"\n通过 {len(OK)} · 失败 {len(BAD)}")

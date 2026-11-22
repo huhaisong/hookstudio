@@ -381,6 +381,20 @@ def llm() -> dict:
 PROXY_URL_DEFAULT = "https://api.hookstudio.cn"
 
 
+def safe_name(name: str) -> str:
+    """项目名清洗：去掉 Windows 文件名非法字符（2026-11-23 评审 B2）。
+
+    项目名会被拼进**成片文件名**（render.run / batch.render_plans），带
+    `<>|:*?"` 这类字符时出片写盘必然失败，而且用户对着报错看不出来是
+    名字的问题。文件夹名做项目名（「留空则用文件夹名」）同样可能带入，
+    所以在建项目入口和出片命名两处都过一遍（后者兜老项目）。
+    """
+    import re as _re
+    cleaned = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or "")).strip(" .")
+    cleaned = _re.sub(r"\s+", " ", cleaned)
+    return cleaned[:80]
+
+
 def device_token() -> str:
     """本机设备号：一台电脑一个，用来做「一个账号只绑一台电脑」。
     **它不是身份，也不带额度**——调 AI 只认账号令牌（见 ai_token）。"""
@@ -1009,7 +1023,7 @@ def create(path: str, name: str, target_minutes: int, episodes: list[dict], mode
     """
     p = {
         "id": uuid.uuid4().hex[:12],
-        "name": name,
+        "name": safe_name(name) or "未命名项目",
         "src_dir": path,
         "win_dir": win_path(path),
         "target_minutes": target_minutes,

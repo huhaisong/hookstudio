@@ -652,8 +652,12 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
 
     if not plans:
         core.set_task(pid, None)
-        # 全军覆没时把每个模型的报错原文带出来，别只说「不可用」
-        raise RuntimeError("；".join(job_errors) or "AI 给出的结构都不可用，请重试")
+        # 全军覆没时把每个模型的报错原文带出来，别只说「不可用」；
+        # 素材预算预警（若有）一并带上——用户对着「重试」救不了素材短缺（评审 P3）
+        msg = "；".join(job_errors) or "AI 给出的结构都不可用，请重试"
+        if budget_notes:
+            msg += "。另外：" + budget_notes[0][:160]
+        raise RuntimeError(msg)
 
     fresh = plans[fresh_start:]
     # 没抛异常却一套都没排出来（AI 给的片段全被 _ensure_geo / _blocks 筛掉）也要能补跑
@@ -1449,7 +1453,7 @@ def render_plans(pid: str, save_dir: str | None = None,
             if os.path.isfile(old) and same_dir:
                 continue
         name = (pl.get("out_name")
-                or f"{p['name']}_混剪set{pl['index']:02d}_{time.strftime('%m%d%H%M%S')}.mp4")
+                or f"{core.safe_name(p['name'])}_混剪set{pl['index']:02d}_{time.strftime('%m%d%H%M%S')}.mp4")
         unit = pl.get("tag") or f"set{pl['index']:02d}"
         kind = "条" if pl.get("mode") == "hook" else "套"
         jobs.append({

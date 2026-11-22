@@ -1917,6 +1917,14 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
     if total < 60:
         raise RuntimeError(
             f"选中的素材只有 {total:.0f} 秒，太短了没法编排——多勾几集，或者把每套时长调短")
+    # 单块硬下限随素材自适应（2026-11-23 评审 B4）：BLOCK_MIN=40 是按「一集 60 秒」
+    # 定的；用户拿 30 秒一集的短素材来，40 秒下限会把所有块延废，AI 套和本地兜底
+    # 套全被筛空，用户对着「重试」永远编不出来。下限 = min(40, 最短集长×0.6)，
+    # 保底 15 秒——15 秒以下的碎片仍然不该进成片。
+    ep_lens = [float(ep.get("duration") or 0) for ep in p["episodes"]
+               if sel_set is None or int(ep["index"]) in sel_set]
+    short_ep = min([x for x in ep_lens if x > 0] or [0.0])
+    blk_min = min(float(BLOCK_MIN), max(15.0, short_ep * 0.6))
 
     def _tick(local_pct: float, msg: str) -> None:
         if progress is False:
@@ -1993,7 +2001,7 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
         # 逐块补到硬下限（2026-11-22 C 档）：AI 按「一场戏」切块，从不按秒数算，
         # 6 批实测中位数 30-38 秒、最短 10.9 秒。提示词改了三轮都压不住，
         # 这里在已选定的块上补——延不动就整块丢，不让碎片进成片。
-        segs = _lift_blocks(p, segs, BLOCK_MIN)
+        segs = _lift_blocks(p, segs, blk_min)
         # 裁完还不到目标的 85%，说明 AI 给这套的素材本身就少——把块向两头延一延，
         # 补到能发出去的长度（不新增素材，只让每场戏更完整）。
         segs = _grow_to(p, segs, avg * 0.85)
@@ -2018,7 +2026,12 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
         _tick(8 + i / max(1, len(staged)) * 55,
               f"已编排 {i}/{len(staged)} 套，正在收紧时长")
     if not out:
-        raise RuntimeError("AI 给出的结构都不可用（时长不足或编号越界），请重试")
+        hint = ""
+        if 0 < short_ep < BLOCK_MIN:
+            hint = (f"；另外：这个项目最短的集只有 {short_ep:.0f} 秒，单块下限已自动放宽到 "
+                    f"{blk_min:.0f} 秒——如果还是编不出来，多半是素材本身太短，"
+                    "换更长的剧集，或把每套时长调到 0.5 分钟以内")
+        raise RuntimeError("AI 给出的结构都不可用（时长不足或编号越界），请重试" + hint)
     # 台账不在这里记：编排可能重跑/整套被丢，计划阶段记账会把没人看过的块也耗掉次数。
     # 真正的记账在出片成功那一刻（batch.render_plans → reuse.record）。
     return out
@@ -2084,6 +2097,12 @@ def local_plan_set(p: dict, count: int, min_minutes: float, max_minutes: float,
     if not blocks:
         return []
     blocks.sort(key=lambda b: b["gs"])
+    # 与 build_plans 同款自适应下限（2026-11-23 评审 B4）：兜底装填延不到
+    # BLOCK_MIN 时同样会全废，短素材剧必须放得进来。
+    ep_lens = [float(ep.get("duration") or 0) for ep in p["episodes"]
+               if sel_set is None or int(ep["index"]) in sel_set]
+    short_ep = min([x for x in ep_lens if x > 0] or [0.0])
+    blk_min = min(float(BLOCK_MIN), max(15.0, short_ep * 0.6))
     avg = max(30.0, (float(min_minutes) + float(max_minutes)) / 2 * 60)
     step = max(1, len(blocks) // max(1, count))
     accepted: list[list[dict]] = []
@@ -2091,7 +2110,7 @@ def local_plan_set(p: dict, count: int, min_minutes: float, max_minutes: float,
     for i in range(max(1, min(20, int(count or 1)))):
         rot = blocks[i * step % len(blocks):] + blocks[:i * step % len(blocks)]
         segs = _fit_target(p, rot, avg, 10.0, avoid=accepted)
-        segs = _lift_blocks(p, segs, BLOCK_MIN)
+        segs = _lift_blocks(p, segs, blk_min)
         segs = _grow_to(p, segs, avg * 0.85)
         if not segs:
             continue

@@ -3167,7 +3167,7 @@ def run(pid: str) -> None:
     if not edl:
         raise RuntimeError("还没有剪辑结构，请先让 AI 出表")
 
-    name = f"{p['name']}_{p['target_minutes']}min_{time.strftime('%m%d%H%M')}.mp4"
+    name = f"{core.safe_name(p['name'])}_{p['target_minutes']}min_{time.strftime('%m%d%H%M')}.mp4"
     # 历史单片导流项目也认「用哪份视频」这个全局默认；其余画面参数不动，
     # 免得老项目突然换了颜色/变形。
     fx0 = (p.get("batch") or {}).get("fx_default") or {}

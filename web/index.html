@@ -110,6 +110,10 @@
           <div class="crumb" id="crumb">—</div>
           <button class="ghost" id="btn-up" title="上一层">↑ 上一层</button>
         </div>
+        <div class="browse-head">
+          <input id="in-path-go" placeholder="粘贴素材文件夹路径，回车直达（例如 F:\素材\某剧）" spellcheck="false" style="flex:1">
+          <button class="ghost" id="btn-path-go">打开</button>
+        </div>
         <div class="dirs" id="dirs"></div>
         <div class="browse-foot">
           <button class="primary" id="btn-use">选用当前目录</button>
@@ -1081,7 +1085,7 @@
         <a class="ghost" id="vl-download">下载这一集 .txt</a>
       </div>
       <div class="ep-chips" id="vl-eps"></div>
-      <textarea id="vl-text" rows="17" spellcheck="false"
+      <textarea id="vl-text" rows="12" spellcheck="false"
         style="width:100%;font-family:Consolas,monospace;font-size:12.5px;line-height:1.7"></textarea>
       <p class="hint">每行一句，格式 <code>1. (2.7-4.9) 台词</code>：括号里是这句在本集里的起止秒数。
         可以直接改错字、删掉整行、改时间码；保存只影响这一集。<b id="vl-tip">改完，之前生成的结构和分镜不会自动更新，需要重新生成。</b></p>
