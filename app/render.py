@@ -2839,6 +2839,13 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
         final_tmp = final + ".copying"
         shutil.copy2(out, final_tmp)
         os.replace(final_tmp, final)
+        # 中转盘上的成片使命已完成（2026-11-22）：以前一直留着，批量出几十套
+        # 就把数据盘吃满几十 G。复制成功后就地删掉（真删，不进回收站）；
+        # 删失败不碍事——成片已在目标盘，顶多剩一个文件占点磁盘。
+        try:
+            os.remove(out)
+        except Exception:  # noqa: BLE001
+            pass
         result = {"name": name, "duration": info["duration"], "size": os.path.getsize(final)}
     else:
         result = {"name": name, "duration": info["duration"], "size": os.path.getsize(out)}
