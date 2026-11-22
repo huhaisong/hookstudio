@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
 import requests
 
@@ -404,6 +405,18 @@ def _parse_json(content: str) -> dict:
         try:
             return json.loads(fixed)
         except json.JSONDecodeError:
+            pass  # 还有下一级修复
+        # 第二级修复：无效转义 + 字符串里的裸控制字符。模型偶发吐出 `\查` 这种
+        # 非法转义、或在字符串里直接带裸换行/制表符——都属于「引号没转义」类
+        # 小错，救得回来就别让整份结果作废（借鉴竞品的 escape_value 思路）。
+        # 合法 JSON 里反斜杠只出现在 ["\\/bfnrtu] 前，所以「反斜杠后跟别的」
+        # 一律补成双反斜杠不会误伤合法输出；裸控制字符换空格，字符串内容
+        # 略有损失但结构保住。截断（半截 JSON）救不了，仍走下面的报错+重试。
+        rescued = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", fixed)
+        rescued = re.sub(r"[\x00-\x1f]", " ", rescued)
+        try:
+            return json.loads(rescued)
+        except json.JSONDecodeError:
             tail = blob[max(0, exc.pos - 60):exc.pos + 60].replace("\n", " ")
             raise RuntimeError(
                 f"AI 返回的 JSON 不完整（第 {exc.lineno} 行附近：…{tail}…）——"
@@ -511,25 +524,36 @@ def _call(prompt: str, system: str | None = None, json_mode: bool = True,
         body["enable_thinking"] = False
 
     def _post(payload: dict):
-        try:
-            # 可中止版：这趟请求可能等 600 秒，中间没有进度上报。包一层之后，
-            # 用户点「中止」最多 0.2 秒就能让本步立刻退出；请求格式、超时、
-            # 错误翻译、参数回退全都不变。TaskCancelled 继承 BaseException，
-            # 下面两个 except 不会把它吃掉，会直达 start_task 的收尾。
-            return core.ai_post_cancelable(
-                lambda: requests.post(url, headers=headers, json=payload, timeout=budget))
-        except requests.Timeout as exc:
-            # 「超时」和「连不上」必须分开说：超时的意思是请求发出去了、对面还在算，
-            # 换网络、换 Key 都没用，能做的只有换生成方式或缩小任务。
-            # 原文 Read timed out 会被读成「网络断了」；这里也不写模型代号和实测数字，
-            # 那是给作者看的实现备注，不该出现在用户能看到的报错里。
-            raise RuntimeError(
-                f"等了 {budget} 秒还没返回：这次生成太慢或排队太久，不是网络断了，"
-                "也不是配置的问题。换一个生成方式，或者把套数 / 单套时长调小一点再试。") from exc
-        except requests.RequestException as exc:
-            if cfg["key"]:
-                raise RuntimeError(f"连不上 AI 接口：{exc}") from exc
-            raise RuntimeError("体验服务暂时连不上，请稍后再试，或换成你自己的服务") from exc
+        # 网络级抖动（超时/断连）自动重试一次（2026-11-22 借鉴竞品的多层回退）：
+        # 只重发传输层失败——代理抖一下、连接被掐这类瞬态错，重发往往就过了。
+        # 4xx/欠费/限流不在这重试：那些在下面有自己的处理路径，重发是白花额度。
+        # 代价要说清：超时类失败最多多等一整轮 budget（最坏 2×600 秒），所以只试一次。
+        for attempt in (1, 2):
+            try:
+                # 可中止版：这趟请求可能等 600 秒，中间没有进度上报。包一层之后，
+                # 用户点「中止」最多 0.2 秒就能让本步立刻退出；请求格式、超时、
+                # 错误翻译、参数回退全都不变。TaskCancelled 继承 BaseException，
+                # 下面两个 except 不会把它吃掉，会直达 start_task 的收尾。
+                return core.ai_post_cancelable(
+                    lambda: requests.post(url, headers=headers, json=payload, timeout=budget))
+            except requests.Timeout as exc:
+                # 「超时」和「连不上」必须分开说：超时的意思是请求发出去了、对面还在算，
+                # 换网络、换 Key 都没用，能做的只有换生成方式或缩小任务。
+                # 原文 Read timed out 会被读成「网络断了」；这里也不写模型代号和实测数字，
+                # 那是给作者看的实现备注，不该出现在用户能看到的报错里。
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"等了 {budget} 秒还没返回：这次生成太慢或排队太久，不是网络断了，"
+                        "也不是配置的问题。换一个生成方式，或者把套数 / 单套时长调小一点再试。") from exc
+            except requests.RequestException as exc:
+                if attempt == 2:
+                    if cfg["key"]:
+                        raise RuntimeError(f"连不上 AI 接口：{exc}") from exc
+                    raise RuntimeError("体验服务暂时连不上，请稍后再试，或换成你自己的服务") from exc
+            # 能走到这里说明是网络类失败且还剩一次机会：先看中止（用户叫停就别再发），
+            # 再退 3 秒错峰重发（校验分镜的串行重试同款间隔）。
+            core.check_cancel()
+            time.sleep(3)
 
     resp = _post(body)
     # 欠费/没开通/Key 错这类错误，摘参数重发也还是同一个错，白等三四轮
