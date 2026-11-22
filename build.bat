@@ -17,6 +17,19 @@ echo [1/5] 清理旧产物
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
+echo [1.5/5] 重新生成内置提示词表
+rem analyze.py 的注释说这一步是自动的——它必须真的是：改了 prompts/*.txt 忘了
+rem 手跑 gen（2026-11-21 混剪提示词改版就差点发生），产物就带着旧提示词、无任何报错。
+rem prompts/ 目录整个不在（被移走/改名）就当场失败，别打出一个空表的包。
+if not exist "prompts\plans.txt" (
+  echo [错误] 找不到 prompts\plans.txt，内置提示词表没法生成
+  goto fail
+)
+"runtime\Scripts\python.exe" gen_builtin_prompts.py
+if errorlevel 1 goto fail
+"runtime\Scripts\python.exe" tests\test_builtin_prompts.py
+if errorlevel 1 goto fail
+
 echo [2/5] PyInstaller 打包（onedir，外部资源不封进去）
 rem --noupx 不是可选项：UPX 压缩 onnxruntime / ctranslate2 的 .pyd 有已知的解压崩溃
 rem 案例（转写一跑就 0xC0000005），体积只省几十 MB，不值得拿稳定性换。
@@ -64,6 +77,13 @@ rem 为什么不在 bat 里写 python -c "...长命令..."：2026-11-04 实测 c
 rem 的引号和中文拆坏，冒出 'sys' is not recognized 但退出码仍是 0，看着像成功其实没跑。
 if not exist "%OUTDIR%\data" mkdir "%OUTDIR%\data"
 "runtime\Scripts\python.exe" build_post.py "%OUTDIR%"
+if errorlevel 1 goto fail
+
+echo [4.5/5] 发布前断言扫描
+rem 之前这步从来没被接入流程（2026-11-22 复查发现，且 GBK 控制台下 ✓ 号必崩
+rem 导致单独跑也从未成功过）。现在打完包强制扫：源码/提示词明文、Key/secret
+rem 泄露、data 运行残留，任一不过直接失败。
+"runtime\Scripts\python.exe" check_release.py "%OUTDIR%"
 if errorlevel 1 goto fail
 
 echo [5/5] 把 exe 改成中文名

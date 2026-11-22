@@ -30,6 +30,13 @@ def read_bytes(name: str) -> bytes:
 
 
 def main() -> None:
+    # prompts/ 不齐就当场用人话说清楚（build.bat 打包时会先调本脚本）：
+    # 绝不能生成一份缺文件的表还退出码 0——那会打出一个提示词残缺的安装包。
+    missing = [n for n in FILES
+               if not os.path.isfile(os.path.join(BASE, "prompts", n))]
+    if missing:
+        raise SystemExit(f"[错误] prompts/ 里缺 {missing}，内置提示词表没法生成；"
+                         "先把 prompts 目录恢复（备份在 _backup_prompts_*）")
     lines = [
         '"""内置提示词常量表（生成物，勿手工编辑）。',
         "",

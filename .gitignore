@@ -46,3 +46,7 @@ bgm/audio/
 # 打包产物：安装器 exe（约 615MB）+ PyInstaller 中间产物，不入库
 dist8/
 build3/
+
+# HookStudio.spec 是每次打包由 PyInstaller 重写的生成物（build.bat/build_obfuscated.py 都走命令行参数），
+# 直接拿它 pyinstaller 会打出无 Cython 加固的普通包——不入库，防误用。
+HookStudio.spec

@@ -6,7 +6,8 @@
 同名 .pyd，打完包在 finally 里无条件还原——任何失败都不破坏源码。
 
 打包用基础 python + PYTHONPATH 指向 runtime/Lib/site-packages（runtime 的
-python.exe 因中文路径坏了，实测不可用）。打完自动对产物跑发布前扫描。
+python.exe 因中文路径坏了，实测不可用）。本脚本只负责「替换 → 打包 → 还原」；
+发布前断言扫描（check_release.py）挂在 build.bat 第 4.5 步，组装资源时必经。
 
 用法：
   python build_cython.py              # 先编译出 .pyd（首次/改代码后要重编）

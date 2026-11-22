@@ -871,6 +871,21 @@ def save_merge(p: dict, keys) -> None:
         os.replace(tmp, path)
 
 
+def bump_lines_ver(pid: str) -> None:
+    """台词内容变了（手改/校对/繁简/人名/对时/粘贴/单集重转）→ lines_ver +1。
+
+    出片的 fx_sig 会带上这个版本（batch._lines_sig 按「这套 EDL 真切到的集」
+    算内容指纹）：改过台词之后，烧了旧台词的成片必须在下次出片时重渲，
+    否则用户改完错字拿到的还是旧字的片子、看起来像「改了没生效」。
+    版本为 0（从没改过台词）时不进指纹——老项目已有的成片记录不会被误判重渲。
+    """
+    p = load(pid)
+    if not p:
+        return
+    p["lines_ver"] = int(p.get("lines_ver") or 0) + 1
+    save_merge(p, ["lines_ver"])
+
+
 def create(path: str, name: str, target_minutes: int, episodes: list[dict], mode: str = "batch") -> dict:
     """建项目。2026-11-05 起**不再新建「单片导流」项目**（用户要求下线）：
     新建只允许 batch（批量混剪）/ shots（只做分镜），历史 funnel 项目仍然能正常打开——
@@ -1067,6 +1082,14 @@ def get_task(pid: str, group: str = "cuts") -> dict | None:
             out = dict(t)
             started = out.get("started") or out.get("at") or 0
             out["elapsed"] = round(time.time() - started, 1) if started else 0.0
+            # 任务链标记（2026-11-22）：一键全自动的各阶段会把 cuts 槽的 kind
+            # 覆盖成子步骤（transcribe/plan/batch），前端只认 kind=="autopipe"
+            # 就会在全自动跑着的全程误报「上次没跑完，可重试」。_RUNNING 里记的
+            # 才是真正的任务入口——入口是 autopipe 而槽位显示的是别的 kind 时，
+            # 把 chain=autopipe 带给前端，让它知道这条进度其实属于全自动。
+            owner = str(_RUNNING.get((pid, group)) or "")
+            if owner and owner != str(t.get("kind") or ""):
+                out["chain"] = owner
             return out
         if done:
             # 跑完的进度条不算「在跑」：留着它会把前端按钮锁死。
@@ -1221,10 +1244,21 @@ def start_task(pid: str, kind: str, fn) -> bool:
 # ── 中止的实现：标记、检查点、子进程登记与真杀 ────────────────────────────
 
 def _cancel_key(pid: str | None = None, group: str | None = None):
-    """当前任务槽位。子线程没有 thread-local 时可由调用方显式传 pid/group。"""
+    """当前任务槽位。子线程没有 thread-local 时可由调用方显式传 pid/group。
+
+    回退到 _CALL_CTX（2026-11-22）：出片并行化后 render_edl 跑在线程池 worker
+    里，worker 只绑过 bind_call_ctx（AI 中止用的 _CALL_CTX），没有 _CUR——
+    之前的取键在这里返回 None，于是 register_proc / check_cancel /
+    wait_cancelable 全变空操作：点中止杀不掉正在编码的 ffmpeg、删项目也不杀。
+    _CUR 优先（runner 主线程口径不变），没有才借 _CALL_CTX 的键，两者都是
+    start_task 时绑的同一个 (pid, group)，口径一致。
+    """
     pid = pid if pid is not None else getattr(_CUR, "pid", None)
     group = group if group is not None else getattr(_CUR, "group", None)
-    return (pid, group) if pid and group else None
+    if pid and group:
+        return (pid, group)
+    key = getattr(_CALL_CTX, "key", None)
+    return key if key else None
 
 
 def is_cancelled(pid: str | None = None, group: str | None = None) -> bool:

@@ -140,6 +140,31 @@ def _step_incomplete(p: dict, kind: str) -> bool:
     if kind == "nosub":
         # 去字幕副本：看实际生成了几集，没齐就续跑（已完成的集会自动跳过）
         return len((p.get("nosub") or {}).get("files") or {}) < len(eps)
+    if kind == "addvideos":
+        # 追加视频的一键任务（转写新集 → 校对 → 抹字幕）：有集没台词就没跑完
+        return bool(eps) and any(not e.get("lines") for e in eps)
+    if kind == "autopipe":
+        # 一键全自动：四步里任何一步没做完就算没做完（数据说话）。
+        ap = p.get("autopipe") or {}
+        if ap.get("done"):
+            return False
+        jobs = (ap.get("cfg") or {}).get("jobs") or []
+        if not jobs:
+            return False     # 配置都不在，谈不上「没跑完」，让用户重新点
+        if any(not e.get("lines") for e in eps):
+            return True      # ① 台词
+        ns = p.get("nosub") or {}
+        if len(ns.get("files") or {}) < len(eps) or ns.get("errors"):
+            return True      # ② 干净底片
+        need = sum(max(1, int(j.get("count") or 0)) for j in jobs)
+        idx = [int(i) for i in (ap.get("indexes") or [])]
+        if len(idx) < need:
+            return True      # ③ 结构
+        gen = int((p.get("batch") or {}).get("gen") or p.get("plan_gen") or 0)
+        done_sets = {int(s.get("index") or 0) for s in (p.get("sets") or [])
+                     if s.get("output") and int(s.get("gen") or 0) == gen}
+        have = {int(pl.get("index") or 0) for pl in (p.get("plans") or [])}
+        return any(i not in done_sets for i in idx if i in have)   # ④ 出片
     return False
 
 
@@ -169,6 +194,20 @@ def resume_interrupted():
             print(f"[wx] 清理残留浏览器目录 {n} 个")
     except Exception as exc:  # noqa: BLE001
         print(f"[wx] 清理残留目录失败：{exc}")
+    # 渲染中转盘残留（2026-11-22）：受保护盘出片先渲到 data/_render_stage/<pid>
+    # 再复制回目标盘。任务收尾的 add_cleanup 登记在进程内存里，中途被杀（断电/
+    # 结束进程）就没人认领——成片、.part 半成品、切段全留在盘上，越积越多。
+    # 启动钩子阶段不可能有渲染在写（续跑也要等用户点头才起任务），整盘扫掉最稳；
+    # 续跑任务重渲时会自己重建目录。
+    try:
+        _stage = os.path.join(core.DATA_DIR, "_render_stage")
+        _left = os.listdir(_stage) if os.path.isdir(_stage) else []
+        for _d in _left:
+            core.rmtree(os.path.join(_stage, _d))
+        if _left:
+            print(f"[render] 清理渲染中转残留 {len(_left)} 个项目目录（_render_stage）")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[render] 清理渲染中转残留失败：{exc}")
     # 播放流速采样：用户上次开着监控就继续跑（平台只给累计播放量，
     # 流速只能自己隔一段时间采一次看差值）。默认关闭，不替用户耗资源。
     try:
@@ -231,6 +270,14 @@ def resume_interrupted():
         kind = core.task_flag(pid)
         if not kind:
             continue
+        # 全自动的各阶段会把 task.json 的 kind 覆盖成子步骤：①转写写 transcribe、
+        # ③生成写 plan、④出片写 batch（task.json 只记 cuts 的最后一步）。全自动
+        # 还在半途（存了 cfg、没跑完）时，断点应该还给整条链——只续单步的话，
+        # 用户点了「继续」也只补了台词/出片，剩下的还得自己再点一遍全自动。
+        if kind in ("transcribe", "plan", "batch", "render"):
+            ap = p.get("autopipe") or {}
+            if ap.get("cfg") and not ap.get("done"):
+                kind = "autopipe"
         if _step_incomplete(p, kind):
             core.set_resume_pending(pid, {"kind": kind, "name": p.get("name") or ""})
             print(f"[resume] 登记待确认续跑：{p.get('name') or pid} / {kind}（未自动运行）")
@@ -789,6 +836,8 @@ def _apply_lines(proj: dict, parsed: dict[int, list[dict]]) -> int:
     if n:
         proj["stage"] = "transcribed"
         core.save_merge(proj, ["episodes", "stage"])
+        # 粘贴导入会整段覆盖（含已有台词的集）：烧了旧字的成片要重渲（LN 位）
+        core.bump_lines_ver(proj["id"])
     return n
 
 
@@ -938,10 +987,15 @@ _RESUME_RUNNERS = {
     "render": lambda pid: render.run(pid),
     "nosub": lambda pid: nosub.run(pid),
     "batch": lambda pid: batch.render_plans(pid),
+    # 全自动整链续跑（2026-11-22）：autopipe.run 每步幂等，cfg/断点都在项目里，
+    # 用户点头后从没做完的那一步接着走，不重复花钱。
+    "autopipe": lambda pid: autopipe.run(pid),
+    "addvideos": lambda pid: addvideos.run(pid),
 }
 _RESUME_LABEL = {
     "transcribe": "整理台词", "analyze": "让 AI 挑片段", "render": "出片",
     "nosub": "重做字幕", "batch": "批量出片",
+    "autopipe": "一键全自动", "addvideos": "追加视频后的整理",
 }
 
 
@@ -1283,7 +1337,11 @@ def do_autopipe(pid: str, body: AutoPipeBody | None = None):
     if fx.get("bgm") and (fx.get("bgm_mode") or "folder") == "folder" \
             and not (fx.get("bgm_dir") or "").strip():
         raise HTTPException(400, "勾了配乐，就先选一个放着多首歌的音乐文件夹")
-    p["autopipe"] = {"cfg": cfg, "stage": "init", "indexes": [],
+    # 断点保留（2026-11-22）：结构参数没变、上次的套还在 → 沿用 indexes，
+    # 重试从断点接着跑，不整批重新生成（重复花 LLM 钱）。参数变了才作废重开。
+    old_ap = p.get("autopipe") or {}
+    stage, indexes = autopipe.resume_entry(old_ap, cfg, p.get("plans") or [])
+    p["autopipe"] = {"cfg": cfg, "stage": stage, "indexes": indexes,
                      "last_error": "", "done": False}
     core.save_merge(p, ["autopipe"])
     core.save_config({"autopipe_cfg": cfg})
@@ -1330,6 +1388,8 @@ def do_transcribe_ep(pid: str, body: dict):
             e["error"] = ""
             break
     core.save_merge(latest, ["episodes"])
+    # 单集重转：这一集的台词内容变了，烧旧字的成片要重渲（LN 位，2026-11-22）
+    core.bump_lines_ver(pid)
     return {"index": ep["index"], "lines": len(lines),
             "seconds": round(_time.time() - t0, 1)}
 
@@ -1526,6 +1586,12 @@ def do_plan(pid: str, body: PlanBody, request: Request):
             raise HTTPException(400, "还没有可以补进去的结构，请直接生成")
         if any(pl.get("mode") == "hook" for pl in old_plans):
             raise HTTPException(400, "当前是单集钩子结构，不能往里追加混剪的套")
+        # 追加与出片并行是安全的（出片只写 sets/batch，不写 plans）；但与
+        # 全自动③、覆盖式重排并发就撞了——两边都在写 plans 尾部 + batch 台账，
+        # 交错保存会把一边追加的套抹掉。生成结构也走 cuts 组，直接挡掉。
+        _busy = core.running_kind(pid, "cuts")
+        if _busy in ("autopipe", "plan"):
+            raise HTTPException(409, "全自动/重新生成正在跑，等它出完这批结构再追加")
     # AI 一次输出不了太多套（每套十几块，输出会过长易截断），上限压到 20
     order = body.order if body.order in ("auto", "chrono", "varied") else "chrono"
     # 追加新套走独立任务组 planadd：只读前两步已定好的台词、写 plans 尾部，
@@ -2280,6 +2346,14 @@ def do_render_plans(pid: str, body: RenderPlansBody | None = None):
     else:
         fx["bgm_path"] = ""
     fx = _clean_fx(fx)
+    # 把这次的出片设置存成项目默认（2026-11-22）：重启后「待确认续跑」接上的
+    # 出片不传 fx，只能拿 batch.fx_default 兜底——不存的话 folder 配乐目录、
+    # 随机指纹档这些只活在这一次请求里的设置全丢，续做出来的套和已出的不一致。
+    # 存的是面板设置（含 bgm_dir / bgm_pick），不是逐套解析出的具体歌——那只在
+    # run_sets_fx 里、绝不固化进项目。与 PUT /fx-default 同一字段、同一口径。
+    latest0 = core.load(pid) or p
+    latest0.setdefault("batch", {})["fx_default"] = fx
+    core.save_merge(latest0, ["batch"])
     # 每套的画面覆盖：只留合法字段，顺手校验 LUT（每套各可能带自己的 LUT）
     sets_fx: dict[str, dict] = {}
     for k, v in ((body.sets_fx or {}) if body else {}).items():
@@ -2469,6 +2543,8 @@ def save_lines(pid: str, body: EditLines, request: Request):
     ep.pop("error", None)
     p["stage"] = "transcribed"
     core.save_merge(p, ["episodes", "stage"])
+    # 手改台词：烧了旧字的成片要在下次出片时重渲（fx_sig 的 LN 位，2026-11-22）
+    core.bump_lines_ver(pid)
     total = sum(len(e.get("lines") or []) for e in p["episodes"])
     audit.log_event(me, "project.lines_edit", target=audit.target_of(pid),
                     payload={"ep": ep_i, "lines": len(lines), "line_total": total},
@@ -2556,6 +2632,9 @@ def proof_apply(pid: str, body: ProofApplyBody, request: Request):
                         body.ep, body.drop_picks)
     except RuntimeError as exc:
         raise HTTPException(400, str(exc))
+    if (r.get("names", 0) or r.get("typos", 0) or r.get("dropped", 0)):
+        # 台词内容变了：烧了旧台词的成片要在下次出片时重渲（fx_sig 的 LN 位）
+        core.bump_lines_ver(pid)
     audit.log_event(me, "project.proof_apply", target=audit.target_of(pid),
                     payload={"ep": body.ep, "names": r.get("names", 0),
                              "typos": r.get("typos", 0),
@@ -2608,6 +2687,7 @@ def do_names_apply(pid: str, request: Request):
     r = names.apply_project(p)
     if r["changed"]:
         core.save_merge(p, ["episodes"])
+        core.bump_lines_ver(pid)     # 烧旧人名的成片要重渲（LN 位，2026-11-22）
     audit.log_event(me, "project.names_apply", target=audit.target_of(pid),
                     payload={"changed": r["changed"], "rules": r["rules"],
                              "episodes": len(r["episodes"])},
@@ -2658,6 +2738,7 @@ def do_zh_apply(pid: str, request: Request):
     r = zh.apply_project(p)
     if r["changed"]:
         core.save_merge(p, ["episodes"])
+        core.bump_lines_ver(pid)     # 烧旧繁体字的成片要重渲（LN 位，2026-11-22）
     audit.log_event(me, "project.zh_apply", target=audit.target_of(pid),
                     payload={"changed": r["changed"], "episodes": len(r["episodes"])},
                     request=request, status_code=200)

@@ -344,6 +344,13 @@ def publish_now(jid: str, request: Request, dry_run: bool = False):
     job = next((j for j in publisher.queue().get("jobs", []) if j.get("id") == jid), None)
     if not job:
         raise HTTPException(404, "这条已经不在队列里了")
+    # 状态守卫（2026-11-22）：这条接口之前对任何状态都直接 run_job——
+    # scheduled（平台已托管）/ publishing（正在传）/ uncertain（点过发表没核实上）
+    # 再手动发一遍就是重复发表。干跑只是填字段不点发表，不拦。
+    if not dry_run and str(job.get("status") or "") not in ("queued", "failed", "manual"):
+        raise HTTPException(409, "这条已经在发表流程里（状态："
+                                 f"{job.get('status')}），不能手动再发一遍；"
+                                 "要重发先撤回排期或点重试")
     try:
         r = wxworker.run_job(job, dry_run=dry_run)
     except Exception as exc:  # noqa: BLE001

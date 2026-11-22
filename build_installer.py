@@ -28,6 +28,29 @@ def sh(cmd: list[str], cwd: str | None = None) -> int:
     return subprocess.call(cmd, cwd=cwd)
 
 
+def _check_dist(src: str) -> int:
+    """压 payload 前的两道闸（2026-11-22 补上，pack_zip.py 的 zip 流程早就有）：
+
+    1. data/ 只许有 config.json——打完包验证双击跑一次 exe，程序就会把带
+       jwt_secret 的 config、app.db、instance.lock（内含开发机绝对路径）写回
+       data/；现在直接打安装器这些全进客户机器（实测 dist 里正躺着一批）。
+    2. check_release.py 断言扫描：源码/提示词明文、Key 泄露、版本号。
+    """
+    data = os.path.join(src, "data")
+    if os.path.isdir(data):
+        leftovers = sorted(set(os.listdir(data)) - {"config.json"})
+        if leftovers:
+            print(f"[错误] {data} 里有测试残留：{leftovers}")
+            print("       先跑 build_post.py 复位（或手动清掉），再打安装器。")
+            print("       （zip 流程的 pack_zip.py 一直有这道闸，安装器不能比它松。）")
+            return 6
+    rc = subprocess.call([sys.executable, os.path.join(HERE, "check_release.py"), src])
+    if rc != 0:
+        print("[错误] 发布前扫描没过，先修再打包")
+        return rc
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("用法：python build_installer.py <onedir 目录> [输出目录]")
@@ -39,6 +62,11 @@ def main() -> int:
     if not os.path.isfile(os.path.join(src, "钩子工坊.exe")):
         print(f"[错误] {src} 不像 onedir 产物（找不到 钩子工坊.exe）")
         return 3
+
+    print("[0/3] 发布前检查（data 残留 + 断言扫描）")
+    rc = _check_dist(src)
+    if rc != 0:
+        return rc
 
     print("[1/3] 同步使用说明")
     doc = os.path.join(HERE, "docs", "使用说明.txt")

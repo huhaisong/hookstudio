@@ -25,6 +25,10 @@ MAX_ATTEMPTS = 2     # 自动重试几次（规格：重试 2 次仍失败就降
 _RUNNING = False
 _STOP = threading.Event()
 _THREAD: threading.Thread | None = None
+# start() 的「检查活线程 → 起线程」必须持锁（2026-11-22）：开机续传线程（延迟
+# 5 秒）和用户一开机就点「排到」是两个线程，同时过检会各起一条 pub-worker，
+# 两条循环同时从队列里领同一条 queued → 同一视频传两遍、点两次发表。
+_START_LOCK = threading.Lock()
 
 
 def _next_queued() -> dict | None:
@@ -169,15 +173,16 @@ def loop() -> None:
 
 def start() -> None:
     global _THREAD
-    if _THREAD and _THREAD.is_alive():
-        # stop() 之后线程要到下一个 TICK 才真正退出；这个窗口里再点「排到」，
-        # 不能因为「线程还活着」就直接返回——否则旧线程退干净后就没人传了。
-        # 把停止信号撤掉等于救回同一线程。
+    with _START_LOCK:
+        if _THREAD and _THREAD.is_alive():
+            # stop() 之后线程要到下一个 TICK 才真正退出；这个窗口里再点「排到」，
+            # 不能因为「线程还活着」就直接返回——否则旧线程退干净后就没人传了。
+            # 把停止信号撤掉等于救回同一线程。
+            _STOP.clear()
+            return
         _STOP.clear()
-        return
-    _STOP.clear()
-    _THREAD = threading.Thread(target=loop, name="pub-worker", daemon=True)
-    _THREAD.start()
+        _THREAD = threading.Thread(target=loop, name="pub-worker", daemon=True)
+        _THREAD.start()
 
 
 def stop() -> None:

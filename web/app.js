@@ -789,6 +789,8 @@ async function openProject(id) {
   // 任一产线在跑就要轮询：只判断 cuts 会漏掉「只开了分镜」的项目的进度刷新
   // planadd（出片中追加新套）是独立组，漏了它状态条会停在上一拍不动
   if (p.task || p.task_nosub || p.task_shots || p.task_planadd) startPoll(); else stopPoll();
+  // 这个项目还挂着一趟排队出片：回来就要接着安排，不能等轮询（空闲项目不轮询）
+  if (ST.pendingRender && ST.pendingRender.pid === p.id) flushPendingRender();
 }
 
 /* 静默开跑：不弹提示；409（已有任务在跑）或项目刚被删都直接忽略 */
@@ -1080,7 +1082,11 @@ function renderAutoState(p) {
   const ap = p.autopipe || {};
   const st = $("#auto-proj-state"), err = $("#auto-proj-error");
   const btn = $("#btn-autopipe");
-  const busyTask = taskBusy(p.task) && p.task.kind === "autopipe";
+  // 全自动的各阶段会把 cuts 槽的 kind 覆盖成子步骤（transcribe/plan/batch），
+  // 只认 kind=="autopipe" 就会在全自动跑着的全程误报「上次没跑完，可重试」。
+  // 后端 get_task 现在带 chain=真正的任务入口（app/core.py），两个都认。
+  const busyTask = taskBusy(p.task)
+    && (p.task.kind === "autopipe" || p.task.chain === "autopipe");
   const STAGE_TXT = {
     init: "准备开始", transcribe: "整理台词中", nosub: "做干净底片中",
     plan: "生成剪辑中", done: "已完成", error: "出错了",
@@ -2295,9 +2301,16 @@ $("#sets-list").addEventListener("click", async (e) => {
   const wasOff = pl.on === false;
   const setsFx = pl.fx && Object.keys(pl.fx).length ? { [String(idx)]: pl.fx } : {};
   const body = { save_dir: saveDir, fx, sets_fx: setsFx, only: [idx] };
-  if (!confirm(`只渲第 ${idx} 套（${pl.ai_name || "未命名"}），用当前出片设置。` +
-      (wasOff ? "\n\n这一套当前没勾选，出片前会自动勾上。" : "") +
-      (taskBusy(p.task) ? "\n\n前面还有一趟在跑，这趟会排队，跑完自动开始。" : "") + "\n\n确定？")) return;
+  const go = await askConfirm({
+    title: `只渲第 ${idx} 套`,
+    body: [
+      `只渲第 ${idx} 套（${pl.ai_name || "未命名"}），用当前出片设置。`,
+      wasOff ? "这一套当前没勾选，出片前会自动勾上。" : "",
+      taskBusy(p.task) ? "前面还有一趟在跑，这趟会排队，跑完自动开始。" : "",
+    ],
+    okText: "开始出片",
+  });
+  if (!go) return;
   if (wasOff) await onPlanToggle(pos, true);
   if (!enqueueRender(p.id, body, `第 ${idx} 套已排队，前面出片跑完自动开始`)) return;
   try {
@@ -2791,17 +2804,31 @@ async function sendRender(pid, body) {
   await api(`/api/projects/${pid}/render-plans`, {
     method: "POST", body: JSON.stringify(body),
   });
-  ST.proj.task = { kind: "batch", pct: 0, msg: "启动中", error: "" };
+  // 只写「这条出片真正属于的项目」的状态条：之前不判 pid，排队那趟在别的
+  // 项目里 flush 时，会把当前项目的 task 写成 batch 0%，闪一拍「正在出片」。
+  if (ST.proj && ST.proj.id === pid) {
+    ST.proj.task = { kind: "batch", pct: 0, msg: "启动中", error: "" };
+  }
   render();
   startPoll();
 }
 
-function flushPendingRender() {
+async function flushPendingRender() {
   const q = ST.pendingRender;
-  if (!q || taskBusy(ST.proj && ST.proj.task)) return;
-  ST.pendingRender = null;
-  toast("前面那趟出片完了，开始排队的那趟");
-  sendRender(q.pid, q.body).catch((e) => toast(`排队出片没启动：${e.message}`));
+  if (!q) return;
+  // 只在看着原项目时才判断忙不忙：切到别的项目后看不到原项目的槽位，
+  // 硬发只会吃 409；切回原项目（或它空闲时）再 flush。
+  if (q.pid === (ST.proj && ST.proj.id) && taskBusy(ST.proj && ST.proj.task)) return;
+  try {
+    await sendRender(q.pid, q.body);
+    ST.pendingRender = null;
+    toast("前面那趟出片完了，开始排队的那趟");
+  } catch (e) {
+    // 原项目还在跑（409）：排队留着，下一拍轮询再试；其他错误才放弃排队
+    if (/已有任务在跑|等它跑完|已有任务/.test(e.message || "")) return;
+    ST.pendingRender = null;
+    toast(`排队出片没启动：${e.message}`);
+  }
 }
 
 function startPoll() {
@@ -3887,10 +3914,16 @@ function updatePlanFeasible() {
     setText(btn, jobs.length > 1 ? `生成 ${totalSets} 套结构（${jobs.length} 组）${tail}`
                                  : `生成 ${totalSets} 套结构${tail}`);
     // 别只按「选没选集」开关按钮：render() 里先按忙碌态设过 disabled，
-    // 这里若无条件覆盖，生成途中按钮会重新变成可点。
-    // 追加式（planadd 组）可与出片并行：出片忙不禁用它，但追加自己在跑时要禁用。
+    // 追加式（planadd 组）可与出片并行：出片忙不禁用它；但全自动③和覆盖式
+    // 重排也在 cuts 组跑 AI 生成，与追加并发写 plans 会互相覆盖（后端会 409），
+    // 前端直接禁用，别让用户点了才挨骂。chain=autopipe 认全自动
+    // （它跑的全程 cuts 槽 kind 显示的是子步骤，见 app/core.py get_task）。
     const addBusy = taskBusy(p && p.task_planadd);
-    const cutsBlock = planIsAppend() ? false : !!(p && p.task && taskBusy(p.task));
+    const cutsKind = (p && p.task) ? p.task : {};
+    const appendBlock = planIsAppend()
+      && (cutsKind.kind === "autopipe" || cutsKind.kind === "plan"
+          || cutsKind.chain === "autopipe");
+    const cutsBlock = planIsAppend() ? appendBlock : !!(p && p.task && taskBusy(p.task));
     btn.disabled = !nSel || !planEpDone(p).length || addBusy || cutsBlock;
   }
   if (!p) return;
@@ -3958,10 +3991,18 @@ $("#btn-plan").addEventListener("click", async () => {
     : keepOld
       ? `会加在已有 ${has} 套后面（已有套和已出的片都不动）。\n`
       : `会清掉已有 ${has} 套重新生成（已出的片还在）。\n`;
-  if (!confirm(`AI 只在这 ${eps.length} 集里挑片段排结构：${epsBrief(eps)}\n${lines}\n\n`
-    + placement
-    + `共 ${totalSets} 套，会用到 ${norm.length} 次今日生成机会，预计约 ${planEta(norm.length)} 分钟。\n`
-    + "生成后每套会标出与前面套的重复程度，只提示、不拦截。\n\n继续？")) return;
+  const go = await askConfirm({
+    title: "生成剪辑结构",
+    body: [
+      `AI 只在这 ${eps.length} 集里挑片段排结构：${epsBrief(eps)}`,
+      lines,
+      placement.trim(),
+      `共 ${totalSets} 套，会用到 ${norm.length} 次今日生成机会，预计约 ${planEta(norm.length)} 分钟。`,
+      "生成后每套会标出与前面套的重复程度，只提示、不拦截。",
+    ],
+    okText: "开始生成",
+  });
+  if (!go) return;
   try {
     const grant = await aiGrant(p.id, "plan");
     await api(`/api/projects/${p.id}/plan`, {
@@ -4072,9 +4113,16 @@ $("#btn-hookcut").addEventListener("click", async () => {
   const old = (p.plans || []).length;
   if (old) {
     const wasHook = (p.plans || [])[0].mode === "hook";
-    if (!confirm(`现在已有 ${old} ${wasHook ? "集钩子" : "套混剪"}结构，重新生成会覆盖它们（已经出好的片子还在）。\n\n`
-      + `这次：${eps.length} 集 × 钩子 ${HK.sec} 秒 + 整集正片\n`
-      + "会用到 1 次今日生成机会，成片在下一步出。\n\n继续？")) return;
+    const go = await askConfirm({
+      title: "重新生成会覆盖现有结构",
+      body: [
+        `现在已有 ${old} ${wasHook ? "集钩子" : "套混剪"}结构，重新生成会覆盖它们（已经出好的片子还在）。`,
+        `这次：${eps.length} 集 × 钩子 ${HK.sec} 秒 + 整集正片`,
+        "会用到 1 次今日生成机会，成片在下一步出。",
+      ],
+      okText: "继续",
+    });
+    if (!go) return;
   }
   try {
     const grant = await aiGrant(p.id, "hook");
@@ -5143,9 +5191,18 @@ $("#btn-render-plans").addEventListener("click", async () => {
   on.forEach((pl) => { if (pl.fx && Object.keys(pl.fx).length) setsFx[String(pl.index)] = pl.fx; });
   const picNote = Object.keys(setsFx).length ? `；${Object.keys(setsFx).length} 套有单独设置` : "";
   // 随机翻转兜底确认（2026-11-19）：没开翻转先问一次，点了「回去改设置」就停。
-  // 用应用内确认框，走完它才进下面的原生 confirm，两个框不会叠在一起。
+  // 两个确认都用应用内确认框：原生 confirm 会冻结轮询、多次后还被浏览器静默拦截。
   if (!(await confirmMirrorIfOff(fx))) return;
-  if (!confirm(`将渲染已勾选的 ${on.length} 套（每套约 2 分钟），存到：\n${outDir}\n\n出片处理：${fxNote}${picNote}；段与段之间加 60/120 毫秒音频淡入淡出（磨掉切口的咔声）。\n\n确定？`)) return;
+  const goRender = await askConfirm({
+    title: "开始出片",
+    body: [
+      `将渲染已勾选的 ${on.length} 套（每套约 2 分钟），存到：`,
+      outDir,
+      `出片处理：${fxNote}${picNote}；段与段之间加 60/120 毫秒音频淡入淡出（磨掉切口的咔声）。`,
+    ],
+    okText: "开始出片",
+  });
+  if (!goRender) return;
   const body = { save_dir: saveDir, fx, sets_fx: setsFx };
   if (!enqueueRender(p.id, body, `前面还有一趟出片在跑，这趟已排队，跑完自动开始`)) return;
   try {
@@ -5700,7 +5757,16 @@ async function whoLogout() {
       }
     } catch (e) { return toast(e.message); }
     const outDir = out || "设置里「成片保存位置」下的「两两合并」文件夹";
-    if (!confirm(`将组合生成 ${pairs} 条视频（A 段在前、B 段在后），统一成竖屏画面和一致的音量，存到：\n${outDir}\n\n已存在的同名文件会跳过不重做。确定开跑？`)) return;
+    const goMerge = await askConfirm({
+      title: "两两合并开跑",
+      body: [
+        `将组合生成 ${pairs} 条视频（A 段在前、B 段在后），统一成竖屏画面和一致的音量，存到：`,
+        outDir,
+        "已存在的同名文件会跳过不重做。",
+      ],
+      okText: "开跑",
+    });
+    if (!goMerge) return;
     try {
       await api("/api/merge/start", { method: "POST", body: JSON.stringify({ a, b, out }) });
       bOpen.classList.add("hidden");
@@ -5961,8 +6027,15 @@ function dpRender(p) {
       } catch (err) { toast(err.message); }
       return;
     }
-    if (!confirm(`把「${name}」从这次出片里移除？\n\n` +
-                 "只从项目里移除；原来的视频文件和已经做好的成片都不会删除。")) return;
+    const goRemove = await askConfirm({
+      title: "从这次出片里移除",
+      body: [
+        `把「${name}」从这次出片里移除？`,
+        "只从项目里移除；原来的视频文件和已经做好的成片都不会删除。",
+      ],
+      okText: "移除",
+    });
+    if (!goRemove) return;
     btn.disabled = true;
     try {
       const fresh = await api(`/api/direct/${DP.pid}/remove-episode`,
@@ -6158,16 +6231,23 @@ function dpRenderGate(p) {
 }
 
 /* 轮询：只看这个直出项目，进度任务字段和主流程一致 */
+let dpFails = 0;
 function dpStartPoll() { if (!DP.timer) DP.timer = setInterval(dpPoll, 1500); }
 function dpStopPoll() { if (DP.timer) { clearInterval(DP.timer); DP.timer = null; } }
 async function dpPoll() {
   if (!DP.pid) { dpStopPoll(); return; }
   try {
     const p = await api("/api/direct/" + DP.pid);
+    dpFails = 0;
     dpRender(p);
     const busy = !!(p.task && p.task.kind);
     if (!busy) dpStopPoll();
-  } catch (e) { dpStopPoll(); }
+  } catch (e) {
+    // 一次请求失败就永久停轮询（2026-11-22 复查）：进度条冻在旧值、任务还在
+    // 后端跑。跟主流程 startPoll 同口径：连续几拍失败说一次人话，恢复自动接上。
+    dpFails += 1;
+    if (dpFails === 3) toast("状态暂时刷不出来，看看程序窗口是不是还开着；恢复后会自动接上");
+  }
 }
 
 /* 开始 / 继续整理：直出项目就是普通项目，通用转写口只补没台词的集。

@@ -20,7 +20,7 @@ import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 
-from . import analyze, core, nosub, render, reuse
+from . import analyze, bgmlib, core, nosub, render, reuse
 
 # 套间重复率上限（2026-11-12 定 80%，2026-11-16 收紧到 70%）：**只用于提示和前端标色，不拦截落盘**（2026-11-12 用户：
 # 「原来程序只在事后上报重复率，不拦截。我不需要你去拦截」）。
@@ -1322,6 +1322,39 @@ def render_plans(pid: str, save_dir: str | None = None,
     if _needs_spans():
         nosub.ensure_spans(pid, on_msg=lambda m: core.set_task(pid, "batch", 0, m))
 
+    # fx_sig 的 LN 位（台词内容指纹）要用的两个项目级事实：改过几版台词、
+    # 第 2 步的副本是不是「已烧字」的旧版（决定这一趟烧不烧台词）。
+    lines_ver = int(p.get("lines_ver") or 0)
+    burned = render._copy_burned(p)
+
+    # 续跑逐套解析配乐（2026-11-22）：接口层把曲库/文件夹解析出的 bgm_path 只放进
+    # 本次请求的 run_sets_fx，绝不写回项目（main.do_render_plans 的注释口径）。
+    # 进程重启后的「待确认续跑」不经过接口层（fx 从 batch.fx_default 兜底），
+    # 没有这一步的话续做的套全都没音乐，fx_sig 还和已出的不一致、下次又重渲。
+    # 规则与接口层同一套：file=指定单曲 / folder=文件夹随机 / auto=内置曲库。
+    _bgm_used: set[str] = set()
+
+    def _pick_bgm(idx: int, pl: dict, setfx: dict) -> str:
+        m = str(setfx.get("bgm_mode") or "").strip().lower()
+        if m not in ("auto", "folder", "file"):
+            m = "file" if setfx.get("bgm_auto") is False else "auto"
+        try:
+            if m == "file":
+                bp = (setfx.get("bgm_path") or "").strip()
+                return bp if bp and os.path.isfile(bp) else ""
+            if m == "folder":
+                bd = (setfx.get("bgm_dir") or "").strip()
+                got = bgmlib.pick_from_dir(bd, f"{pid}:{idx}", _bgm_used)
+                _bgm_used.add(os.path.normcase(got["path"]))
+                return got["path"]
+            got = bgmlib.resolve(str(pl.get("bgm") or ""), f"{pid}:{idx}", _bgm_used,
+                                 pick_id=str(setfx.get("bgm_pick") or "").strip())
+            _bgm_used.add(got["id"])
+            return got["path"]
+        except Exception as exc:  # noqa: BLE001 —— 续跑解析不了就这套没音乐，别炸整批
+            print(f"[batch] 第 {idx} 套配乐解析失败，这套先不带 BGM：{exc}", flush=True)
+            return ""
+
     # ── 阶段 1：主线程串行准备每一套的参数（纯计算 + 读项目，很快）──────────
     # 原来的大循环把「算参数 / 渲染 / 写回」搅在一起，没法并行。拆开后：
     #   · 准备与写回都留在主线程 → 多套同时写 sets/batch 互相覆盖的竞态彻底消失；
@@ -1338,6 +1371,8 @@ def render_plans(pid: str, save_dir: str | None = None,
             if fv is not None:
                 setfx[fk] = fv
         fl = _flags(setfx)
+        if setfx.get("bgm") and not fl["bgm_path"]:
+            fl["bgm_path"] = _pick_bgm(int(pl["index"]), pl, setfx)
         this_hook = ""
         if fl["hook"]:
             this_hook = (pl.get("hook") or "").strip() or (pl.get("ai_name") or "").strip()
@@ -1357,14 +1392,29 @@ def render_plans(pid: str, save_dir: str | None = None,
                                             p.get("episodes") or [])
         else:
             ver_sig = ""
+        # 台词内容指纹（2026-11-22）：烧台词字幕的套（加回字幕开关开着 + 现场
+        # 做，或干净副本这一趟现烧）必须认台词——第 1 步改完错字，烧了旧字的
+        # 成片要重渲。ver_sig 里 nosub 路径存的是第 2 步落盘的快照，改台词不会
+        # 刷新它，所以单独带上「这套真切到的集」的内容指纹（_lines_sig 一直
+        # 写着却没人用）。lines_ver==0（从没改过台词）时不带这一位：
+        # 老项目已有的成片记录一个都不会被误判重渲。
+        if lines_ver and bool(setfx.get("newsub")) \
+                and (_ver == "live" or (_ver == "nosub" and not burned)):
+            lines_sig = f"|LN{_lines_sig(p, pl['edl'])}"
+        else:
+            lines_sig = ""
         fx_sig = (f"{int(fl['title'])}{int(fl['speed'])}"
                   f"{int(bool(this_hook))}{int(fl['zoom'])}|{this_hook[:40]}"
+                  # 钩子卡时长（2026-11-22）：改 1.8→3.0 也要重渲。只挂在
+                  # 开了钩子卡的套上，没开卡的套指纹与老版本一致，不触发全量重渲。
+                  + (f"|HS{int(round(fl['hook_sec'] * 10))}" if this_hook else "")
                   + f"|R{fl['fp_level']}{run_id}"
                   + ("|F1" if fl["zoom"] else "")
                   + (f"|{bgm_sig}" if bgm_sig else "")
                   + (f"|P{pic_sig}" if pic_sig else "")
-                  + (f"|V{ver_sig}" if ver_sig else "")
-                  + (f"|T{fl['trans_sec']:.2f}" if fl["trans_sec"] > 0 else ""))
+                  + (f"|{ver_sig}" if ver_sig else "")
+                  + (f"|T{fl['trans_sec']:.2f}" if fl["trans_sec"] > 0 else "")
+                  + lines_sig)
 
         # 这一套已有合格成片就跳过（续跑）
         done = next((s for s in (p.get("sets") or [])

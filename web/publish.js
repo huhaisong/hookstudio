@@ -2433,9 +2433,16 @@
         const who = accLabel(currentAid());
         const n = ((S.d && S.d.jobs) || []).filter((j) =>
           j.status === "queued" && j.account_id === currentAid()).length;
-        if (!confirm(`把【${who}】还在排队、没上传的 ${n} 条取消掉？\n`
-          + "它们会退回队列重新设置；已经传到平台并定了时间的，程序取消不了"
-          + "（要去视频号助手「待发布」里手动删），已经发出去的也不受影响。继续吗？")) return;
+        const goStop = await askConfirm({
+          title: "取消排队的条目",
+          body: [
+            `把【${who}】还在排队、没上传的 ${n} 条取消掉？`,
+            "它们会退回队列重新设置；已经传到平台并定了时间的，程序取消不了"
+            + "（要去视频号助手「待发布」里手动删），已经发出去的也不受影响。",
+          ],
+          okText: "取消这些条目",
+        });
+        if (!goStop) return;
         const r = await api("/api/publish/stop", { method: "POST",
           body: JSON.stringify({ account_id: currentAid() || "" }) });
         toast(r.on_platform
@@ -2474,7 +2481,13 @@
       if (name === "del") {
         // 这里的「移除」只面向还没交给平台的条目（draft/failed/manual）；
         // 已交平台的行不再摆这个按钮（2026-11-14 用户反馈：那是噪音）。
-        if (!confirm("从队列里删掉这条记录？平台那边不受影响。")) return;
+        const goDel = await askConfirm({
+          title: "删掉这条记录",
+          body: "从队列里删掉这条记录？平台那边不受影响。",
+          okText: "删掉",
+          danger: true,
+        });
+        if (!goDel) return;
         await api(`/api/publish/job/${jid}`, { method: "DELETE" });
         await load();
         return;
@@ -2487,10 +2500,14 @@
       if (name === "resolve") {
         // 点过「发表」但没核对上：只能由人去平台看过之后收尾，程序不猜
         const ok = el.dataset.to === "published";
-        const word = ok
-          ? "在视频号助手「待发布」里确认这条已经在了？\n点「确定」后记成「已发布」，不会再重传。"
-          : "在视频号助手里确认这条确实没发出去？\n点「确定」后结束这条，不会再重传。";
-        if (!confirm(word)) return;
+        const goResolve = await askConfirm({
+          title: ok ? "确认已发布" : "确认没发出去",
+          body: ok
+            ? "在视频号助手「待发布」里确认这条已经在了？点「确定」后记成「已发布」，不会再重传。"
+            : "在视频号助手里确认这条确实没发出去？点「确定」后结束这条，不会再重传。",
+          okText: "确认",
+        });
+        if (!goResolve) return;
         await api(`/api/publish/job/${jid}/mark`, {
           method: "POST",
           body: JSON.stringify({ action: ok ? "resolved_published" : "resolved_cancelled", note: "" }),
@@ -2504,7 +2521,12 @@
         // 以前「已定时」那行还有个「记成已取消」（状态 skipped），2026-11-14
         // 用户要求去掉，改成「移除」+ 确认框讲清平台照样会发。
         // 后端 mark(skipped) 保留，供老队列和脚本兼容，前端不再调用。
-        if (!confirm("这条不上传了？会退回「还没安排」，以后想发点「开始上传」再带它一次。")) return;
+        const goBack = await askConfirm({
+          title: "这条不上传了",
+          body: "会退回「还没安排」，以后想发点「开始上传」再带它一次。",
+          okText: "退回",
+        });
+        if (!goBack) return;
         await api(`/api/publish/job/${jid}/mark`, {
           method: "POST", body: JSON.stringify({ action: "draft", note: "" }),
         });

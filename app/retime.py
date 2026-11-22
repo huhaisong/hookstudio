@@ -298,6 +298,10 @@ def run(pid: str, force: bool = False) -> None:
     sst = span_split.apply_to(p, by)
     core.save_merge(p, ["episodes"])
     core.set_task(pid, None)
+    # 时间码/切行变了，烧出来的字幕跟着变：记一版，下次出片重渲烧了旧时间的套
+    # （fx_sig 的 LN 位，2026-11-22）。没动任何行就不 bump，别白让成片作废。
+    if stat["fixed"] or sst.get("cut") or sst.get("added"):
+        core.bump_lines_ver(pid)
     print(f"[retime] 完成 {stat['fixed'] + stat['skipped']}/{stat['total']} 集"
           f"（重算 {stat['fixed']}、已对过 {stat['skipped']}）"
           f"，按字幕屏切行 {sst['cut']} 行 → 多 {sst['added']} 行"
@@ -321,4 +325,5 @@ def revert(pid: str) -> int:
         n += 1
     if n:
         core.save_merge(p, ["episodes"])
+        core.bump_lines_ver(pid)   # 回退也是时间码变更，烧过的套同样要重渲
     return n

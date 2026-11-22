@@ -63,6 +63,28 @@ RETRY_LEAD_MIN = 20
 
 _LOCK = threading.Lock()
 
+# 队列互斥（2026-11-22）：所有 mutator 都是「queue() 读整份 → 改字段 →
+# save_queue 整份写回」的模式，_LOCK 只罩住写盘那一瞬，罩不住读改写全程。
+# worker 线程（set_status / mark_submit_started）和用户在界面上改另一条
+# （update_job / apply_fields / mark / retry…）并发时，两个线程各自读→改→写，
+# 后落盘的把先落盘的整个补丁抹掉——轻则丢用户编辑、丢 attempts 计数，
+# 重则 mark_submit_started 刚写的 submit_started_at 被抹掉，重启后
+# reset_stuck_publishing 看到没有时间戳的 publishing 放回 queued，
+# 同一批视频重复上传、重复发表（这正是 2026-11-15 那次修复想堵死的路径，
+# 2026-11-22 复查发现锁的粒度不够）。所以读改写全程必须持同一把互斥锁；
+# 用 RLock 是因为 mutator 之间有嵌套调用（set_status 里还会调 mark）。
+_QMUTEX = threading.RLock()
+
+
+def _qlocked(fn):
+    """队列写操作的「读改写全程」互斥（为什么要锁见 _QMUTEX 的注释）。"""
+    def wrapper(*args, **kwargs):
+        with _QMUTEX:
+            return fn(*args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
 # 状态：draft 未排期 / queued 已排期待发 / scheduled 平台已托管 / published 已发
 # manual 需人工补发 / failed 失败 / skipped 跳过
 # uncertain = 点过「发表」但没核对上（或断电断在那一刻），平台收没收到不知道。
@@ -319,6 +341,7 @@ def mark_expired(aid: str) -> dict:
     return update_account(aid, state="expired", last_check=fmt(now()))
 
 
+@_qlocked
 def remove_account(aid: str) -> None:
     save_accounts([r for r in load_accounts() if r.get("id") != aid])
     # 删掉的号不能继续当「当前发到」——否则刷新后界面还指着它，
@@ -447,6 +470,7 @@ def _ledger_add(q: dict, job: dict) -> None:
     q["ledger"] = q["ledger"][-500:]
 
 
+@_qlocked
 def mark_submit_started(jid: str) -> dict:
     """点「发表」**之前**落盘：写不进去就别点（回调抛错会中断发布，安全）。
 
@@ -487,6 +511,7 @@ ARCHIVE_FILE = os.path.join(core.DATA_DIR, "queue_archive.json")
 DONE_ARCHIVE = ("scheduled", "published", "skipped")
 
 
+@_qlocked
 def archive_old_jobs(keep_days: int = 7) -> int:
     """把完结超过 7 天的条目挪出队列（2026-11-14 批2 遗留清单）。
 
@@ -528,6 +553,7 @@ def archive_old_jobs(keep_days: int = 7) -> int:
 ACCOUNT_FIELDS_EMPTY = {k: "" for k in ACC_BOUND_KEYS}
 
 
+@_qlocked
 def select_account(aid: str) -> dict:
     """切号：当前号写进队列，上一个号专属的配置就地清空。
 
@@ -551,6 +577,7 @@ def select_account(aid: str) -> dict:
     return {"current_account_id": aid, "cleared": True}
 
 
+@_qlocked
 def migrate_legacy() -> int:
     """把旧版「存在 project.json 里的 publish 块」搬到全局队列（只做一次）。
 
@@ -838,6 +865,7 @@ def add_jobs(files: list[str] | None = None, sets: list[int] | None = None,
 _ADD_LOCK = threading.Lock()
 
 
+@_qlocked
 def _add_jobs(files: list[str] | None = None, sets: list[int] | None = None,
               pid: str = "", dir_path: str = "") -> dict:
     q = queue()
@@ -929,6 +957,7 @@ def job_full(j: dict) -> dict:
     return base
 
 
+@_qlocked
 def update_job(jid: str, patch: dict) -> dict:
     q = queue()
     job = next((j for j in q["jobs"] if j["id"] == jid), None)
@@ -970,6 +999,7 @@ def update_job(jid: str, patch: dict) -> dict:
     return job
 
 
+@_qlocked
 def apply_fields(fields: dict) -> dict:
     """把「整批通用设置」套到所有还没交出去的视频上，并记成批次默认值。
 
@@ -1024,6 +1054,7 @@ def apply_fields(fields: dict) -> dict:
     return {"n": n, "template": q["template"]}
 
 
+@_qlocked
 def del_job(jid: str, allow_platform: bool = False) -> None:
     """从队列里删掉一条。
 
@@ -1050,6 +1081,7 @@ def del_job(jid: str, allow_platform: bool = False) -> None:
     save_queue(q)
 
 
+@_qlocked
 def clear_draft() -> dict:
     """清空还没开始排的草稿（不影响已排/已发）。"""
     q = queue()
@@ -1269,6 +1301,7 @@ def preview(first_at: str, interval_min: int) -> dict:
     return res
 
 
+@_qlocked
 def start(first_at: str, interval_min: int, account_id: str,
           intent: str = "") -> dict:
     """落库排期：draft → queued，写入计划时间。"""
@@ -1319,6 +1352,7 @@ def start(first_at: str, interval_min: int, account_id: str,
     return {"started": len(jobs), "first": res["first"], "last": res["last"]}
 
 
+@_qlocked
 def stop(account_id: str = "") -> dict:
     """撤回排期：还没传的（queued）退回 draft，同时数一下已经在平台的条目。
 
@@ -1346,6 +1380,7 @@ def stop(account_id: str = "") -> dict:
     return {"reverted": n, "on_platform": on_platform}
 
 
+@_qlocked
 def reset_stuck_publishing() -> int:
     """把上次没跑完就退出的「正在上传」条目放回队列。
 
@@ -1390,6 +1425,7 @@ def due_jobs() -> list[dict]:
     return out
 
 
+@_qlocked
 def mark(jid: str, action: str, note: str = "") -> dict:
     """人工操作：退回待排期 / 已发 / 跳过。
 
@@ -1439,6 +1475,7 @@ def mark(jid: str, action: str, note: str = "") -> dict:
     return job
 
 
+@_qlocked
 def set_status(jid: str, status: str, note: str = "", extra: dict | None = None) -> dict:
     """给自动发表流程改状态用（worker 调）。
 
@@ -1470,6 +1507,7 @@ def set_status(jid: str, status: str, note: str = "", extra: dict | None = None)
     return job
 
 
+@_qlocked
 def retry(jid: str) -> dict:
     """把一条失败的作业放回队列。返回 {"job": ..., "moved_to": 新时间或空}。
 
@@ -1531,6 +1569,7 @@ def jobs_of_project(pid: str) -> int:
 PURGE_JOB_STATUS = ("draft", "queued", "failed", "manual")
 
 
+@_qlocked
 def purge_project(pid: str) -> dict:
     """把某个项目的发布痕迹从全局队列/归档/备份里摘掉。
 

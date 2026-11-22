@@ -49,7 +49,10 @@ def run():
             if not writeback_timeline or writeback_timeline[-1] != n:
                 writeback_timeline.append(n)
 
-    def fake_set_task(pid, kind, pct=0.0, msg="", error="", ignore_cancel=False):
+    # extra：2026-11-21 起 set_task 多了这个参数（出片队列表），stub 也要认，
+    # 否则 render_plans 一进任务就把测试打崩（TypeError: unexpected kwarg）。
+    def fake_set_task(pid, kind, pct=0.0, msg="", error="", ignore_cancel=False,
+                      extra=None):
         progress.append((kind, round(float(pct), 1), msg))
 
     def fake_render_edl(proj, edl, name, **kw):

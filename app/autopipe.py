@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -65,13 +66,42 @@ def _nosub_ready(p: dict, n_eps: int) -> bool:
     """底片是否已经齐了：文件覆盖所有集且没有错误。"""
     ns = p.get("nosub") or {}
     files = ns.get("files") or {}
-    errs = ns.get("errors") or []
+    errs = ns.get("errors") or {}
     return bool(files) and len(files) >= n_eps and not errs
+
+
+def resume_entry(old_ap: dict, cfg: dict, plans: list[dict]) -> tuple[str, list[int]]:
+    """点「一键全自动 / 重试」时要不要沿用上次的套号断点。
+
+    之前 POST /autopipe 无条件把 indexes 清零（2026-11-22 复查发现）：断在③/④
+    的项目点「重试」会把 N 套结构**整批重新生成**，LLM 费用双倍，界面上
+    「已完成的不会重做」的承诺落空。现在的规则：
+
+    - 结构参数（模型/套数/顺序/选集）和上次完全一致、且那些套号都还在项目里
+      → 原样沿用，stage 标成 plan（第③步直接跳过，不重复花钱）；
+    - 参数变了、或套被删过 → 断点作废，从头开新批（保守方向：宁可重算，不可错配）。
+    - 画面/配乐/存盘参数随便改——它们只影响第④步，不动断点。
+    """
+    old_cfg = old_ap.get("cfg") or {}
+
+    def _plan_key(c: dict) -> str:
+        return json.dumps([c.get("jobs") or [], c.get("order") or "chrono",
+                           c.get("eps") or []], ensure_ascii=False, sort_keys=True)
+
+    try:
+        idx = sorted({int(i) for i in (old_ap.get("indexes") or [])})
+    except (TypeError, ValueError):
+        idx = []
+    have = {int(pl.get("index") or 0) for pl in (plans or [])}
+    if idx and old_ap.get("cfg") and _plan_key(old_cfg) == _plan_key(cfg) \
+            and all(i in have for i in idx):
+        return "plan", idx
+    return "init", []
 
 
 def run(pid: str, cfg: dict | None = None) -> None:
     """全自动主流程。cfg 不传就用项目里存的（重跑/续跑走这条）。"""
-    from . import batch, nosub, transcribe
+    from . import batch, nosub, render, transcribe
 
     p = core.load(pid)
     if not p:
@@ -84,7 +114,11 @@ def run(pid: str, cfg: dict | None = None) -> None:
     cfg = cfg or ap.get("cfg") or {}
     run_id = ap.get("run_id") or _new_run_id()
     if not ap or ap.get("stage") in (None, "", "init"):
-        _stage(pid, "init", cfg=cfg, run_id=run_id, indexes=[],
+        # init 只在「全新开始」时重写：断点字段（indexes）原样带过去。
+        # 之前这里把 indexes 清成 []，配合 POST /autopipe 的重置，
+        # 重试一次就整批重新生成（2026-11-22 复查发现）。
+        _stage(pid, "init", cfg=cfg, run_id=run_id,
+               indexes=[int(i) for i in (ap.get("indexes") or [])],
                last_error="", done=False)
 
     try:
@@ -113,7 +147,25 @@ def run(pid: str, cfg: dict | None = None) -> None:
                 f"全自动 ②/④ 抹字幕 · {msg}"))
             _check_cancel(pid)
             p = core.load(pid)
+            # nosub.run 单集失败只记 errors、正常返回（不抛异常）：这里必须
+            # 再验一次，底片不齐就当场停下——否则照样去花③的模型费，④每套
+            # 渲染时才报「没有已处理的视频」，失败点远离根因（2026-11-22 复查）。
+            if not _nosub_ready(p, len(eps)):
+                errs = (p.get("nosub") or {}).get("errors") or {}
+                why = "；".join(f"{k}：{v}" for k, v in list(errs.items())[:3])
+                raise RuntimeError(
+                    f"干净底片没做齐（{len(errs)} 集失败），全自动先停在这里。"
+                    "到「第 2 步·重做字幕」看完失败原因、处理后点「重试全自动」。"
+                    + (f"失败原因：{why}" if why else ""))
         _stage(pid, "nosub")
+        # 旧版副本（台词已烧进画面）不能拿来做底片：出片会叠出两层字。
+        # 正常出片入口有这道闸（main._prepared_mirror_conflict），全自动直连
+        # render_plans 绕过了它——在这里补上同口径的检查，别安静地出废片。
+        _ver = str(((cfg.get("fx") or {}).get("src_ver")) or DEFAULT_FX["src_ver"]).strip()
+        if _ver == "nosub" and (p.get("nosub") or {}).get("files") \
+                and render._copy_burned(p) is True:
+            raise RuntimeError("第 2 步现在的产物是旧版（台词已经烧进画面），用它出片会叠两层字。"
+                               "回第 2 步点一次「生成处理好的视频」，重做完再点「重试全自动」")
 
         # ③ 生成 N 套（批次隔离：已有套就 append 新批，绝不覆盖；断点防止重复花钱）
         core.set_task(pid, "autopipe", 54, "全自动 ③/④ 正在生成剪辑结构…")
@@ -132,7 +184,12 @@ def run(pid: str, cfg: dict | None = None) -> None:
             )
             _check_cancel(pid)
             p = core.load(pid)
-            indexes = [int(pl["index"]) for pl in (p.get("plans") or [])[before:]]
+            # 本批的套按批号取（2026-11-22）：生成这几分钟里用户可能在 planadd
+            # 组并行追加别的套，按 plans[before:] 切会把别人的套算进全自动的
+            # 出片清单，白渲还占并发。每套落盘时都带着自己的 batch_no。
+            batch_no = int((p.get("batch") or {}).get("plan_batch_no") or 0)
+            indexes = [int(pl["index"]) for pl in (p.get("plans") or [])
+                       if int(pl.get("batch_no") or 0) == batch_no and batch_no]
             if len(indexes) < need:
                 raise RuntimeError(f"这批改只生成了 {len(indexes)} 套，期望 {need} 套")
             _stage(pid, "plan", indexes=indexes, batch_no=(p.get("batch") or {}).get("plan_batch_no"))
