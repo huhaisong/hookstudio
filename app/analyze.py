@@ -7,9 +7,13 @@ import re
 
 import requests
 
-from . import core, reuse
+from . import core, reuse, _builtin_prompts
 
 PROMPT_DIR = core.PROMPTS
+# 发布包不再带 prompts/ 明文（2026-11-22 防破解第一批）。默认走内置常量表；
+# 开发期调提示词时设 HOOK_DEV_PROMPTS=1 可继续读磁盘，改完即生效、不必重打包
+# （但要记得打包前重跑 gen_builtin_prompts.py，build.bat 已自动做这一步）。
+_DEV_PROMPTS_ON = os.environ.get("HOOK_DEV_PROMPTS") == "1"
 _PLACEHOLDER = re.compile(r"\{(\w+)\}")
 # 单次调用最多等多久。10 分钟结构这种长 JSON，慢模型（qwen3.8-max 实测）
 # 会超过 5 分钟，默认放宽到 10 分钟；环境变量 LLM_TIMEOUT 可覆盖。
@@ -48,15 +52,30 @@ def _custom_prompt_path(name: str) -> str:
 
 
 def _default_prompt(name: str) -> str:
-    """读内置默认提示词（原样全文）。生成链路和编辑框都要从这里取基准。"""
-    path = os.path.join(PROMPT_DIR, name)
-    try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read().strip()
-    except OSError as exc:
-        raise RuntimeError(f"提示词文件缺失：{path}") from exc
+    """读内置默认提示词（原样全文）。生成链路和编辑框都要从这里取基准。
+
+    发布包不带 prompts/ 明文，默认从 _builtin_prompts.BUILTIN 按原字节取。
+    decode + strip 的口径与旧的 open(..., encoding="utf-8").read().strip() 完全一致。
+    HOOK_DEV_PROMPTS=1 时优先读磁盘（开发期方便改），读不到再退回内置。
+    """
+    if _DEV_PROMPTS_ON:
+        path = os.path.join(PROMPT_DIR, name)
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            raw = None  # 开发开关下磁盘没有也退回内置，别把链路卡死
+    else:
+        raw = None
+    if raw is None:
+        raw = _builtin_prompts.BUILTIN.get(name)
+        if raw is None:
+            raise RuntimeError(f"提示词未内置且磁盘也没有：{name}")
+    # 文本模式 open() 会做 universal newline 归一化（\r\n / \r → \n），按字节读后
+    # 必须补上同一动作，否则磁盘是 CRLF 时内置版与旧版行为不一致。
+    text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
-        raise RuntimeError(f"提示词文件是空的：{path}")
+        raise RuntimeError(f"提示词是空的：{name}")
     return text
 
 
@@ -172,7 +191,13 @@ def _read_prompt(name: str) -> str:
 
 
 def read_prompt_view(name: str) -> dict:
-    """给「修改提示词」编辑框用的当前状态：生效中的指令部分 + 是否自定义版。
+    """⚠️ 已停用输出通道（2026-11-22）：禁止在任何对外路由里调用本函数。
+
+    它返回近乎全文（FIXED_TAIL_MARKS 为空表，没有文件被剥尾巴），10 个 key
+    可枚举，曾是最便宜的提示词泄露路径。GET /api/prompts/{key} 已改 404。
+    保留函数只为将来恢复「提示词编辑」功能时复用，绝不接到公开接口上。
+
+    给「修改提示词」编辑框用的当前状态：生效中的指令部分 + 是否自定义版。
 
     编辑框里**只有指令**（2026-11-05 用户要求，两处收口）：
     ① 末尾「## 全剧台词」标题剥掉——Whisper 转写的台词由程序生成时统一拼接；

@@ -1457,8 +1457,14 @@ def _prompt_file(key: str) -> str:
 
 @app.get("/api/prompts/{key}")
 def get_prompt(key: str):
-    """「修改提示词」：返回当前生效的提示词（自定义版优先）。"""
-    return analyze.read_prompt_view(_prompt_file(key))
+    """提示词正文已内置且对用户只读（2026-11-22 防破解第一批）。
+
+    旧的 read_prompt_view 会吐出近乎全文（FIXED_TAIL_MARKS 是空表，没有文件
+    被剥尾巴），10 个 key 又全部可枚举——试用账号循环 10 次就能拿走整套提示词
+    工程，比反编译便宜两个数量级。前端编辑入口 11-12 就收了（PROMPT_EDIT_ON
+    =false），GET 根本不发，所以这里统一 404、不区分 key 是否存在（不给枚举差异）。
+    """
+    raise HTTPException(404, "提示词接口已关闭")
 
 
 @app.put("/api/prompts/{key}")
