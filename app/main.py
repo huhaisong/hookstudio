@@ -350,6 +350,8 @@ def status():
         "whisper_model": os.path.isfile(os.path.join(mdir, "model.bin")),
         "whisper_dir": mdir,
         "ffmpeg": os.path.isfile(core.ff("ffmpeg")),
+        # 当前出片实际用的编码器（2026-11-22）：None=尚未探测/""=CPU 软编/否则人话标签
+        "hw_encoder": _hw_encoder_label(),
         "base": core.BASE,
         "data": core.DATA_DIR,
         "version": APP_VERSION,
@@ -371,6 +373,16 @@ def _asr_denoise_available() -> bool:
         return voiceiso.available()
     except Exception:  # noqa: BLE001
         return False
+
+
+def _hw_encoder_label() -> str | None:
+    """当前编码器标签（None=尚未探测/""=CPU 软编/否则是人话标签）。
+    render 顺手查缓存，绝不触发探测；render 出问题也不许拖垮状态接口。"""
+    try:
+        from . import render
+        return render.hw_encoder_label()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @app.get("/api/config")

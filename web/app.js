@@ -5375,6 +5375,19 @@ async function openSettings() {
     `本机：${s.cpu} 核 CPU · ${s.mem_gb ? s.mem_gb + " GB 内存" : "内存未知"}`;
   $("#in-outdir").value = c.paths.output || "";
   $("#in-hwenc").value = c.hw_encode === "off" ? "off" : "auto";
+  // 当前编码器（2026-11-22）：打开设置时查一次状态，失败静默——提示是锦上添花，
+  // 不能挡住设置弹窗。None=还没测过显卡，""=CPU 软编，其余是人话标签。
+  api("/api/status").then((st) => {
+    const el = $("#hwenc-hint");
+    if (!el) return;
+    if (st.hw_encoder === null || st.hw_encoder === undefined) {
+      el.textContent = "当前编码：尚未探测（下次出片时自动测）";
+    } else if (st.hw_encoder === "") {
+      el.textContent = "当前编码：CPU 软编";
+    } else {
+      el.textContent = `当前编码：${st.hw_encoder}`;
+    }
+  }).catch(() => {});
   if ($("#in-conc")) $("#in-conc").value = String(c.max_concurrent || 3);
   // 去背景音：只有随包带了分离模型才露出这个开关（同后端的 available 判断）
   const fldDenoise = $("#fld-asr-denoise");

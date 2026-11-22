@@ -30,6 +30,13 @@ PROMPTS = os.path.join(BASE, "prompts")
 MODELS = os.path.join(BASE, "models")
 BIN = os.path.join(BASE, "bin")
 
+# 子进程统一隐藏窗口（2026-11-22，借鉴竞品 HiddenPopen 的思路，落成常量 dict
+# 而不是 Popen 子类）。控制台形态下子进程本就继承黑窗不另弹；这是给将来的
+# 无控制台形态（pythonw / 安装器静默调用）兜底，免得 ffmpeg 探测一路闪黑框。
+# 非 Windows 是空 dict（subprocess 不认 creationflags）。playwright 的 Chrome
+# 窗口不在此列——发布助手要可见窗口，隐藏归 playwright 的 headless 管。
+POPEN_HIDE = {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
+
 # 随包只带 small：中文准确率与体积的折中点，去掉 base 可省约 140MB
 TIER = "small"
 
@@ -745,7 +752,8 @@ def ffprobe(path: str) -> dict:
         "format=duration:stream=codec_type,width,height", "-of", "json", path,
     ]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                             **POPEN_HIDE).stdout
         info = json.loads(out or "{}")
     except Exception:
         return {"duration": 0.0, "width": 0, "height": 0}
@@ -1475,7 +1483,7 @@ def run_cancelable(cmd: list[str], *, text: bool = False, encoding: str | None =
     返回值与 subprocess.run 一致（.returncode / .stdout / .stderr），
     所以调用点只需换函数名；超时和原来一样会杀掉进程。
     """
-    popen_kw = dict(kw)
+    popen_kw = {**POPEN_HIDE, **dict(kw)}   # 调用方显式传的 flags 优先
     if capture_output:
         popen_kw.setdefault("stdout", subprocess.PIPE)
         popen_kw.setdefault("stderr", subprocess.PIPE)

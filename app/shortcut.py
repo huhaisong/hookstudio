@@ -49,7 +49,7 @@ def ensure() -> None:
             ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
              "-Command", ps],
             timeout=25, capture_output=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=core.POPEN_HIDE.get("creationflags", 0),
         )
         # 桌面可能被 OneDrive 重定向，或者用户压根没权限；无论哪种都别再重试
         os.makedirs(os.path.dirname(mark), exist_ok=True)
