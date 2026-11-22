@@ -578,7 +578,7 @@ PRESET_VERSION = 1
 
 @app.get("/api/config/preset")
 def get_config_preset(request: Request):
-    auth.require(request)
+    me = auth.current_user(request)
     cfg = core.load_config() or {}
     return {"version": PRESET_VERSION,
             "settings": {k: cfg.get(k, core.DEFAULT_CONFIG.get(k)) for k in PRESET_KEYS}}
@@ -591,7 +591,7 @@ class PresetBody(BaseModel):
 
 @app.put("/api/config/preset")
 def put_config_preset(body: PresetBody, request: Request):
-    auth.require(request)
+    me = auth.current_user(request)
     settings = body.settings
     if body.version != PRESET_VERSION or not isinstance(settings, dict):
         raise HTTPException(400, "预设文件版本不对或内容缺失——请确认是从同版本导出的")
@@ -619,6 +619,10 @@ def put_config_preset(body: PresetBody, request: Request):
             raise HTTPException(400, "预设里 stall_sec 超出范围（只能 0 或 60–600）")
     if "merge_gap" in patch:
         patch["merge_gap"] = min(15.0, max(6.0, float(patch["merge_gap"])))
+    # 并发数导入时也夹到 1–8：core.max_concurrent() 读取时会 clamp，但 config.json
+    # 里留着 99 这种值会让设置页回填出「99 条」的怪状态（2026-11-23 评审实测）
+    if "max_concurrent" in patch:
+        patch["max_concurrent"] = max(1, min(8, int(patch["max_concurrent"])))
     core.save_config(patch)
     return {"ok": True, "applied": sorted(patch)}
 
