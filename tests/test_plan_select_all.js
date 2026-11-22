@@ -15,11 +15,16 @@ function makeCtx(plans, matchCount) {
     rows.push({
       _checked: plans[i].on !== false,
       _off: plans[i].on === false,
+      _wildcard: false,
       querySelector(sel) {
-        if (sel === 'input[type="checkbox"]') {
+        // 2026-11-22 起头部有两个勾选框：「要出片」(.plan-on-cb) 和「批量删除」(plan-del-cb)。
+        // 这里同时守两件事：① 必须点名 .plan-on-cb；② 走了通配选择器就标红——
+        // 通配会勾到第一个框（删除框），全选就变成了「全勾上要删」。
+        if (sel === ".plan-on-cb") {
           const row = this;
           return { set checked(v) { row._checked = v; }, get checked() { return row._checked; } };
         }
+        if (sel === 'input[type="checkbox"]') { this._wildcard = true; return null; }
         return null;
       },
       classList: {
@@ -56,6 +61,7 @@ function makeCtx(plans, matchCount) {
     const offs = ctx.rows.map((r) => r._off);
     if (!checked.every(Boolean)) throw new Error("全选后仍有未勾: " + checked);
     if (offs.some(Boolean)) throw new Error("全选后仍有 off: " + offs);
+    if (ctx.rows.some((r) => r._wildcard)) throw new Error("用了通配复选框选择器，会勾到「要删」那个框");
     if (!ctx.calls.api.body.on.every(Boolean)) throw new Error("API 未全 true");
     if (ctx.calls.stat < 1) throw new Error("统计未刷新");
     console.log("PASS 全选：3/3 复选框勾上、off 清除、API 全 true、统计刷新");

@@ -731,6 +731,9 @@ MODEL_CANDIDATES = [
     "ZHIPU/GLM-5.3", "ZHIPU/GLM-5.2", "ZHIPU/GLM-5",
     "MiniMax/MiniMax-M2.7", "MiniMax/MiniMax-M3",
     "kimi/kimi-k3.1-pro", "stepfun/step-5-preview",
+    # 2026-11-22 加：8 套档唯一又快又稳的（88 秒/8 套、套间重合 77%）。
+    # 加进这张表才会被「检测可用模型」探到；漏了它前端会按旧缓存把它藏起来。
+    "glm-5.3-prime",
 ]
 _MODELS_CACHE = os.path.join(core.DATA_DIR, "models_cache.json")
 
@@ -1105,6 +1108,14 @@ def _push_ep_run(run: list[dict], by_index: dict, meta: dict, blk: str, push) ->
 # 多半是换了场景（走路、赶路、转场），那才是该省略的地方。
 MERGE_GAP = 9.0       # 秒：两块间隙 ≤ 9 秒（同一场交锋内）才缝成一块
 MAX_BLOCK = 90.0      # 秒：缝合后单块上限，只防「把两场不相干的戏连成一条巨块」
+
+# 一块的硬下限（2026-11-22 C 档）：程序在编排末尾逐块检查，不足就向两头延长，
+# 延不到就整块丢掉。为什么要程序判：提示词写「一块 ≥60 秒」也好、「40-75 秒」也好，
+# 模型都不执行——6 批 240 个块的中位数是 30-38 秒、最短 10.9 秒，它按「一场戏」切，
+# 而算秒数是它做不了的长程算术。凡是可计算的硬指标，提示词说完后必须在代码里再判一次。
+# 取 40 而不是 60：本剧一集只有 60.8 秒，_grow_to 的 GROW_CAP=0.72 让**单集块最长
+# 43.8 秒**，要求 60 只能靠跨集拼接，会把「一场戏一块」的结构整个打散。
+BLOCK_MIN = 40.0      # 秒：一块的硬下限
 
 # 衔接缓冲块：rating 低于这个分，就是「让前一记重拳落地」的过渡（沉默、错愕、
 # 一句承上的话）。2026-11-12 用户明确**不再要 AI 专门去找缓冲块**（plans.txt 里
@@ -1695,6 +1706,74 @@ def _grow_to(p: dict, segs: list[dict], floor: float, want: float = 55.0) -> lis
     return out
 
 
+def _lift_blocks(p: dict, segs: list[dict], min_block: float = BLOCK_MIN) -> list[dict]:
+    """把不足 min_block 的块向两头延长；延不到就整块丢掉。（2026-11-22 C 档）
+
+    为什么要在程序里补：plans.txt 改成「40-75 秒」后，GLM-5.3 交出来的块反而更碎
+    （中位 34.3 秒、最短 10.9 秒），因为模型把「一场戏」当一块、从不按秒数算。
+    延长只动这一块**前后的台词**（观众看到的是更完整的一场交锋），不新增剧情、
+    不跨场；上限受同集邻块与集首尾约束——延到邻块身上就是同一段播两遍。
+
+    跨集块按片处理：尾片往后延、首片往前延，各自吸附到台词边界。
+    两块都延不出空间（贴满集首尾、或邻块紧贴）时整块丢弃——宁可这套少一块，
+    也不让 25 秒的碎片进成片（用户口径：话说一半就跳比不出现更伤）。
+    """
+    if not segs:
+        return segs
+    by_idx = {ep["index"]: ep for ep in p["episodes"]}
+    off = ep_offsets(p)
+    groups: dict[str, list[dict]] = {}
+    for s in segs:
+        groups.setdefault(s.get("blk") or f"e{s['ep']}_{s['start']}", []).append(s)
+
+    out: list[dict] = []
+    for ps in groups.values():
+        ps = [dict(x) for x in sorted(ps, key=lambda x: float(x["gs"]))]
+        dur = sum(float(x["end"]) - float(x["start"]) for x in ps)
+        if dur >= min_block:
+            out.extend(ps)
+            continue
+        # 两轮：先往后延尾片，再往前延首片。每轮都用最新的 dur 重算要补多少。
+        for rnd in range(2):
+            if dur >= min_block:
+                break
+            s = ps[-1] if rnd == 0 else ps[0]
+            ep = by_idx.get(s["ep"])
+            lines = (ep or {}).get("lines") or []
+            if not lines:
+                continue
+            ep_dur = float(ep.get("duration") or 0)
+            a0, z0 = float(s["start"]), float(s["end"])
+            # 同集的其他块把它夹在中间，不能延过去
+            sib = [x for x in segs
+                   if x.get("ep") == s["ep"] and x.get("blk") != s.get("blk")]
+            lo = max([float(x["end"]) for x in sib if float(x["end"]) <= a0 + 0.05] + [0.0])
+            hi = min([float(x["start"]) for x in sib
+                      if float(x["start"]) >= z0 - 0.05] + [ep_dur])
+            want = min_block - dur
+            if rnd == 0:
+                if hi <= z0 + 0.3:
+                    continue
+                b2 = _snap(lines, min(hi, z0 + want), z0, hi)
+                if b2 - z0 < 0.3:
+                    continue
+                s["end"], s["ge"] = round(b2, 3), round(off.get(s["ep"], 0.0) + b2, 3)
+                dur += b2 - z0
+            else:
+                if lo >= a0 - 0.3:
+                    continue
+                a2 = _snap(lines, max(lo, a0 - want), lo, a0)
+                if a0 - a2 < 0.3:
+                    continue
+                s["start"], s["gs"] = round(a2, 3), round(off.get(s["ep"], 0.0) + a2, 3)
+                dur += a0 - a2
+        if dur < min_block - 0.5:
+            continue
+        out.extend(ps)
+    out.sort(key=lambda s: (s["ep"], float(s["start"])))
+    return out
+
+
 def _segs_sec(segs: list[dict]) -> float:
     """池子里的素材总时长（秒）。判断池子够不够用它，不要用条数。"""
     return sum(float(s["end"]) - float(s["start"]) for s in segs)
@@ -1834,6 +1913,10 @@ def build_plans(p: dict, count: int, min_minutes: float, max_minutes: float,
     for i, st in enumerate(staged, 1):
         segs = _fit_target(p, st["segments"], avg, 10.0, avoid=accepted,
                            spare=spare, usage=usage)
+        # 逐块补到硬下限（2026-11-22 C 档）：AI 按「一场戏」切块，从不按秒数算，
+        # 6 批实测中位数 30-38 秒、最短 10.9 秒。提示词改了三轮都压不住，
+        # 这里在已选定的块上补——延不动就整块丢，不让碎片进成片。
+        segs = _lift_blocks(p, segs, BLOCK_MIN)
         # 裁完还不到目标的 85%，说明 AI 给这套的素材本身就少——把块向两头延一延，
         # 补到能发出去的长度（不新增素材，只让每场戏更完整）。
         segs = _grow_to(p, segs, avg * 0.85)

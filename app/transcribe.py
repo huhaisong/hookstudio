@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 
@@ -32,6 +33,66 @@ _COLLAPSE_CHARS = 30
 
 def _worst_chars(lines: list[dict]) -> int:
     return max((len(str(l.get("text") or "")) for l in (lines or [])), default=0)
+
+
+# ── 片尾「字幕组署名」幻听（2026-11-22）───────────────────────────────────
+# 实测两个项目共 8 处，**全部是该集最后一行、距集尾 0.03~0.34 秒**：
+# 《白月光》第 3 集片长 60.6s，那行 59.98~60.26 = 0.28 秒 7 个字（25 字/秒），
+# 真人说不出来。whisper 的训练语料里「字幕组署名」总伴随片尾音乐/静音，遇到
+# 没人声的片尾就照抄这类套话（英文那套是 "Subtitles by Amara.org"）。
+# vad_filter=False 放大了它：没有 VAD 挡着，片尾那段音乐直接进解码器。
+# 不是校对的锅：proof["auto"]["items"] 和 proof["drops"] 里 0 条涉及这些行，
+# 校对只输出局部 before/after，不会整集重写。
+#
+# 只在**片尾 _TAIL_SEC 秒内的行**上动手，中间偶尔冒出同一句的留给人工判断
+# （那种更可能是真台词，静默删除比漏删危险）。
+_TAIL_SEC = 3.0
+_JUNK_RE = re.compile(
+    r"字幕\s*[Bb][Yy]\s*.*$"                     # 字幕by索兰娅 / 字幕BY某某
+    r"|[Ss]ubtitles?\s*[Bb][Yy]\s*.*$"           # Subtitles by Amara.org
+    r"|字幕\s*(?:由|：|:)\s*.*(?:制作|提供|压制|字幕组)"   # 字幕由XX字幕组制作
+    r"|本?字幕(?:组)?\s*.*(?:制作|提供|压制)"
+    r"|请?不?吝?(?:点赞|订阅|转发|打赏)"            # 请不吝点赞 订阅 转发 打赏
+    r"|感谢(?:您的?)?(?:观看|收看)"
+    r"|[Aa]mara\.org"
+)
+# 剪掉套话后剩下的这一小截还算不算台词：标点、空白、省略号全不算字。
+_PUNCT_RE = re.compile(r"[\s，。、,.!?！？：:；;…—~（）()\[\]【】\"'“”‘’]+")
+
+
+def _drop_tail_junk(lines: list[dict], total_sec: float) -> tuple[list[dict], int]:
+    """丢掉片尾的「字幕组署名」幻听，返回 (新 lines, 处理了几行)。
+
+    两种情况都算命中：
+      · 整行就是套话（前面剩不到 2 个字）→ 整行删；
+      · 套话粘在真台词尾巴上（"谢谢字幕by索兰娅"）→ 只剪掉套话，保留台词。
+    删完不留空壳：行数变了，retime 按新句数重对（run 里 force 会清备份，
+    这里只改转写当场的结果，不碰已存的 lines_time_bak）。
+    """
+    if not lines:
+        return lines, 0
+    out: list[dict] = []
+    n = 0
+    for line in lines:
+        text = str(line.get("text") or "").strip()
+        end = float(line.get("end") or 0.0)
+        # total_sec 拿不到（解码失败）时按「最后一行」兜底，别整集不查
+        in_tail = (total_sec <= 0 and line is lines[-1]) or \
+                  (total_sec > 0 and end >= total_sec - _TAIL_SEC)
+        m = _JUNK_RE.search(text) if in_tail else None
+        if not m:
+            out.append(line)
+            continue
+        head = _PUNCT_RE.sub("", text[:m.start()])
+        n += 1
+        if len(head) < 2:
+            print(f"[transcribe] 丢掉片尾幻听：{text!r}"
+                  f"（{line.get('start')}~{line.get('end')}s）", flush=True)
+            continue
+        print(f"[transcribe] 剪掉句尾幻听：{text!r} → {head!r}"
+              f"（{line.get('start')}~{line.get('end')}s）", flush=True)
+        out.append({**line, "text": head})
+    return out, n
 
 
 def _split_on_gap(segments, on_segment=None) -> tuple[list[dict], dict]:
@@ -250,6 +311,12 @@ def transcribe_episode(path: str, on_progress=None, on_stage=None) -> list[dict]
     if st["split"]:
         print(f"[transcribe] 长句按一屏拆开 {st['split']} 句 → "
               f"多出 {st['added']} 行：{os.path.basename(path)}", flush=True)
+    # 最后一道：片尾音乐段 whisper 爱编「字幕by某某」这类署名（见 _JUNK_RE 注释）。
+    # 放在切行之后：先让切行按原始句数算完，再删这条尾巴，不影响前面的切点。
+    lines, n_junk = _drop_tail_junk(lines, total_sec)
+    if n_junk:
+        print(f"[transcribe] 片尾幻听处理 {n_junk} 行 → 剩 {len(lines)} 句："
+              f"{os.path.basename(path)}", flush=True)
     return lines
 
 

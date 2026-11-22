@@ -35,7 +35,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from . import audiofp, core
+from . import core
 
 # ── 平台约束（上线前用真账号实测校准，代码只认这几个常量）─────────────────
 LEAD_MIN = 10          # 最早：距现在至少 10 分钟
@@ -93,10 +93,13 @@ DECLARES = (("", "无需标注"), ("3", "内容为虚构剧情，仅供娱乐"),
             ("1", "含AI生成内容"), ("2", "内容包含营销广告"),
             ("5", "内容为自行拍摄"), ("7", "内容为转载"),
             ("8", "个人观点，仅供参考"))
-# 整批一致的那几项（能一键套到全批）；标题 / 短标题 / 封面取帧秒数逐条不同。
+# 整批一致的那几项（能一键套到全批）；标题 / 封面取帧秒数逐条不同。
+# 短标题（2026-11-21 用户要求「要能统一设置」）默认整批同一句，但单条可以
+# 单独改过 —— 套用时只覆盖「空着的」和「还跟着上次整批值」的，见 apply_fields。
 # 封面图片（cover_file）是「整批默认 + 单条覆盖」，只写 template、不灌进每条，
 # 所以不在 BATCH_KEYS 里，由 apply_fields 单独处理（见下方注释）。
-BATCH_KEYS = ("collection", "location", "activity", "link", "original", "declare", "topics")
+BATCH_KEYS = ("collection", "location", "activity", "link", "original", "declare",
+              "topics", "short_title")
 # 已经是「平台托管」或「已发」的，任何字段都不许再改（改了也发不出去，只会让人误会）
 LOCKED_STATUS = ("scheduled", "published", "publishing", "uncertain")
 
@@ -339,6 +342,8 @@ def account_name(aid: str) -> str:
 # ── 全局队列 ────────────────────────────────────────────────────────────
 def _default_tpl() -> dict:
     return {
+        # 短标题（≤16 字）：整批一般用同一句，所以放模板；单条改过的保留（见 apply_fields）
+        "short_title": "",
         "topics": [], "cover_file": "", "collection": "", "collection_id": "",
         # 原创默认**不勾**：号没有原创权限时勾了会被驳回，甚至影响账号权重。
         # 默认帮用户勾上等于替他做一个有风险的承诺（2026-11-13 定）。
@@ -590,7 +595,7 @@ def migrate_legacy() -> int:
 def _tpl_fields(tpl: dict) -> dict:
     """批次默认值 → 新作业的初始字段。加字段只改这里和 FIELD_SPEC。"""
     return {
-        "short_title": "",
+        "short_title": str(tpl.get("short_title") or ""),
         "topics": list(tpl.get("topics") or []),
         "cover_ts": 0.0,
         # 封面图不复制进每条：空串＝继承整批默认，界面上才分得清
@@ -811,29 +816,30 @@ def scan_dir(path: str, recursive: bool = True) -> list[dict]:
              "size": os.path.getsize(f) if os.path.isfile(f) else 0} for f in found]
 
 
-def probe_dur(path: str) -> float:
-    """读时长（秒）。拿不到就返回 0：时长只用于提示，不该阻断添加。"""
-    exe = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                       "bin", "ffprobe.exe")
-    if not os.path.isfile(exe):
-        return 0.0
-    try:
-        out = subprocess.run(
-            [exe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nw=1:nk=1", path],
-            capture_output=True, text=True, timeout=20,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return round(float((out.stdout or "0").strip() or 0), 1)
-    except Exception:  # noqa: BLE001
-        return 0.0
-
-
 def add_jobs(files: list[str] | None = None, sets: list[int] | None = None,
              pid: str = "", dir_path: str = "") -> dict:
     """把选中的视频加进队列（状态 draft，还没排期）。
 
     三条入口共用这里：选文件、选文件夹、从某个项目挑成片。
+
+    **入队只记「文件在哪」**（2026-11-21 用户定）：存在性、大小、路径指纹，
+    都是 stat 级，毫秒返回。以前这里还同步解整条音轨算内容指纹、再对每组
+    疑似同源跑段级定位（22 条 5-11 分钟成片要 34 秒，冷缓存+并发实测 142 秒），
+    而查重结果只是提示、从不拦人 —— 用一个可选提示阻塞确定的入队动作，不值。
+    现在 `afp` 留空，`repost_conflicts` 只按文件名/台账比（零成本）；预览路径
+    也不再比指纹（2026-11-21，见 repost_conflicts 的说明）。
     """
+    # 并发提交（连点、双击）会各自读旧队列再写回，后写覆盖先写。入队既然已经
+    # 只剩毫秒级操作，串行化不会卡任何人。
+    with _ADD_LOCK:
+        return _add_jobs(files, sets, pid, dir_path)
+
+
+_ADD_LOCK = threading.Lock()
+
+
+def _add_jobs(files: list[str] | None = None, sets: list[int] | None = None,
+              pid: str = "", dir_path: str = "") -> dict:
     q = queue()
     tpl = q["template"]
     p = core.load(pid) if pid else {}
@@ -886,7 +892,7 @@ def add_jobs(files: list[str] | None = None, sets: list[int] | None = None,
             "title": "", "title_src": "template", "account_id": "",
             "plan_at": "", "status": "draft", "attempts": 0,
             "error": "", "remote_hint": "", "verified_at": "",
-            "dur": it["dur"] or probe_dur(it["path"]), "size": it["size"],
+            "dur": it["dur"] or 0, "size": it["size"],
             "created_at": fmt(datetime.now()), "done_at": "",
             **_tpl_fields(tpl),
         }
@@ -894,9 +900,9 @@ def add_jobs(files: list[str] | None = None, sets: list[int] | None = None,
         # 模板里没填话题才自动生成；填了就按用户填的来（别覆盖人家的设置）
         if not job["topics"]:
             job["topics"] = auto_topics(pname)
-        # 音频内容指纹（多号查重用，只提示不拦）。120s 音频约 0.3s，同步算不卡界面；
-        # 算不出来（无音轨/损坏）就留空，按原来的文件名口径查重，绝不影响入队。
-        job["afp"] = audiofp.compute(it["path"])
+        # 这里以前会 `audiofp.compute(path)` 解整条音轨算内容指纹。已移除
+        # （2026-11-21 用户定：入队这一步不需要查内容）。老条目里的 afp 字段
+        # 原样留着不动，repost_conflicts 见到空 afp 就只走文件名口径。
         q["jobs"].append(job)
         added.append(job["id"])
 
@@ -967,8 +973,12 @@ def update_job(jid: str, patch: dict) -> dict:
 def apply_fields(fields: dict) -> dict:
     """把「整批通用设置」套到所有还没交出去的视频上，并记成批次默认值。
 
-    只处理**整批一致**的那几项（BATCH_KEYS）：标题 / 短标题 / 封面取帧秒数是
-    逐条不同的，整批套同一个标题等于把 15 条视频发成 15 个同名作品。
+    只处理**整批一致**的那几项（BATCH_KEYS）：标题 / 封面取帧秒数是逐条不同
+    的，整批套同一个标题等于把 15 条视频发成 15 个同名作品。
+
+    短标题（2026-11-21 用户要求「要能统一设置」）走整批，但**不硬覆盖**：只写
+    「还空着」或「还等于上次整批那个值」的条目。单条自己改过的保留下来，否则
+    用户只是调一下话题，22 条各自写好的短标题就被冲成同一句了。
 
     封面图片是唯一的例外：它只写 template（整批默认），不灌进每条 job ——
     job.cover_file 留着当「这条单独换过」的覆盖值，换全批图时也不冲掉它。
@@ -988,6 +998,7 @@ def apply_fields(fields: dict) -> dict:
         raise PublishError("没有要改的项")
 
     q = queue()
+    old_tpl = dict(q["template"] or {})   # 判断「还跟着整批值吗」要用改之前的那份
     for k, v in {**clean, **extra}.items():
         q["template"][k] = v
     if cover is not None:
@@ -1001,6 +1012,10 @@ def apply_fields(fields: dict) -> dict:
         if j.get("status") not in ("draft", "failed", "manual"):
             continue
         for k, v in clean.items():
+            if k == "short_title":
+                cur = str(j.get("short_title") or "")
+                if cur and cur != str(old_tpl.get("short_title") or ""):
+                    continue      # 这条自己写过短标题，别被整批覆盖
             j[k] = list(v) if k == "topics" else v
         for k, v in extra.items():
             j[k] = v
@@ -1184,11 +1199,15 @@ def repost_conflicts(jobs: list[dict], q: dict | None = None) -> list[dict]:
     **只提醒，不拦**：同一个片子换个时间重发是合法场景（2026-11-15 A 档）。
     队列里现存的条目 `add_jobs` 已经按 hash 挡过，这里专治「删掉记录或归档
     之后又加回来」——那时队列里查不到，但台账里留着证据。
+
+    **2026-11-21 起不比音频指纹**：这个函数挂在 `preview()` 里，而 preview 是
+    「改一下时间就调一次」的接口。指纹比对要对最像的一条解两条完整音轨，实测
+    22 条 / 7 对 = 10.2 秒（占 preview 全部耗时），界面上就是「设完时间要等十
+    几秒」。内容查重已按用户要求从入队与预览两条路径上摘掉；老条目里残留的
+    afp 字段不再读（字段留着不碍事）。
     """
     q = q or queue()
     prev: dict[str, list[dict]] = {}
-    # 内容指纹台账：只收带 afp 且不是取消/跳过的记录，供「不同文件但同源」比对
-    fp_hist: list[dict] = []
     for rec in (q.get("ledger") or []):
         f = _norm_file(rec.get("file"))
         st = str(rec.get("status") or "")
@@ -1196,73 +1215,22 @@ def repost_conflicts(jobs: list[dict], q: dict | None = None) -> list[dict]:
             continue
         at = str(rec.get("scheduled_at") or rec.get("submit_started_at")
                  or rec.get("left_at") or "")
-        title = str(rec.get("title") or "")[:60]
-        aid = str(rec.get("account_id") or "")
         prev.setdefault(f, []).append({
-            "status": st, "at": at, "title": title,
+            "status": st, "at": at, "title": str(rec.get("title") or "")[:60],
         })
-        if rec.get("afp"):
-            fp_hist.append({"afp": rec["afp"], "file": f,
-                            "title": title, "at": at, "account_id": aid})
-    # 队列里还没发的也纳入：一次加好几条、发到不同号时，彼此同源也要能查出来。
-    for jb in (q.get("jobs") or []):
-        if str(jb.get("status") or "") in ("skipped",):
-            continue
-        if jb.get("afp"):
-            fp_hist.append({
-                "afp": jb["afp"], "file": _norm_file(jb.get("file")),
-                "title": str(jb.get("title") or "")[:60],
-                "at": str(jb.get("created_at") or ""),
-                "account_id": str(jb.get("account_id") or ""),
-                "job_id": str(jb.get("id") or ""),
-            })
     out = []
     for j in jobs:
         hits = prev.get(_norm_file(j.get("file"))) or []
-        hits.sort(key=lambda x: x["at"], reverse=True)
-        # 内容级命中：先整片相似度筛，再对最像的一条做**段级定位**（2026-11-17）。
-        # 为什么要定位：我们的成片是同一批块拼的，两套共用 60% 时整片相似度会被
-        # 稀释到 0.7x 以下，只按 MIN_SIM 判会漏；命中了还得说得出「撞了哪几秒」，
-        # 否则用户没法改。定位只跑最像的一条，不拿 500 条历史全做窗口比对。
-        content = None
-        jafp = str(j.get("afp") or "")
-        if jafp:
-            my_id = str(j.get("id") or "")
-            scored = [(audiofp.similarity(jafp, h["afp"]), h) for h in fp_hist
-                      if h.get("job_id", "") != my_id]   # 别跟自己比
-            near = [(s, h) for s, h in scored if s >= audiofp.NEAR_SIM]
-            if near:
-                s, h = max(near, key=lambda x: x[0])
-                loc = audiofp.locate_files(str(j.get("file") or ""),
-                                           str(h.get("file") or ""))
-                if loc["method"] == "unavailable":
-                    # 历史文件被移走/删掉了：只能退回存下来的指纹（整片级）
-                    loc = audiofp.locate(jafp, h["afp"])
-                if s >= audiofp.MIN_SIM or loc["ratio"] >= audiofp.MIN_RATIO:
-                    span = (loc["spans"][0]["a"] if loc["spans"] else [])
-                    content = {"title": h["title"], "at": h["at"],
-                               "sim": s, "ratio": loc["ratio"],
-                               "overlap": loc["overlapSeconds"], "span": span,
-                               "account_id": h["account_id"]}
-        if not hits and not content:
+        if not hits:
             continue
-        row = {
+        hits.sort(key=lambda x: x["at"], reverse=True)
+        out.append({
             "job_id": str(j.get("id") or ""),
             "file": os.path.basename(str(j.get("file") or "")),
             "times": len(hits),
-        }
-        if hits:
-            row.update({"kind": "file", "prev_status": hits[0]["status"],
-                        "prev_at": hits[0]["at"], "prev_title": hits[0]["title"]})
-        if content:
-            # 文件名也命中时以文件名口径为准（同一条，别重复提示），
-            # 否则才算内容命中——提示语走「画面内容相同」，不说技术词。
-            if not hits:
-                row.update({"kind": "content", "prev_status": "content",
-                            "prev_at": content["at"], "prev_title": content["title"],
-                            "sim": content["sim"], "ratio": content["ratio"],
-                            "overlap": content["overlap"], "span": content["span"]})
-        out.append(row)
+            "kind": "file", "prev_status": hits[0]["status"],
+            "prev_at": hits[0]["at"], "prev_title": hits[0]["title"],
+        })
     return out
 
 

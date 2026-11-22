@@ -1,5 +1,8 @@
 const $ = (s) => document.querySelector(s);
-const ST = { path: "", proj: null, timer: null, pendingRender: null };
+const ST = { path: "", proj: null, timer: null, pendingRender: null,
+  // 套列表的三种临时状态（2026-11-22）：哪几批收起来了、要不要批量删、勾了哪几套。
+  // 都放在这里而不是 DOM 上——1.5 秒轮询会重建列表，状态挂在 DOM 上会一刷新就丢。
+  planFold: {}, planDel: false, planDelSel: new Set() };
 
 
 async function api(url, opts = {}) {
@@ -140,6 +143,7 @@ const MODEL_LABEL = {
   "qwen3.5-plus": "qwen3.5-plus", "ZHIPU/GLM-5.2": "ZHIPU/GLM-5.2",
   "ZHIPU/GLM-5.3": "ZHIPU/GLM-5.3", "deepseek-v4-pro": "deepseek-v4-pro",
   "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+  "glm-5.3-prime": "glm-5.3-prime", "kimi/kimi-k3.1-pro": "kimi/kimi-k3.1-pro",
   "deepseek-flash": "deepseek-flash", "qwen-max": "qwen-max",
 };
 function modelLabel(v) {
@@ -451,9 +455,9 @@ $("#in-autopipe").addEventListener("change", (e) => {
               fx:{auto_fx,src_ver,mirror,bgm,bgm_mode,bgm_dir,...}}
    记住上次：存进 config.autopipe_cfg（后端 ConfigBody/AutoPipeBody 都收）。 */
 const AUTO_DEF_JOBS = [
+  { model: "glm-5.3-prime", count: 5 },
   { model: "deepseek-v4.1-flash", count: 5 },
-  { model: "ZHIPU/GLM-5.2", count: 5 },
-  { model: "deepseek-v4-pro", count: 5 },
+  { model: "ZHIPU/GLM-5.3", count: 5 },
 ];
 const AUTO_DEF_MIN = 3, AUTO_DEF_MAX = 7;
 // PM_MODELS 在本文件后面才 const 声明；若在顶部 .filter 会触发 TDZ，整份脚本停摆。
@@ -1616,14 +1620,16 @@ function hookCard(pl, i) {
       <span class="pc-label">${esc(s.label || "")}</span>
     </div>`).join("");
   return `
-    <div class="plan ${pl.on === false ? "off" : ""}" data-i="${i}">
+    <div class="plan ${pl.on === false ? "off" : ""}" data-i="${i}" data-bn="">
       <div class="plan-head">
-        <input type="checkbox" ${pl.on === false ? "" : "checked"}>
+        ${planDelBits(pl)}
+        <input class="plan-on-cb" type="checkbox" ${pl.on === false ? "" : "checked"}>
         <b>第 ${pl.ep} 集</b>
         ${pl.model ? `<span class="ov info" title="这一集用的生成方式">${esc(modelLabel(pl.model))}</span>` : ""}
         <span class="hint">钩子 ${fmt(he - hs)}（原片 ${fmt(hs)}–${fmt(he)}）+ 正片 ${fmt(pl.ep_dur || 0)} · 成片 ${fmt(pl.sec || 0)}</span>
         <span class="ov plan-fx ${pl.fx ? "info" : ""}" data-i="${i}" title="这一集的出片与画面设置：去重 / 配乐 / 调色 / 用哪份视频都能改；不改就跟随这批的默认">✎ 设置 · ${esc(pl.fx ? fxShort(pl.fx) : "跟随默认")}</span>
         <span class="plan-more">展开表 ▾</span>
+        ${planDelX(pl)}
       </div>
       <div class="plan-body hidden">
         <div class="pl-order">结构：钩子段（本集 ${fmt(hs)}–${fmt(he)}，提到片头）+ 整集正片（0:00–${fmt(pl.ep_dur || 0)}）；钩子那段在正片里会再出现一次</div>
@@ -1668,6 +1674,9 @@ function renderPlans() {
     $("#plan-note").textContent = "";
     $("#btn-render-plans").textContent = HK.mode === "hook" ? "出片（已选 0 集）" : "出片（已选 0 套）";
     $("#btn-render-plans").disabled = true;
+    // 套全删光了还停在「批量删除」模式会没法操作，顺手退出来
+    if (ST.planDel) setPlanDelMode(false);
+    syncPlanDelUI();
     renderPlanShortfall();
     return;
   }
@@ -1691,21 +1700,34 @@ function renderPlans() {
         .map((el) => el.dataset.i));
     renderPlans._sig = sig;
     list._sig = sig;
-    list.innerHTML = planListHtml(plans);
+    list.innerHTML = planListHtml(plans, planFoldState(p, plans));
     // 重建完把用户原来展开着的几套恢复，再重新挂事件
     list.querySelectorAll(".plan").forEach((el) => {
       const i = Number(el.dataset.i);
+      const idx = Number((plans[i] || {}).index || 0);
       if (openSet.has(el.dataset.i)) {
         el.querySelector(".plan-body").classList.remove("hidden");
         el.querySelector(".plan-more").textContent = "收起 ▴";
       }
-      el.querySelector('input[type="checkbox"]').addEventListener("change", (e) => {
+      // 头部有两个勾选框：plan-on-cb 是「要不要出片」，plan-del-cb 是批量删除时勾的。
+      // 必须分开绑——以前只有前者，用 querySelector('input') 就够，现在不能那么写。
+      const onCb = el.querySelector(".plan-on-cb");
+      if (onCb) onCb.addEventListener("change", (e) => {
         e.stopPropagation();
         onPlanToggle(i, e.target.checked);
+      });
+      const delCb = el.querySelector(".plan-del-cb");
+      if (delCb) delCb.addEventListener("change", () => togglePlanDelSel(idx, delCb.checked, delCb));
+      const delBtn = el.querySelector(".plan-del");
+      if (delBtn) delBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        askDelPlans([idx]);
       });
       // 片头大字输入框 2026-11-21 随片头组一起删了（钩子卡没有开关可开，填了也不会出卡）
       el.querySelector(".plan-head").addEventListener("click", (e) => {
         if (e.target.tagName === "INPUT") return;
+        // 批量删除模式下点整行 = 勾选/取消这一套（勾选框只有 15px，一行一行点太费劲）
+        if (ST.planDel) { togglePlanDelSel(idx, !ST.planDelSel.has(idx), delCb); return; }
         if (e.target.closest(".plan-fx")) { e.stopPropagation(); openPlanFx(i); return; }
         const body = el.querySelector(".plan-body");
         body.classList.toggle("hidden");
@@ -1713,6 +1735,17 @@ function renderPlans() {
       });
       updatePlanFxChips();
     });
+    // 批标题整行可点：收起/展开这一批
+    list.querySelectorAll(".plan-batch.foldable").forEach((el) => {
+      el.addEventListener("click", () => togglePlanFold(el.dataset.bn));
+    });
+    // 重建会抹掉批量删除的临时勾选，按 ST 恢复（正在批量删时轮询恰好重建过一次）
+    list.classList.toggle("deleting", !!ST.planDel);
+    ST.planDelSel.forEach((idx) => {
+      const cb = list.querySelector(`.plan-del-cb[data-idx="${idx}"]`);
+      if (cb) { cb.checked = true; cb.closest(".plan").classList.add("picked"); }
+    });
+    applyPlanFold();
   }
   // 头部备注/统计每拍都对齐一次（纯文本，改值才写，不会打断阅读）
   let note = (p.batch && p.batch.plan_note) || "";
@@ -1734,8 +1767,225 @@ function renderPlans() {
   updatePlanStat();
   updatePlanFxChips();
   syncHookFxLocks();
+  syncPlanDelUI();
   renderPlanShortfall();
 }
+
+/* ---------- 套太多时的整理手段（2026-11-22 用户要求） ----------
+   一次能排出十几批几十套，全平铺就是三四屏。三个口子：
+   ① 按批收起（批标题整行可点 + 全部收起/展开）；② 每套标题右端一个 ×，单删；
+   ③ 「批量删除」模式：每行左侧出红勾，勾完一次删掉。
+   折叠状态存 localStorage、勾选态存 ST——1.5 秒轮询会重建 DOM，挂在节点上会一刷就没。 */
+
+function planFoldStoreKey(pid) { return "hf_plan_fold_" + pid; }
+
+function planFoldLoad(pid) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(planFoldStoreKey(pid)) || "null");
+    return raw && typeof raw === "object" ? raw : null;
+  } catch { return null; }   // 本地存储被清过/被改坏了，当没有记录处理
+}
+
+function planFoldSave(pid, st) {
+  try { localStorage.setItem(planFoldStoreKey(pid), JSON.stringify(st)); } catch { /* 存不下就算了，最多下次进来又按默认 */ }
+}
+
+/* 有哪些「批」。老套没有批号 → 单独算一组（"0"），对应列表里「之前生成的套」那个标题。
+   钩子模式（一集一条）不分组也不折叠：一集一张卡，按批折等于把同一批的集藏起来。 */
+function planGroupKeys(plans) {
+  const keys = [];
+  (plans || []).forEach((pl) => {
+    if (pl.mode === "hook") return;
+    const k = String(Number(pl.batch_no || 0));
+    if (!keys.includes(k)) keys.push(k);
+  });
+  return keys;
+}
+
+/* 算这一拍用哪份折叠状态，顺手定下「第一次进来」和「又生成了一批」两种情况。
+   默认口径（2026-11-22 用户定）：只展开最后一批，其余收起。 */
+function planFoldState(p, plans) {
+  const keys = planGroupKeys(plans);
+  if (!keys.length) { ST.planFold = {}; return {}; }
+  const lastKey = keys[keys.length - 1];
+  const st = planFoldLoad(p.id);
+  if (!st || !st.fold) {
+    const fold = {};
+    keys.slice(0, -1).forEach((k) => (fold[k] = 1));
+    planFoldSave(p.id, { fold, last: lastKey });
+    ST.planFold = fold;
+    return fold;
+  }
+  const fold = { ...(st.fold || {}) };
+  if (st.last !== lastKey) {
+    // 新批出来了：这一批展开（不然生成完看不见），旧批保持用户上次的样子
+    delete fold[lastKey];
+    planFoldSave(p.id, { fold, last: lastKey });
+  }
+  ST.planFold = fold;
+  return fold;
+}
+
+function applyPlanFold() {
+  const list = $("#plan-list");
+  if (!list) return;
+  const fold = ST.planFold || {};
+  list.querySelectorAll(".plan[data-bn]").forEach((el) => {
+    const k = el.dataset.bn;
+    if (k) el.classList.toggle("hidden", !!fold[k]);
+  });
+  list.querySelectorAll(".plan-batch.foldable").forEach((el) => {
+    const on = !!fold[el.dataset.bn];
+    el.classList.toggle("folded", on);
+    const a = el.querySelector(".pb-arrow");
+    if (a) a.textContent = on ? "▸" : "▾";
+  });
+}
+
+function togglePlanFold(key) {
+  const p = ST.proj;
+  if (!p || !key) return;
+  const st = planFoldLoad(p.id) || {};
+  const fold = { ...(st.fold || {}) };
+  if (fold[key]) delete fold[key]; else fold[key] = 1;
+  planFoldSave(p.id, { fold, last: st.last || "" });
+  ST.planFold = fold;
+  applyPlanFold();
+}
+
+/* 全部收起 / 全部展开：批多时一次点完，不用一个个点标题 */
+function setPlanFoldAll(on) {
+  const p = ST.proj;
+  if (!p) return;
+  const keys = planGroupKeys(p.plans || []);
+  const fold = {};
+  if (on) keys.forEach((k) => (fold[k] = 1));
+  const st = planFoldLoad(p.id) || {};
+  planFoldSave(p.id, { fold, last: st.last || keys[keys.length - 1] || "" });
+  ST.planFold = fold;
+  applyPlanFold();
+}
+
+/* ② 标题行右侧那排按钮的状态。钩子模式没有「批」可折，两个折叠按钮收起来；
+   一套都没有时批量删除点不动。每拍对一次，纯文本/disabled 赋值，改值才写。 */
+function syncPlanTools() {
+  const plans = (ST.proj && ST.proj.plans) || [];
+  const hook = !!(plans.length && plans[0].mode === "hook");
+  ["#btn-plan-fold", "#btn-plan-unfold"].forEach((s) => {
+    const el = $(s);
+    if (el) el.classList.toggle("hidden", hook || !plans.length);
+  });
+  const mdel = $("#btn-plan-mdel");
+  if (mdel) {
+    mdel.disabled = !plans.length;
+    setText(mdel, ST.planDel ? "退出删除" : "批量删除");
+    mdel.classList.toggle("danger", !!ST.planDel);
+  }
+}
+
+/* 批量删除模式的界面态：进出只切 class 和显隐，不重建列表——
+   重建会把用户展开着的表合上（和轮询重建是同一个道理）。 */
+function syncPlanDelUI() {
+  const on = !!ST.planDel;
+  const plans = (ST.proj && ST.proj.plans) || [];
+  const hook = !!(plans.length && plans[0].mode === "hook");
+  const n = ST.planDelSel ? ST.planDelSel.size : 0;
+  const list = $("#plan-list");
+  if (list) list.classList.toggle("deleting", on);
+  ["#plan-stat", "#btn-plan-all", "#btn-plan-none", "#btn-render-plans"].forEach((s) => {
+    const el = $(s);
+    if (el) el.classList.toggle("hidden", on);
+  });
+  const bar = $("#plan-del-bar");
+  if (bar) bar.classList.toggle("hidden", !on);
+  setText("#plan-del-n", on ? `已选 ${n} ${hook ? "集" : "套"}` : "");
+  const go = $("#btn-plan-del-do");
+  if (go) go.disabled = !n;
+  syncPlanTools();
+}
+
+function setPlanDelMode(on) {
+  ST.planDel = !!on;
+  ST.planDelSel = new Set();
+  const list = $("#plan-list");
+  if (list) {
+    list.querySelectorAll(".plan-del-cb").forEach((cb) => { cb.checked = false; });
+    list.querySelectorAll(".plan.picked").forEach((el) => el.classList.remove("picked"));
+  }
+  syncPlanDelUI();
+}
+
+function togglePlanDelSel(idx, on, cb) {
+  if (!ST.planDel) return;
+  if (!ST.planDelSel) ST.planDelSel = new Set();
+  const n = Number(idx) || 0;
+  if (!n) return;
+  if (on) ST.planDelSel.add(n); else ST.planDelSel.delete(n);
+  const list = $("#plan-list");
+  const box = cb || (list && list.querySelector(`.plan-del-cb[data-idx="${n}"]`));
+  if (box) {
+    box.checked = !!on;
+    const card = box.closest(".plan");
+    if (card) card.classList.toggle("picked", !!on);
+  }
+  syncPlanDelUI();
+}
+
+/* 单删和批删共用：先按数据把要删的说清楚（几套、哪几套、几套已出片），
+   再调后端。已出片的套只从列表移掉，mp4 留在保存目录——弹层里必须写明，
+   否则用户会以为连带把片子删了。 */
+async function askDelPlans(indexes) {
+  const p = ST.proj;
+  if (!p) return;
+  const plans = p.plans || [];
+  const hook = !!(plans.length && plans[0].mode === "hook");
+  const unit = hook ? "集" : "套";
+  const want = new Set((indexes || []).map(Number).filter(Boolean));
+  const targets = plans.filter((x) => want.has(Number(x.index)));
+  if (!targets.length) return toast(`要删的${unit}已经不在了，刷新一下再看`);
+  const curGen = Number((p.batch && p.batch.gen) || p.plan_gen || 0);
+  const made = new Set((p.sets || [])
+    .filter((s) => Number(s.gen || 0) === curGen && s.output)
+    .map((s) => Number(s.index)));
+  const outN = targets.filter((x) => made.has(Number(x.index))).length;
+  const body = [];
+  if (targets.length === 1 && !hook) {
+    const t = targets[0];
+    body.push(`第 ${t.index} 套${t.ai_name ? ` · ${t.ai_name}` : ""}：${(t.edl || []).length} 片 · ${fmt(t.sec || 0)}`
+      + (t.eps && t.eps.length ? ` · 第 ${t.eps[0]}–${t.eps[1]} 集` : ""));
+  } else {
+    body.push(`要删的 ${targets.length} ${unit}：${targets
+      .map((t) => (hook ? `第 ${t.ep} 集` : `第 ${t.index} 套`)).join("、")}`);
+  }
+  if (outN) body.push(`其中 ${outN} ${unit}已经出过片：只从列表里移掉，mp4 文件留在保存目录，不会删。`);
+  body.push(`剩下的${unit}号会连着重排（删掉第 2 套，原来的第 3 套就变成第 2 套），已出片的记录跟着改号。`);
+  body.push("删掉的结构恢复不了，要重来只能重新生成（会花生成次数）。");
+  const ok = await askConfirm({
+    title: `删掉这 ${targets.length} ${unit}？`, body, okText: "删掉", danger: true,
+  });
+  if (!ok) return;
+  try {
+    const r = await api(`/api/projects/${p.id}/plans-delete`, {
+      method: "POST", body: JSON.stringify({ indexes: [...want] }),
+    });
+    ST.proj = await api("/api/projects/" + p.id);
+    setPlanDelMode(false);
+    render();
+    toast(`已删掉 ${r.removed} ${r.unit || unit}，还剩 ${r.left} ${r.unit || unit}`);
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+/* 三个按钮挂一次就够：列表本身每 1.5 秒可能重建，标题行和底部工具条是静态节点。 */
+$("#btn-plan-fold").addEventListener("click", () => setPlanFoldAll(true));
+$("#btn-plan-unfold").addEventListener("click", () => setPlanFoldAll(false));
+$("#btn-plan-mdel").addEventListener("click", () => setPlanDelMode(!ST.planDel));
+$("#btn-plan-del-cancel").addEventListener("click", () => setPlanDelMode(false));
+$("#btn-plan-del-do").addEventListener("click", () => {
+  if (!ST.planDelSel || !ST.planDelSel.size) return;
+  askDelPlans([...ST.planDelSel]);
+});
 
 /* ---------- 没生成成功的组：提示条 + 只重跑这些组（2026-11-16 A 档） ----------
    只在**有组没出来**时出现。按钮把上次失败组的原参数原样发回去，后端 append=True
@@ -1827,34 +2077,56 @@ $("#plan-shortfall").addEventListener("click", async (e) => {
 /* 套列表：按「批」分组。同一部剧可以反复分批生成（这批勾 1-8 集、下批勾 5-11 集），
    十几套平铺在一起看不出哪套是哪次排的、用的哪些集。
    老项目没有 batch_no，照旧平铺、不插标题（不凭空造批次）。 */
-function planListHtml(plans) {
+function planListHtml(plans, fold) {
   let last = null;
   let legacyTitled = false;
   const hasBatch = plans.some((x) => Number(x.batch_no || 0));
   const out = [];
+  const folded = (k) => !!(fold && fold[k]);
   plans.forEach((pl, i) => {
     const bn = Number(pl.batch_no || 0);
+    const key = String(bn);
     // 老套没有批号：混在新批中间会看不出哪套是哪次排的，给它们一个总标题
     if (pl.mode !== "hook" && !bn && hasBatch && !legacyTitled) {
       legacyTitled = true;
-      out.push(`<div class="plan-batch"><b>之前生成的套</b>`
-        + `<span>没记批次</span><i>这批之前的旧结构，出片照旧</i></div>`);
+      out.push(planBatchHtml(key, "之前生成的套", "没记批次", "这批之前的旧结构，出片照旧", folded(key)));
     }
     if (pl.mode !== "hook" && bn && bn !== last) {
       last = bn;
       const n = plans.filter((x) => Number(x.batch_no || 0) === bn).length;
       const brief = epsBrief(pl.batch_eps || []);
-      out.push(`<div class="plan-batch"><b>第 ${bn} 批</b>`
-        + `<span>${n} 套${brief ? ` · 用 ${esc(brief)}` : ""}</span>`
-        + `<i>这一批只从这些集里挑片段</i></div>`);
+      out.push(planBatchHtml(key, `第 ${bn} 批`, `${n} 套${brief ? ` · 用 ${esc(brief)}` : ""}`,
+        "这一批只从这些集里挑片段", folded(key)));
     }
-    out.push(planCard(pl, i));
+    // 折叠靠卡片的 data-bn：收起时只给同批的卡加 .hidden，不重建 DOM
+    out.push(planCard(pl, i, pl.mode === "hook" ? "" : key));
   });
   return out.join("");
 }
 
+/* 批标题：整行可点，箭头 ▾/▸ 表示这一批是展开还是收起的。
+   收起后「N 套」还在标题上——不然会看不出里面还压着多少东西。 */
+function planBatchHtml(key, name, span, tip, isFolded) {
+  return `<div class="plan-batch foldable${isFolded ? " folded" : ""}" data-bn="${esc(key)}"
+      title="点一下${isFolded ? "展开" : "收起"}这一批">
+    <span class="pb-arrow">${isFolded ? "▸" : "▾"}</span>
+    <b>${name}</b><span>${span}</span><i>${tip}</i></div>`;
+}
+
+/* 删除的两个入口：批量模式下的红勾（默认藏着，.deleting 时显示）和标题右端的 ×。
+   两者的 data-idx 都是**套号**（不是数组下标）——删除接口按套号走。 */
+function planDelBits(pl) {
+  const u = pl.mode === "hook" ? "集" : "套";
+  return `<input type="checkbox" class="plan-del-cb" data-idx="${pl.index}" title="勾上＝要删掉这${u}">`;
+}
+
+function planDelX(pl) {
+  const u = pl.mode === "hook" ? "这一集" : "这一套";
+  return `<span class="plan-del" data-idx="${pl.index}" title="删掉${u}">×</span>`;
+}
+
 /* 一套结构 = 一张卡片：头部一行概览 + 可展开的表 */
-function planCard(pl, i) {
+function planCard(pl, i, bn) {
   // 单集钩子前置是另一种产物形态（一集一条），字段和体检指标都不一样
   if (pl.mode === "hook") return hookCard(pl, i);
   const epDur = {};
@@ -1885,9 +2157,10 @@ function planCard(pl, i) {
     + (pl.avg_gap ? `平均每次跳过 ${Math.round(pl.avg_gap)} 秒；` : "")
     + `每分钟跳切 ${perMin.toFixed(1)} 次（跳过过程，正常）`;
   return `
-    <div class="plan ${pl.on === false ? "off" : ""}" data-i="${i}">
+    <div class="plan ${pl.on === false ? "off" : ""}" data-i="${i}" data-bn="${bn || ""}">
       <div class="plan-head">
-        <input type="checkbox" ${pl.on === false ? "" : "checked"}>
+        ${planDelBits(pl)}
+        <input class="plan-on-cb" type="checkbox" ${pl.on === false ? "" : "checked"}>
         <b>第 ${pl.index} 套</b>
         ${pl.model ? `<span class="ov info" title="这套用的生成方式">${esc(modelLabel(pl.model))}</span>` : ""}
         <span class="hint">${(pl.edl || []).length} 片${pl.blocks ? ` / ${pl.blocks} 块` : ""} · ${fmt(pl.sec || 0)}${pl.eps && pl.eps.length ? ` · 第 ${pl.eps[0]}–${pl.eps[1]} 集` : ""}${pl.style ? ` · ${esc(pl.style)}` : ""}</span>
@@ -1897,6 +2170,7 @@ function planCard(pl, i) {
         ${pl.anchor_hit ? `<span class="ov ${pl.anchor_hit >= 3 ? "bad" : pl.anchor_hit >= 2 ? "mid" : "ok"}" title="和前面第 ${pl.anchor_vs} 套用了同一条名场面锚点（core 那句）。名场面可以两套都用，只要「与前面重复」没超过 80% 就行">锚点重 ${pl.anchor_hit}</span>` : ""}
         <span class="ov plan-fx ${pl.fx ? "info" : ""}" data-i="${i}" title="这一套单独的出片与画面设置：去重 / 配乐 / 调色 / 变形 / 特效 / 用哪份视频都能改；不改就跟随这批套的默认">✎ 设置 · ${esc(pl.fx ? fxShort(pl.fx) : "跟随默认")}</span>
         <span class="plan-more">展开表 ▾</span>
+        ${planDelX(pl)}
       </div>
       <div class="plan-body hidden">
         ${pl.order_desc ? `<div class="pl-order">顺序：${esc(pl.order_desc)}${pl.seq ? ` · 集号走位 ${esc(pl.seq)}` : ""}</div>` : ""}
@@ -1954,7 +2228,8 @@ async function planSelectAll(on) {
   // 但下面一排复选框看着没反应（2026-11-21 用户反馈「全选/全不选不起作用」）。
   // 不重建 DOM，用户展开的那几套保持展开。
   document.querySelectorAll("#plan-list .plan").forEach((row) => {
-    const cb = row.querySelector('input[type="checkbox"]');
+    // 必须点名 .plan-on-cb：头部还有「批量删除」那个红勾，通配选会勾错框
+    const cb = row.querySelector(".plan-on-cb");
     if (cb) cb.checked = on;
     row.classList.toggle("off", !on);
   });
@@ -3366,16 +3641,22 @@ $("#btn-plan-auto").addEventListener("click", () => {
      准入标准和 kimi/step「探针通但零产出」是同一条：出不了可用结果的概不提供。
    - 每条都能在 docs/模型对比报告.html 里查到记录。
    - pmAlive：点「检测可用模型」后，现在探不通的（欠费/没开通）会从下拉里去掉，
-     但不会动「自己填进来的型号」——那一行会切到「自定义…」保留原值。 */
+     但不会动「自己填进来的型号」——那一行会切到「自定义…」保留原值。
+   - 2026-11-22 8 套档横评（每模型 8 套 / 5–12 分钟 / 并行不掐）后新增两个：
+     · glm-5.3-prime：88 秒出齐 8 套、366–487 秒全达标、套间重合 77%，本轮最快最稳；
+     · kimi/kimi-k3.1-pro：样本不稳——8 套 172 秒成功过一次，另两次 601/300 秒超时；
+       精确指令遵循国内第一，留作备选，出不来就换 prime。
+     没放进来：qwen3.8-max / qwen3.8-flash 三次 8 套档都 >600 秒、kimi-k2.6 百炼 400
+     无权限、ZHIPU/GLM-5.3 8 套档也超 600 秒（5 套档 139 秒可用，要它就把套数降到 5）。
+     要试这几个请选「自定义…」手输。 */
 /* 2026-11-19 用户定：下拉直接写真实模型名，不再用「快速 / 精细」档位名。
    value 仍是真实代号，提交逻辑一行没动；「跟随设置」「自定义…」保持人话。 */
 const PM_MODELS = [
   ["", "跟随设置（推荐）"],
-  ["qwen3.5-plus", "qwen3.5-plus"],
   ["ZHIPU/GLM-5.3", "ZHIPU/GLM-5.3"],
-  ["ZHIPU/GLM-5.2", "ZHIPU/GLM-5.2"],
   ["deepseek-v4.1-flash", "deepseek-v4.1-flash"],
-  ["deepseek-v4-pro", "deepseek-v4-pro"],
+  ["glm-5.3-prime", "glm-5.3-prime"],
+  ["kimi/kimi-k3.1-pro", "kimi/kimi-k3.1-pro"],
 ];
 let pmAlive = null;   // null = 没检测过，全放；Set = 只放这里面的（+默认+自定义）
 

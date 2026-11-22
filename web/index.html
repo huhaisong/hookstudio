@@ -577,7 +577,16 @@
             </details>
           </div>
 
-          <div class="section-label">② 挑选要出片的套</div>
+          <!-- 套多时的三个口子（2026-11-22 用户要求）：按批收起、单套删、批量删。
+               工具按钮放标题行右侧，不占列表空间；没用套的时候整排禁用。 -->
+          <div class="section-label plan-sec">
+            <span>② 挑选要出片的套</span>
+            <span class="plan-tools">
+              <button class="ghost sm" id="btn-plan-fold" title="每批只留标题，一屏看完有几批">全部收起</button>
+              <button class="ghost sm" id="btn-plan-unfold">全部展开</button>
+              <button class="ghost sm" id="btn-plan-mdel" title="挑几套一起删掉">批量删除</button>
+            </span>
+          </div>
           <div id="plan-shortfall" class="shortfall hidden" aria-live="polite"></div>
           <div id="plan-list" class="plan-list"></div>
           <div class="note" id="plan-note"></div>
@@ -614,6 +623,11 @@
             <span id="plan-stat" class="hint"></span>
             <button class="ghost sm" id="btn-plan-all">全选</button>
             <button class="ghost sm" id="btn-plan-none">全不选</button>
+            <span id="plan-del-bar" class="hidden">
+              <span id="plan-del-n" class="hint"></span>
+              <button class="ghost sm danger" id="btn-plan-del-do">删除</button>
+              <button class="ghost sm" id="btn-plan-del-cancel">取消</button>
+            </span>
             <button class="primary" id="btn-render-plans">出片（已选 0 套）</button>
           </div>
 
@@ -854,11 +868,10 @@
           <label class="fld" id="fld-model">生成方式
             <input id="in-model" list="model-list" placeholder="留空则用默认" autocomplete="off" spellcheck="false">
             <datalist id="model-list">
-              <option value="qwen3.5-plus">qwen3.5-plus</option>
-              <option value="ZHIPU/GLM-5.2">ZHIPU/GLM-5.2</option>
               <option value="ZHIPU/GLM-5.3">ZHIPU/GLM-5.3</option>
-              <option value="deepseek-v4-pro">deepseek-v4-pro</option>
               <option value="deepseek-v4.1-flash">deepseek-v4.1-flash</option>
+              <option value="glm-5.3-prime">glm-5.3-prime</option>
+              <option value="kimi/kimi-k3.1-pro">kimi/kimi-k3.1-pro</option>
               <option value="deepseek-flash">deepseek-flash</option>
               <option value="qwen-max">qwen-max</option>
             </datalist>

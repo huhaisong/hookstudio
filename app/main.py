@@ -1728,6 +1728,44 @@ def put_plans_select(pid: str, body: PlansSelectBody):
     return {"ok": True, "selected": sum(1 for pl in plans if pl.get("on", True))}
 
 
+class PlansDeleteBody(BaseModel):
+    indexes: list[int] = []
+
+
+# 删套是「load → 改 → save_merge」，两次点击挨得近会各自基于同一份旧快照，
+# 后写的那次把前一次删掉的套又写回来。用进程内锁串起来（出片/生成各自有自己的
+# 判断，它们根本不许和删除同时进行，见接口里的 409）。
+_PLAN_DEL_LOCK = threading.Lock()
+
+
+@app.post("/api/projects/{pid}/plans-delete")
+def post_plans_delete(pid: str, body: PlansDeleteBody):
+    """删掉几套结构（2026-11-22 用户要求）：单删、批删共用这一个口子。
+
+    套号 / 成片记录 / 套间指标怎么一起收拾，全在 batch.drop_plans 里，此处只做
+    HTTP 层：判在跑的出片、加锁、落盘。
+    """
+    idxs = sorted({int(i) for i in (body.indexes or [])})
+    if not idxs:
+        raise HTTPException(400, "没有指定要删哪几套")
+    with _PLAN_DEL_LOCK:
+        p = core.load(pid)
+        if not p:
+            raise HTTPException(404, "项目不存在")
+        # 出片队列按套号对齐（batch.py 的 queue 用 pl["index"]），中途改号会让
+        # 「正在渲第 5 套」变成渲别的结构，这批片子全废。等跑完再删，几秒钟的事。
+        task = core.get_task(pid)
+        if (task and task.get("kind") == "batch" and not task.get("error")
+                and float(task.get("pct") or 0) < 100):
+            raise HTTPException(409, "正在出片，等这一趟跑完再删——出片队列按套号走，中途改号会让正在渲的套错位")
+        try:
+            r = batch.drop_plans(p, idxs)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        core.save_merge(p, ["plans", "sets", "batch"])
+    return {"ok": True, **r}
+
+
 class PlanHookBody(BaseModel):
     index: int      # 第几套（1 起）
     hook: str = ""  # 开场黑屏那一句，空 = 这套不出钩子卡

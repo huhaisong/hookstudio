@@ -47,6 +47,58 @@ def _human(exc: Exception) -> str:
     return s[:160] or "窗口没打开，重试一次。"
 
 
+# ── 「窗口还开着吗」必须看活体，不能只信一条内存记录 ────────────────────
+# 2026-11-21 事故：21:06 打开的窗口被用户关掉后，窗口线程卡在收尾（Playwright
+# 的 ctx.close() / pw.stop() 在浏览器已退出时会无限等），`finally` 到不了 →
+# `rec["closed"]` 永不置位、临时 profile 也删不掉。之后每次点「进入视频号助手」
+# 都命中 already 分支，只弹「窗口已经开着了」而其实一个进程都没有，用户被彻底
+# 挡住，只能重启软件。所以：
+#   ① 线程活着就每 0.5s 打一次心跳，心跳停了＝线程死了/卡住了；
+#   ② `finally` 第一行先把 closed 置位，再去做可能卡住的收尾；
+#   ③ 判定记录失效的当场丢掉，允许重新开窗。
+_HEARTBEAT_STALE = 3.0     # 秒：心跳停这么久就当线程已死
+_STARTUP_GRACE = 75.0      # 秒：启动阶段没法打心跳，用「点了多久」兜（判完登录约 45s）
+_PROFILE_STALE = 3600.0    # 秒：临时 profile 超过 1 小时视为陈旧目录
+
+
+def _alive(rec: dict | None) -> bool:
+    """这条记录对应的窗口线程是否还活着（活着＝用户可以切过去看的那个窗口）。"""
+    if not rec or rec["closed"].is_set():
+        return False
+    if not rec.get("ready"):
+        # 还在借 cookie / 起浏览器 / 等页面稳定，这段时间由启动宽限期兜住
+        return (time.time() - rec["since"]) < _STARTUP_GRACE
+    return (time.time() - (rec.get("beat") or 0)) < _HEARTBEAT_STALE
+
+
+def _sweep_stale_profiles() -> None:
+    """清掉以前卡死留下的临时 profile（浏览器进程已退，目录没人删）。
+
+    只动 `_tmp_browser/viewer_*`，且 mtime 超过 1 小时；正在用的目录跳过。
+    纯卫生动作，失败一律忽略，不耽误开窗。
+    """
+    root = os.path.join(core.DATA_DIR, "_tmp_browser")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    with _MU:
+        live = {r.get("prof_dir") for r in _VIEWERS.values() if _alive(r)}
+    now = time.time()
+    for n in names:
+        if not n.startswith("viewer_"):
+            continue
+        p = os.path.join(root, n)
+        if p in live:
+            continue
+        try:
+            if now - os.path.getmtime(p) < _PROFILE_STALE:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(p, ignore_errors=True)
+
+
 def _clean_cookies(cookies) -> list[dict]:
     out: list[dict] = []
     for c in cookies or []:
@@ -91,6 +143,7 @@ def _viewer(aid: str, cookies: list[dict], ready: queue.Queue, rec: dict) -> Non
         prof_dir = os.path.join(core.DATA_DIR, "_tmp_browser",
                                 "viewer_" + uuid.uuid4().hex)
         os.makedirs(prof_dir, exist_ok=True)
+        rec["prof_dir"] = prof_dir      # 清陈旧目录时要跳过它
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=prof_dir,
             executable_path=wxbot.find_browser(),
@@ -125,10 +178,15 @@ def _viewer(aid: str, cookies: list[dict], ready: queue.Queue, rec: dict) -> Non
                    "body": body, "cookies": len(cookies),
                    "url": (page.url or "")[-120:]})
         sent = True
+        rec["ready"] = True          # 从这里开始算心跳，不再走启动宽限期
+        rec["beat"] = time.time()
         # 窗口开着就一直占着这个线程。轮询而不是 wait_for_event("close")：
         # 用户直接关整个浏览器窗口时后者会抛 TargetClosed，且脚本退出前
         # 没法让线程干净收尾（见 close_platform）。
         while not rec["stop"].wait(0.5):
+            # 心跳：线程还活着。卡在 Playwright 同步调用上时心跳会停，
+            # open_platform 据此判死、允许重开，不会被一条僵尸记录永远挡住。
+            rec["beat"] = time.time()
             try:
                 if page.is_closed():
                     break
@@ -138,6 +196,9 @@ def _viewer(aid: str, cookies: list[dict], ready: queue.Queue, rec: dict) -> Non
         if not sent:
             ready.put({"ok": False, "note": _human(exc)})
     finally:
+        # 先落地状态，再做可能卡住的收尾（ctx.close / pw.stop 在浏览器已退出时
+        # 会无限等，卡住也不能让这条记录继续挡着用户）。
+        rec["closed"].set()
         try:
             if ctx is not None:
                 ctx.close()
@@ -162,11 +223,20 @@ def open_platform(aid: str) -> dict:
     if wxbot.headless():
         return {"ok": False, "aid": aid,
                 "note": "现在是调试用的无头模式，不弹窗口。正常打开软件时点这里会直接弹出已登录的视频号助手。"}
+    _sweep_stale_profiles()
     with _MU:
         old = _VIEWERS.get(aid)
-        if old and not old["closed"].is_set():
-            return {"ok": True, "aid": aid, "already": True, "logged_in": True,
+        if old is not None and _alive(old):
+            if not old.get("ready"):
+                return {"ok": True, "aid": aid, "already": True, "starting": True,
+                        "note": "窗口正在打开，等一两秒看一眼屏幕。"}
+            return {"ok": True, "aid": aid, "already": True,
                     "note": "窗口已经开着了，切过去看就行。"}
+        if old is not None:
+            # 记录还在但线程已经死了（窗口被关 / 卡在收尾）：不能让它继续挡着，
+            # 叫旧线程收工、丢掉这条，下面重新开一个。
+            old["stop"].set()
+            _VIEWERS.pop(aid, None)
 
     try:
         # 号正忙（发表 / 采样 / 预取）时这里会排队，25 秒等不到就如实说，
@@ -183,7 +253,14 @@ def open_platform(aid: str) -> dict:
         _VIEWERS[aid] = rec
     th = threading.Thread(target=_viewer, args=(aid, cookies, ready, rec),
                           name="wx-view-" + aid, daemon=True)
-    th.start()
+    try:
+        th.start()
+    except Exception as exc:  # noqa: BLE001  线程起不来就别留僵尸记录
+        with _MU:
+            if _VIEWERS.get(aid) is rec:
+                _VIEWERS.pop(aid, None)
+        rec["closed"].set()
+        return {"ok": False, "aid": aid, "note": _human(exc)}
     try:
         res = ready.get(timeout=45)
     except queue.Empty:
@@ -193,10 +270,9 @@ def open_platform(aid: str) -> dict:
 
 
 def viewer_open(aid: str) -> bool:
-    """给回归 / 状态查询用：这个号的窗口是否还开着。"""
+    """给回归 / 状态查询用：这个号的窗口是否还真的开着（不看僵尸记录）。"""
     with _MU:
-        rec = _VIEWERS.get(aid)
-        return bool(rec and not rec["closed"].is_set())
+        return _alive(_VIEWERS.get(aid))
 
 
 def close_platform(aid: str) -> bool:

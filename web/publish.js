@@ -17,6 +17,11 @@
     // 防搬运建议一致（2026-11-14 用户定），要用别的档随时点。
     // hist = 右栏当前在「队列 / 已提交」哪个视图（2026-11-14 新增已提交任务）。
     first: "", gap: 30, plan: null, planTimer: null, poll: null, hist: false,
+    // planSeq：预览请求的序号。改时间会连发好几个 plan（每次 350ms 防抖后仍然
+    // 可能重叠），谁后返回谁覆盖 → 摘要闪回上一次的值。只认最后一次的响应。
+    // planFor：这份预览是按哪组「首条/间隔/条数」算出来的，开始上传时直接复用，
+    // 省掉一次白算（2026-11-21）。
+    planSeq: 0, planFor: null,
     key: "", edit: null, picker: null, opts: {}, optBusy: {},
     verifiedCur: "",   // 本次页面会话已经真导航核对过登录态的当前号（切号即验号）
     // 选好号后的静默预取：optFor 记住已经备好的是哪个号，optSeq 用来丢弃
@@ -39,6 +44,10 @@
     statFilter: "", statIncOnly: false, statColl: "", statSort: "time",
     statCols: 1, statNotice: null, statNoticeOpen: false,
     statBusy: false, diagBusy: false, abn: null, delBusy: false, openBusy: false,
+    // 加入队列的进行态（2026-11-21）：以前点完到入队完成之间界面一动不动，
+    // 22 条时要等半分钟到两分钟，人只会以为按钮坏了、然后连点十几次。
+    // addBusy 期间按钮禁用并显示条数，连点直接吞掉（后端也加了锁）。
+    addBusy: false, addN: 0,
     // 登录会话：null＝没在登录。添加账号/重登/失效兜底全走这一个状态，
     // 后端负责弹出可见浏览器窗口，前端只提示 + 轮询登录态（2026-11-14 用户定：
     // 界面里不再显示二维码）。
@@ -949,6 +958,145 @@
   }
   function stopPoll() { if (S.poll) clearInterval(S.poll); S.poll = null; }
 
+  /** ① 那一整块（候选卡片 + 底部按钮行）。单独成函数是为了「勾一条」「选完
+   *  文件夹」「清空」只重画这里 —— 以前这些都走整页 render()，②里正在打的
+   *  话题、下拉展开态、输入焦点会跟着被冲掉（2026-11-21 用户反馈「点文案
+   *  左边整块刷一下」时顺手一起修的）。 */
+  function candSec(noAcc) {
+    return `<section class="pub-sec" id="pub-sec1">
+            <div class="pub-sec-h"><span class="pub-n">1</span>
+              <div class="pub-h-txt"><b>选视频</b><em>整个文件夹、几个文件，或者从某个项目里挑成片</em></div></div>
+            ${candBox()}
+            <div class="pub-acts">
+              <button class="ghost sm" data-act="pickdir">＋ 选文件夹</button>
+              <button class="ghost sm" data-act="pickfiles">＋ 选视频文件</button>
+              <button class="ghost sm" data-act="pickproj">＋ 从项目挑</button>
+              <span class="hint">${noAcc ? "先在上面账号条选一个号"
+                : S.sel.size ? `已选 ${S.sel.size} 条` : "先勾几条视频"}</span>
+              <button class="primary sm" data-act="add"
+                ${(S.sel.size && !noAcc && !S.addBusy) ? "" : "disabled"}
+                title="${S.addBusy ? "正在加入，稍等一下"
+                  : noAcc ? "先在上面账号条选一个号"
+                  : !S.sel.size ? "先勾几条视频" : "把勾中的视频加进队列"}"
+                >${S.addBusy ? `正在加入…（${S.addN} 条）` : "加入队列"}</button>
+            </div>
+            <div class="hist-chips" id="pub-hist-dir"></div>
+          </section>`;
+  }
+
+  /** 右栏（队列 / 已提交）的内容。抽出来之后，点「文案」展开一条、切
+   *  「队列↔已提交」、换筛选都只重画这一列，左边的 ②③ 一概不动。 */
+  function rightHTML(d) {
+    const jobs = d.jobs || [];
+    const drafts = jobs.filter((j) => j.status === "draft").length;
+    // 队列 = 设置工作台（还没安排的草稿）；已提交 = 点完「开始上传」的
+    // 后台任务（等着传 / 正在传 / 已定时 / 已提交 / 已发布 / 失败 / 已取消）。
+    // 开始上传成功后队列清空、通用设置恢复默认，下一批从头填
+    // （2026-11-14 用户定稿：后台任务不占设置工作台）。
+    const draftJobs = jobs.filter((j) => j.status === "draft");
+    const submittedJobs = jobs.filter((j) => j.status !== "draft");
+    // 已提交按号隔离（2026-11-14 用户反馈「切号后队列数据没变」）：任务自己
+    // 带着账号走，右边就只看当前号的；没选号时不过滤（页面刚打开还没号，
+    // 全部摆出来，选了号再看自己的）。草稿属于设置工作台，跟号无关，不过滤。
+    const cur = currentAid();
+    const mySubmitted = cur
+      ? submittedJobs.filter((j) => j.account_id === cur) : submittedJobs;
+    const otherSubmitted = cur
+      ? submittedJobs.filter((j) => j.account_id !== cur) : [];
+    const queuedN = mySubmitted.filter((j) => j.status === "queued").length;
+    const failedN = mySubmitted.filter((j) => j.status === "failed").length;
+    const noAcc = !cur;
+    // 已提交一多（真号 20+ 条很常见）就得能一眼找到要管的那条
+    const TODO_ST = ["queued", "publishing", "failed", "uncertain", "manual"];
+    const todoN = mySubmitted.filter((j) => TODO_ST.includes(j.status)).length;
+    const qf = S.qfilter || "all";
+    const shownSubmitted = qf === "todo"
+      ? mySubmitted.filter((j) => TODO_ST.includes(j.status))
+      : qf === "done"
+        ? mySubmitted.filter((j) => !TODO_ST.includes(j.status))
+        : mySubmitted;
+    const startTxt = noAcc ? "先在上面账号条选号"
+      : `开始上传（${drafts} 条）`;
+    // 右侧预览里的警告容易漏看，在开始按钮旁再摆一条精简版（完整版进 title）
+    const warnMsg = ((S.plan && (S.plan.warns || [])[0]) || {}).msg || "";
+    return `
+          <div class="pub-qhead">
+            <div class="seg pub-qtabs">
+              <button class="pub-qtab${S.hist ? "" : " on"}" data-act="qtab" data-hist="0">队列${draftJobs.length ? " " + draftJobs.length : ""}</button>
+              <button class="pub-qtab${S.hist ? " on" : ""}" data-act="qtab" data-hist="1">已提交${mySubmitted.length ? " " + mySubmitted.length : ""}</button>
+            </div>
+          </div>
+          ${!S.hist ? `
+          <div id="pub-plan" class="pub-plan"></div>
+          ${draftJobs.length ? `<div class="pub-rows">${draftJobs.map((j, i) => row(j, i)).join("")}</div>`
+            : `<div class="pub-empty">队列是空的。左边选好视频、设好时间和内容，点「开始上传」。</div>`}
+          <div class="pub-start-warn" id="pub-start-warn"
+            style="${(drafts && warnMsg) ? "" : "display:none"}"
+            title="${esc(warnMsg)}">${esc(
+              warnMsg.length > 88 ? warnMsg.slice(0, 88) + "…" : warnMsg)}</div>
+          <div class="pub-foot">
+            <button class="ghost sm" data-act="clear" ${noAcc || !drafts ? "disabled" : ""}
+              title="把「还没安排」的条目从队列里删掉">删掉没安排的${drafts ? `（${drafts} 条）` : ""}</button>
+            ${drafts || noAcc ? `<button class="primary" data-act="start" ${noAcc ? "disabled" : ""}>${startTxt}</button>` : ""}
+          </div>`
+          : (mySubmitted.length
+            ? `${failedN ? `<div class="pub-acts"><button class="ghost sm" data-act="retryAll" title="只重试当前号的失败条目">重试失败 ${failedN} 条</button></div>` : ""}
+              <div class="pub-qfilters">
+                <button class="pub-qf${qf === "all" ? " on" : ""}" data-act="qfilter" data-f="all">全部 ${mySubmitted.length}</button>
+                <button class="pub-qf${qf === "todo" ? " on" : ""}" data-act="qfilter" data-f="todo">要处理的 ${todoN}</button>
+                <button class="pub-qf${qf === "done" ? " on" : ""}" data-act="qfilter" data-f="done">已完成的 ${mySubmitted.length - todoN}</button>
+              </div>
+              ${shownSubmitted.length
+                ? `<div class="pub-rows">${shownSubmitted.map((j) => row(j, mySubmitted.indexOf(j))).join("")}</div>`
+                : `<div class="pub-empty">这一类现在是空的，切到「全部」看其它条目。</div>`}
+              <div class="pub-foot">
+            <button class="ghost sm" data-act="stop" ${noAcc || !queuedN ? "disabled" : ""}
+              title="取消当前号还在排队、没上传的条目，退回队列重新设置；已经传到平台的取消不了，得到视频号助手手动删">批量取消${queuedN ? `（${queuedN} 条）` : ""}</button>
+              </div>
+              ${otherSubmitted.length ? `<div class="pub-acts"><span class="hint">另外有 ${otherSubmitted.length} 条任务在别的号上，切到那个号就能看到。</span></div>` : ""}`
+            : `<div class="pub-empty">这个号还没有提交过的任务。点「开始上传」之后，交出去的都在这里跟踪。</div>
+              ${otherSubmitted.length ? `<div class="pub-acts"><span class="hint">另外有 ${otherSubmitted.length} 条任务在别的号上，切到那个号就能看到。</span></div>` : ""}`)}`;
+  }
+
+  /** 只重画 ①。整页 render() 会把 ② 重建：正在打的字、下拉展开态、焦点全丢。 */
+  function paintCand() {
+    const sec = document.getElementById("pub-sec1");
+    if (!sec) { render(); return; }       // 还没画过整页（或停在门禁页）就退回整页
+    sec.outerHTML = candSec(!currentAid());
+    paintHist();
+  }
+
+  /** 只重画右栏。排期预览（#pub-plan）是 doPlan 异步填进去的，重建完要还回去，
+   *  否则点一下「文案」侧栏那行排期摘要就白了。 */
+  /** 只重建右栏。三个坑：
+   *  1) 排期预览（#pub-plan）是 doPlan 异步填进去的，重建完要还回去；
+   *  2) 右栏的滚动在 `.pub-rows` 内部，innerHTML 一换 scrollTop 归零 ——
+   *     在第 11 条点「文案」会直接跳回第 1 条（2026-11-21 用户反馈）；
+   *  3) 展开的那条如果被挤出可视区，得最小幅度滚回来，否则点了像没反应。
+   */
+  function paintRight(resetScroll) {
+    const box = document.querySelector(".pub-right");
+    const d = S.d;
+    if (!box || !d) { render(); return; }
+    const planEl = box.querySelector("#pub-plan");
+    const planHTML = planEl ? planEl.innerHTML : "";
+    const rowsEl = box.querySelector(".pub-rows");
+    const keepTop = rowsEl ? rowsEl.scrollTop : 0;
+    const keepY = window.scrollY;      // 窄屏下右栏不吸顶，整页也可能被带着滚
+    box.innerHTML = rightHTML(d);
+    const plan2 = box.querySelector("#pub-plan");
+    if (plan2 && planHTML) plan2.innerHTML = planHTML;
+    const rows2 = box.querySelector(".pub-rows");
+    // 切「队列 / 已提交」、换筛选：那是一份新列表，从头看更合理
+    if (rows2) rows2.scrollTop = resetScroll ? 0 : keepTop;
+    if (keepY && !resetScroll) window.scrollTo(0, keepY);
+    if (S.edit && !resetScroll) {
+      const form = box.querySelector(`[data-fedit="${S.edit}"]`);
+      const row = form && form.closest(".pub-row");
+      if (row) row.scrollIntoView({ block: "nearest" });
+    }
+  }
+
   // ── 渲染 ──────────────────────────────────────────────────────────────
   function render() {
     const d = S.d;
@@ -969,57 +1117,11 @@
       return;
     }
 
-    const accounts = d.accounts || [];
-    const jobs = d.jobs || [];
-    const drafts = jobs.filter((j) => j.status === "draft").length;
-    // 队列 = 设置工作台（还没安排的草稿）；已提交 = 点完「开始上传」的
-    // 后台任务（等着传 / 正在传 / 已定时 / 已提交 / 已发布 / 失败 / 已取消）。
-    // 开始上传成功后队列清空、通用设置恢复默认，下一批从头填
-    // （2026-11-14 用户定稿：后台任务不占设置工作台）。
-    const draftJobs = jobs.filter((j) => j.status === "draft");
-    const submittedJobs = jobs.filter((j) => j.status !== "draft");
-    // 已提交按号隔离（2026-11-14 用户反馈「切号后队列数据没变」）：任务自己
-    // 带着账号走，右边就只看当前号的；没选号时不过滤（页面刚打开还没号，
-    // 全部摆出来，选了号再看自己的）。草稿属于设置工作台，跟号无关，不过滤。
-    const cur = currentAid();
-    const mySubmitted = cur
-      ? submittedJobs.filter((j) => j.account_id === cur) : submittedJobs;
-    const otherSubmitted = cur
-      ? submittedJobs.filter((j) => j.account_id !== cur) : [];
-    const queuedN = mySubmitted.filter((j) => j.status === "queued").length;
-    const failedN = mySubmitted.filter((j) => j.status === "failed").length;
     const noAcc = !currentAid();
-    // 已提交一多（真号 20+ 条很常见）就得能一眼找到要管的那条
-    const TODO_ST = ["queued", "publishing", "failed", "uncertain", "manual"];
-    const todoN = mySubmitted.filter((j) => TODO_ST.includes(j.status)).length;
-    const qf = S.qfilter || "all";
-    const shownSubmitted = qf === "todo"
-      ? mySubmitted.filter((j) => TODO_ST.includes(j.status))
-      : qf === "done"
-        ? mySubmitted.filter((j) => !TODO_ST.includes(j.status))
-        : mySubmitted;
-    const startTxt = noAcc ? "先在上面账号条选号"
-      : `开始上传（${drafts} 条）`;
-    // 右侧预览里的警告容易漏看，在开始按钮旁再摆一条精简版（完整版进 title）
-    const warnMsg = ((S.plan && (S.plan.warns || [])[0]) || {}).msg || "";
     BODY().innerHTML = `
       <div class="pub-cols">
         <div class="pub-left">
-          <section class="pub-sec">
-            <div class="pub-sec-h"><span class="pub-n">1</span>
-              <div class="pub-h-txt"><b>选视频</b><em>整个文件夹、几个文件，或者从某个项目里挑成片</em></div></div>
-            ${candBox()}
-            <div class="pub-acts">
-              <button class="ghost sm" data-act="pickdir">＋ 选文件夹</button>
-              <button class="ghost sm" data-act="pickfiles">＋ 选视频文件</button>
-              <button class="ghost sm" data-act="pickproj">＋ 从项目挑</button>
-              <span class="hint">${noAcc ? "先在上面账号条选一个号"
-                : S.sel.size ? `已选 ${S.sel.size} 条` : "先勾几条视频"}</span>
-              <button class="primary sm" data-act="add" ${S.sel.size && !noAcc ? "" : "disabled"}
-                title="${noAcc ? "先在上面账号条选一个号" : !S.sel.size ? "先勾几条视频" : "把勾中的视频加进队列"}">加入队列</button>
-            </div>
-            <div class="hist-chips" id="pub-hist-dir"></div>
-          </section>
+          ${candSec(noAcc)}
 
           <section class="pub-sec">
             <div class="pub-sec-h"><span class="pub-n">2</span>
@@ -1064,44 +1166,7 @@
           </details>
         </div>
 
-        <aside class="pub-right">
-          <div class="pub-qhead">
-            <div class="seg pub-qtabs">
-              <button class="pub-qtab${S.hist ? "" : " on"}" data-act="qtab" data-hist="0">队列${draftJobs.length ? " " + draftJobs.length : ""}</button>
-              <button class="pub-qtab${S.hist ? " on" : ""}" data-act="qtab" data-hist="1">已提交${mySubmitted.length ? " " + mySubmitted.length : ""}</button>
-            </div>
-          </div>
-          ${!S.hist ? `
-          <div id="pub-plan" class="pub-plan"></div>
-          ${draftJobs.length ? `<div class="pub-rows">${draftJobs.map((j, i) => row(j, i)).join("")}</div>`
-            : `<div class="pub-empty">队列是空的。左边选好视频、设好时间和内容，点「开始上传」。</div>`}
-          <div class="pub-start-warn" id="pub-start-warn"
-            style="${(drafts && warnMsg) ? "" : "display:none"}"
-            title="${esc(warnMsg)}">${esc(
-              warnMsg.length > 88 ? warnMsg.slice(0, 88) + "…" : warnMsg)}</div>
-          <div class="pub-foot">
-            <button class="ghost sm" data-act="clear" ${noAcc || !drafts ? "disabled" : ""}
-              title="把「还没安排」的条目从队列里删掉">删掉没安排的${drafts ? `（${drafts} 条）` : ""}</button>
-            ${drafts || noAcc ? `<button class="primary" data-act="start" ${noAcc ? "disabled" : ""}>${startTxt}</button>` : ""}
-          </div>`
-          : (mySubmitted.length
-            ? `${failedN ? `<div class="pub-acts"><button class="ghost sm" data-act="retryAll" title="只重试当前号的失败条目">重试失败 ${failedN} 条</button></div>` : ""}
-              <div class="pub-qfilters">
-                <button class="pub-qf${qf === "all" ? " on" : ""}" data-act="qfilter" data-f="all">全部 ${mySubmitted.length}</button>
-                <button class="pub-qf${qf === "todo" ? " on" : ""}" data-act="qfilter" data-f="todo">要处理的 ${todoN}</button>
-                <button class="pub-qf${qf === "done" ? " on" : ""}" data-act="qfilter" data-f="done">已完成的 ${mySubmitted.length - todoN}</button>
-              </div>
-              ${shownSubmitted.length
-                ? `<div class="pub-rows">${shownSubmitted.map((j) => row(j, mySubmitted.indexOf(j))).join("")}</div>`
-                : `<div class="pub-empty">这一类现在是空的，切到「全部」看其它条目。</div>`}
-              <div class="pub-foot">
-            <button class="ghost sm" data-act="stop" ${noAcc || !queuedN ? "disabled" : ""}
-              title="取消当前号还在排队、没上传的条目，退回队列重新设置；已经传到平台的取消不了，得到视频号助手手动删">批量取消${queuedN ? `（${queuedN} 条）` : ""}</button>
-              </div>
-              ${otherSubmitted.length ? `<div class="pub-acts"><span class="hint">另外有 ${otherSubmitted.length} 条任务在别的号上，切到那个号就能看到。</span></div>` : ""}`
-            : `<div class="pub-empty">这个号还没有提交过的任务。点「开始上传」之后，交出去的都在这里跟踪。</div>
-              ${otherSubmitted.length ? `<div class="pub-acts"><span class="hint">另外有 ${otherSubmitted.length} 条任务在别的号上，切到那个号就能看到。</span></div>` : ""}`)}
-        </aside>
+        <aside class="pub-right">${rightHTML(d)}</aside>
       </div>`;
     paintHist();
   }
@@ -1723,6 +1788,9 @@
       ${linkField(t)}
       <label><span>话题</span><input data-bf="topics"
              value="${esc(topicsText(t.topics))}" placeholder="空格隔开，不用打 #"></label>
+      <label><span>短标题</span><input data-bf="short_title" maxlength="16"
+             value="${esc(t.short_title || "")}"
+             placeholder="6-16 字，整批都用这句；留空让平台自己截"></label>
       <label class="chk"><input type="checkbox" data-bf="original"${t.original ? " checked" : ""}>
         <span>声明原创<em>号没开通原创权限时勾了会被驳回</em></span></label>`;
   }
@@ -1987,14 +2055,23 @@
         ? `<div class="hint">没有还没安排的条目了。</div>` : "";
       if (tbox) tbox.innerHTML = "";
       paintStartWarn(null);
+      S.plan = null;
+      S.planFor = null;
+      S.planSeq++;          // 作废还在路上的那次预览
       return;
     }
+    const wantFirst = S.first;
+    const wantGap = Number(S.gap) || 30;
+    const seq = ++S.planSeq;
     try {
       const r = await api("/api/publish/plan", {
         method: "POST",
-        body: JSON.stringify({ first_at: S.first, interval_min: Number(S.gap) || 30 }),
+        body: JSON.stringify({ first_at: wantFirst, interval_min: wantGap }),
       });
+      // 连点时间会同时挂好几个请求，谁后返回谁覆盖会让摘要闪回旧值：只认最后一次
+      if (seq !== S.planSeq) return;
       S.plan = r;
+      S.planFor = { first: wantFirst, gap: wantGap, n: drafts };
       paintStartWarn(r);
       if (!r.n) { box.innerHTML = `<div class="hint">队列里还没有视频，先在左边勾几条。</div>`; return; }
       const errs = (r.errors || []).map((e) => `<div class="pub-alarm bad">${esc(e.msg)}</div>`).join("");
@@ -2014,6 +2091,7 @@
             ? `<span class="pub-t more">还有 ${all.length - show.length} 条</span>` : "");
       }
     } catch (e) {
+      if (seq !== S.planSeq) return;
       box.innerHTML = `<div class="pub-alarm bad">${esc(e.message)}</div>`;
       if (tbox) tbox.innerHTML = "";
       paintStartWarn(null);
@@ -2043,7 +2121,7 @@
         // 整个文件夹默认全选：用户的意图就是「这些都要发」，再让他一条条勾一遍很烦
         S.sel = new Set(S.cand.map((_c, i) => i));
         if (!S.cand.length) toast("这个文件夹里没找到视频（支持 mp4/mov 等常见格式）");
-        render();
+        paintCand();
         return;
       }
       if (name === "recentdir") {
@@ -2056,7 +2134,7 @@
         S.cand = (r.files || []).map((f) => ({ path: f.path, name: f.name, size: f.size }));
         S.sel = new Set(S.cand.map((_c, i) => i));
         if (!S.cand.length) toast("这个文件夹里没找到视频了");
-        render();
+        paintCand();
         return;
       }
       if (name === "pickfiles") {
@@ -2069,7 +2147,7 @@
           path: p, name: p.split(/[\\/]/).pop(), size: 0,
         }));
         S.sel = new Set(S.cand.map((_c, i) => i));
-        render();
+        paintCand();
         return;
       }
       if (name === "pickproj") {
@@ -2079,12 +2157,15 @@
         S.cand = [];
         S.sel.clear();
         S.pid = "";
-        render();
+        paintCand();
         return;
       }
-      if (name === "backCand") { resetCand(); render(); return; }
-      if (name === "clearCand") { resetCand(); render(); return; }
+      if (name === "backCand") { resetCand(); paintCand(); return; }
+      if (name === "clearCand") { resetCand(); paintCand(); return; }
       if (name === "add") {
+        // 连点直接吞掉：上一次还没回来就再发一遍，后端会各自读旧队列再写回，
+        // 轻则重复条目、重则后写覆盖先写（2026-11-21 实测被连点 12 次）。
+        if (S.addBusy) return;
         const body = { files: [], sets: [], pid: S.pid, dir_path: "" };
         if (S.picker === "proj") {
           body.sets = S.cand.filter((_c, i) => S.sel.has(i))
@@ -2092,15 +2173,25 @@
         } else {
           body.files = S.cand.filter((_c, i) => S.sel.has(i)).map((c) => c.path);
         }
-        if (!(body.sets.length || body.files.length)) { toast("先勾几条"); return; }
-        const r = await api("/api/publish/add", { method: "POST", body: JSON.stringify(body) });
-        const dup = (r.dup || []).length;
-        const repost = r.repost || [];
-        const rep = repost.length;
-        const byContent = repost.filter((x) => x.kind === "content").length;
-        toast(`加了 ${(r.added || []).length} 条` + (dup ? `，${dup} 条已经在队列里` : "")
-          + (rep ? `；其中 ${rep} 条内容重复${byContent ? `（${byContent} 条跟其他条或已发过的内容重复，换了文件名也认得出，可能是整条也可能是其中一段）` : ""}，提交前会再提醒一次` : ""));
-        resetCand();
+        const n = body.sets.length || body.files.length;
+        if (!n) { toast("先勾几条"); return; }
+        // 入队本身已经只做 stat 级核对（毫秒级），这里主要是让「点下去有反应」：
+        // 按钮立刻禁用并显示条数，回来之前不可能再发一次。
+        S.addBusy = true; S.addN = n;
+        paintCand();
+        try {
+          const r = await api("/api/publish/add", { method: "POST", body: JSON.stringify(body) });
+          const dup = (r.dup || []).length;
+          const repost = r.repost || [];
+          const byFile = repost.filter((x) => x.kind === "file").length;
+          const byContent = repost.filter((x) => x.kind === "content").length;
+          toast(`加了 ${(r.added || []).length} 条` + (dup ? `，${dup} 条已经在队列里` : "")
+            + (byFile ? `；${byFile} 条以前发过` : "")
+            + (byContent ? `；${byContent} 条内容以前发过（换了文件名也认得出）` : ""));
+          resetCand();
+        } finally {
+          S.addBusy = false; S.addN = 0;
+        }
         await load();
         return;
       }
@@ -2208,11 +2299,13 @@
         return;
       }
       if (name === "editf") {
+        // 只动右栏：以前走 render() 会把左边 ②「通用设置」整块重建，
+        // 正在打的话题/标题、下拉展开态、焦点全丢（2026-11-21 用户反馈）。
         S.edit = S.edit === jid ? null : jid;
-        render();
+        paintRight();
         return;
       }
-      if (name === "closef") { S.edit = null; render(); return; }
+      if (name === "closef") { S.edit = null; paintRight(); return; }
       if (name === "savef") {
         const box = el.closest("[data-fedit]");
         const body = {};
@@ -2238,8 +2331,14 @@
         if (!n) { toast("队列里没有「还没安排」的视频，先在上面勾几条"); return; }
         await flushApply();   // 最后一次改动也要带上：没落库就排期，会被锁在门外
         // 确认指纹必须跟「现在这一屏」一致：改完时间立刻点提交时，防抖的
-        // doPlan 可能还没跑，先强制刷一次预览再拿 intent
-        await doPlan();
+        // doPlan 可能还没跑，先强制刷一次预览再拿 intent。
+        // 反过来，预览就是按眼前这组「首条/间隔/条数」算的，直接复用——
+        // 以前无条件重算，等于点一下「开始上传」再白等一遍（2026-11-21）。
+        const pf = S.planFor;
+        const wantGap = Number(S.gap) || 30;
+        if (!(pf && S.plan && pf.first === S.first && pf.gap === wantGap && pf.n === n)) {
+          await doPlan();
+        }
         if (S.plan && S.plan.ok === false) {
           toast(((S.plan.errors || [])[0] || {}).msg || "这批还排不了，先看上面的提示");
           return;
@@ -2364,12 +2463,12 @@
       }
       if (name === "qtab") {
         S.hist = el.dataset.hist === "1";
-        render();
+        paintRight(true);
         return;
       }
       if (name === "qfilter") {
         S.qfilter = el.dataset.f || "all";
-        render();
+        paintRight(true);
         return;
       }
       if (name === "del") {
@@ -2471,8 +2570,9 @@
             // 登录态没带过去就直说，绝不假装「免扫码成功」
             toast("窗口开了，但这个号的登录没带过去；在窗口里扫一次码就能进");
           } else {
-            toast(r.already ? "窗口已经开着了，切过去看就行"
-                            : "已打开，用的就是当前这个号");
+            // 后端已经区分「还开着」和「正在打开」，有 note 就用它
+            toast(r.note || (r.already ? "窗口已经开着了，切过去看就行"
+                            : "已打开，用的就是当前这个号"));
           }
         } catch (e) { toast(e.message); }
         S.openBusy = false; syncOpenBtn();
@@ -2610,16 +2710,29 @@
     VIEW().addEventListener("change", (e) => {
       // ② 通用设置：改动即套用（2026-11-13 去掉「套用到这批视频」按钮）
       const bf = e.target.closest("[data-bf]");
-      if (bf) { applyBusy = doApply(); return; }
+      if (bf) {
+        // 短标题不到 6 个字后端会拒（平台要求 6-16 字）。别把「还没打完」当错误
+        // 弹出去，先只提示还差几个，等够了再自动套用。
+        if (bf.dataset.bf === "short_title") {
+          const n = (bf.value || "").trim().length;
+          if (n && n < 6) {
+            const hint = document.querySelector("#pub-apply-hint");
+            if (hint) hint.textContent = `短标题还差 ${6 - n} 个字（要 6-16 个字）`;
+            return;
+          }
+        }
+        applyBusy = doApply();
+        return;
+      }
       const opt = e.target.closest("[data-opt]");
       if (opt) { applyBusy = doApply(); return; }
       const cb = e.target.closest("[data-cand]");
       if (cb) {
         const n = Number(cb.dataset.cand);
         cb.checked ? S.sel.add(n) : S.sel.delete(n);
-        cb.closest(".pub-pick").classList.toggle("on", cb.checked);
-        const hint = document.querySelector(".pub-acts .hint");
-        render();
+        // 只重画 ①（已选条数、加入按钮的可用态都在这块里）。以前整页重画，
+        // 勾一条就把 ② 的输入框重建一遍 —— 你刚打的话题会没。
+        paintCand();
         return;
       }
       if (e.target.id === "pub-proj-sel") {
@@ -2651,6 +2764,11 @@
     // 话题打字时防抖套用；失焦的 change 已兜底发过一次，这里只是「边打边存」的即时感
     VIEW().addEventListener("input", (e) => {
       if (e.target.closest('[data-bf="topics"]')) autoApply(600);
+      const st = e.target.closest('[data-bf="short_title"]');
+      if (st) {
+        const n = (st.value || "").trim().length;
+        if (!n || n >= 6) autoApply(600);   // 打到一半（1~5 字）先不发
+      }
     });
 
     // 位置搜索框回车就搜。不监听 keydown 的话，用户敲完只能去点旁边那个「搜」，

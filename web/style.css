@@ -281,6 +281,31 @@ a.ghost:hover { border-color: var(--accent); color: var(--accent); }
 }
 .plan-batch b { font-size: 12.5px; color: var(--text); }
 .plan-batch i { font-style: normal; opacity: .75; }
+/* ── 套太多时的整理工具（2026-11-22 用户要求）─────────────────────────
+   ② 标题行右侧：全部收起 / 全部展开 / 批量删除。.section-label 本身是 flex 且用
+   ::after 画横线，加了按钮就得把线关掉，别让它插在按钮后面。 */
+.section-label.plan-sec { display: flex; align-items: center; gap: 8px; }
+.section-label.plan-sec::after { content: none; }
+.plan-tools { margin-left: auto; display: flex; gap: 6px; }
+.plan-tools .ghost.sm { font-size: 11.5px; padding: 2px 8px; }
+/* 批标题整行可点：收起/展开这一批。箭头是唯一的位置提示，收起后「N 套」照旧留着 */
+.plan-batch.foldable { cursor: pointer; border-radius: 6px; padding: 3px 4px; user-select: none; }
+.plan-batch.foldable:hover { background: var(--accent-wash); }
+.plan-batch .pb-arrow { flex: none; width: 11px; font-size: 10px; line-height: 1; opacity: .7; }
+.plan-batch.folded b { opacity: .8; }
+/* 批量删除模式：红勾顶掉「要出片」的绿勾，× 先藏起来——一次只做一件事，别让人勾错 */
+.plan-del-cb { display: none; width: 15px; height: 15px; flex: none; accent-color: #c44a3a; }
+.plan-list.deleting .plan-del-cb { display: block; }
+.plan-list.deleting .plan-on-cb { display: none; }
+.plan-list.deleting .plan-del { display: none; }
+.plan.picked { outline: 2px solid rgba(196, 74, 58, .45); outline-offset: 1px; }
+/* 单删的 ×：平时淡着，鼠标移到这套才显眼，不跟一排徽标抢注意力 */
+.plan-del {
+  flex: none; width: 18px; height: 18px; line-height: 16px; text-align: center;
+  border-radius: 5px; font-size: 15px; color: var(--muted); opacity: .45;
+}
+.plan-del:hover { background: rgba(196, 74, 58, .14); color: #c44a3a; opacity: 1; }
+#plan-del-bar { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
 /* 「保留已有套」勾选框：.chk 原本只挂在出片设置/发布表单下面，action-bar 里
    没有通用样式，不补这条就是默认 label（字号和间距跟旁边按钮对不上）。 */
 .action-bar label.chk {

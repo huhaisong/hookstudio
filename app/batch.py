@@ -11,6 +11,7 @@ AI 编排直接读台词，不再需要先挖池、也不再有本机组装这�
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -93,6 +94,86 @@ def legacy_plan_result(p: dict) -> dict | None:
         return None
     return {"requested": requested, "got": len(plans), "total": len(plans),
             "append": False, "failed": failed, "legacy": True}
+
+
+def drop_plans(p: dict, indexes: list[int]) -> dict:
+    """删掉指定套号的几套结构（2026-11-22 用户要求：套太多，要能单删也能批删）。
+
+    只把 plans 里那几项抹掉，会留下三处坏数据，所以一次做干净：
+      1) 套号补成连续的 1..N —— 追加生成按 len(plans)+1 编号，留空号下次一定撞号；
+      2) 成片记录和失败清单跟着改号；被删那几套的成片记录移出列表，**mp4 文件一个不删**
+         （文件在用户的保存目录里，删不删由他自己决定）；
+      3) 「与前面重复 / 锚点重」按剩下的套重算 —— 否则会点名一个已经不存在的套。
+
+    纯数据变换，不落盘：调用方拿改好的 p 去 save_merge（见 main 的 plans-delete）。
+    正在出片时不许调：出片队列按套号走，改号会让正在渲的套错位。
+    """
+    plans = list(p.get("plans") or [])
+    gone = {int(i) for i in (indexes or [])}
+    keep = [pl for pl in plans if int(pl.get("index") or 0) not in gone]
+    if len(keep) == len(plans):
+        raise ValueError("要删的套已经不在了，刷新一下再看")
+    hook = bool(plans) and plans[0].get("mode") == "hook"
+    # 旧号 → 新号（只在真的变了时记，避免把没动的号也写进去）
+    remap: dict[int, int] = {}
+    for n, pl in enumerate(keep, 1):
+        old = int(pl.get("index") or 0)
+        if old != n:
+            remap[old] = n
+        pl["index"] = n
+    b = dict(p.get("batch") or {})
+    gen = int(b.get("gen") or p.get("plan_gen") or 0)
+    dropped = 0
+    sets = []
+    for s in (p.get("sets") or []):
+        if int(s.get("gen") or 0) == gen:
+            i = int(s.get("index") or 0)
+            if i in gone:
+                dropped += 1
+                continue
+            s = dict(s)
+            s["index"] = remap.get(i, i)
+        sets.append(s)
+    if b.get("failures"):
+        b["failures"] = [dict(f, index=remap.get(int(f.get("index") or 0), int(f.get("index") or 0)))
+                         for f in b["failures"] if int(f.get("index") or 0) not in gone]
+    # 「这次要 N 套只出来 M 套」要跟着改：主动删套不该被读成「有套没生成出来」
+    r = b.get("plan_result")
+    if isinstance(r, dict):
+        r = dict(r)
+        left = sum(max(0, int(f.get("count") or 0)) for f in (r.get("failed") or []))
+        r["got"] = len(keep)
+        r["total"] = len(keep)
+        r["requested"] = len(keep) + left
+        b["plan_result"] = r
+    elif b.get("jobs"):
+        # 老项目只有 jobs，界面读项目时会用差额推断「缺了几套」——写一份实打实的
+        # 结果把推断挡掉，否则删完立刻冒出一条「还有套没生成出来，去补跑」。
+        b["plan_result"] = {"requested": len(keep), "got": len(keep), "total": len(keep),
+                            "append": bool(b.get("count")), "failed": [], "legacy": True}
+    # 套间指标重算（纯本地计算，不调模型、不花额度）
+    if not hook:
+        seen: list[list[dict]] = []
+        for pl in keep:
+            edl = pl.get("edl") or []
+            vs, ov, av, ah = None, 0.0, None, 0
+            for j, a in enumerate(seen, 1):
+                o = _overlap(edl, a)
+                if o > ov:
+                    vs, ov = j, o
+                h = _anchor_hit(edl, a)
+                if h > ah:
+                    av, ah = j, h
+            pl["overlap"] = round(ov, 3)
+            pl["vs"] = vs
+            pl["anchor_hit"] = ah
+            pl["anchor_vs"] = av
+            seen.append(edl)
+    p["plans"] = keep
+    p["sets"] = sets
+    p["batch"] = b
+    return {"removed": len(plans) - len(keep), "left": len(keep),
+            "dropped_sets": dropped, "unit": "集" if hook else "套"}
 
 
 def _seg_key(s: dict) -> tuple:
@@ -247,6 +328,20 @@ def ai_plan_run(pid: str, count: int, min_minutes: float = 4.0,
     }], order, eps=eps)
 
 
+def _plan_sig(pl: dict) -> str:
+    """一套结构的指纹：只认「剪了哪些片」，不认套名/统计字段。
+
+    写回时要判断「这套盘上到底还在不在」。套号不可靠——用户删套后 drop_plans
+    会把号重排成 1..N，同一个套号在删除前后指向不同的套；套名也不可靠（AI 会给
+    几套起同一个名字）。只有「剪了哪几段片」是这套结构的身份。
+    """
+    if pl.get("edl_text"):
+        return str(pl["edl_text"])
+    return json.dumps([[s.get("ep"), round(float(s.get("start") or 0), 2),
+                        round(float(s.get("end") or 0), 2)]
+                       for s in (pl.get("edl") or [])], ensure_ascii=False)
+
+
 def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
                   append: bool = False, eps=None, new_batch: bool = False,
                   task_kind: str = "plan") -> None:
@@ -390,6 +485,31 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
             pool.shutdown(wait=False, cancel_futures=True)
     else:
         results[0] = _one(prepared[0])
+
+    # ── 汇总之前重新对齐磁盘：AI 这一跑是几分钟，期间用户可能已经删套/补套 ────
+    # 2026-11-22 事故：8 组横评跑到第 4 组时用户在界面删了 30 套（76→46），
+    # 任务结束时拿「开跑那一刻」的 76 套快照整份写回，删除全被恢复。
+    # 原来只靠写回处那句 `len(latest_old) == fresh_start` 兜着——数量一对不上就
+    # 退回开头的快照，等于「用户删的作废」。现在改成：数量变了就把基准换成最新盘，
+    # 新套接在剩下的套后面（套号从 len(最新)+1 起，天然连续）。
+    # 顺带把 accepted（重合度参照）也换成盘上还在的套——否则 vs 会点名一个已经
+    # 被删掉的套号，用户点过去发现没有这套。
+    rebase_note = ""
+    if append:
+        latest = core.load(pid)
+        if latest:
+            latest_plans = list(latest.get("plans") or [])
+            if len(latest_plans) != fresh_start:
+                gone = fresh_start - len(latest_plans)
+                p = latest
+                existing = list(latest_plans)
+                plans = list(latest_plans)
+                accepted = [pl["edl"] for pl in latest_plans if pl.get("edl")]
+                fresh_start = len(latest_plans)
+                rebase_note = (
+                    f"生成期间你删掉了 {gone} 套：新套接在剩下的 {fresh_start} 套后面，"
+                    "删掉的这几套没有写回来" if gone > 0 else
+                    f"生成期间多了 {-gone} 套：新套接在最新的 {fresh_start} 套后面")
 
     # ── 第二阶段：严格按 jobs 顺序汇总（跟老版串行逐字一致）─────────────
     for it in prepared:
@@ -569,15 +689,25 @@ def ai_plan_multi(pid: str, jobs: list[dict], order: str = ORDER_CHRONO,
         note = "补跑：" + note
     elif append and fresh:
         note = f"第 {batch_no} 批（选集 {'、'.join(str(i) for i in sel) if scope_eps else '全部'}）：" + note
+    if rebase_note:
+        # 让用户知道这次的套号为什么从一半开始接——不然他会以为套数算错了
+        note += "；" + rebase_note
 
     p = core.load(pid) or p
     if append and fresh_start:
         # 补跑跑了几分钟，期间用户可能改过勾选 / 每套设置。旧套以最新盘为准，
         # 只把新套接在后面，别拿开头的快照把用户的改动盖回去。
-        # 数量对不上说明期间又整批重排过，这时保留本次结果，不硬拼两套编号。
         latest_old = list(p.get("plans") or [])
         if len(latest_old) == fresh_start:
             plans = latest_old + plans[fresh_start:]
+        else:
+            # 汇总之后这一小会儿盘上又变了（用户又删了几套，或并行的补跑写完了）。
+            # 仍以最新盘为底，只把「盘上还没有的」新套按指纹接上去、套号重排连续。
+            # 绝不退回开跑那一刻的快照——那正是 2026-11-22「删掉的套又回来」的原因。
+            have = {_plan_sig(x) for x in latest_old}
+            plans = latest_old + [x for x in fresh if _plan_sig(x) not in have]
+            for n, pl in enumerate(plans, 1):
+                pl["index"] = n
     # gen（结构版本）决定「哪些成片是当前结构的」。追加新套（append+new_batch）
     # 只是往现有结构尾部加套，旧套和正在渲的成片都还是这一版的，**绝不能 bump**：
     # 一旦 gen 变了，出片开头快照的旧 gen 写回的 sets 会被前端判成「旧结构」全部隐藏

@@ -104,6 +104,8 @@ ACTION_RULES: dict[tuple[str, str], str] = {
     # 第 2/3 步的编辑动作（2026-11-06 补齐）：勾选要出哪几套、改片头文案、
     # 单套特效、整批默认值。这几条原来没有动作名，后台全是「—」。
     ("PUT", "/api/projects/{id}/plans-select"): "plan.select",
+    # 删套（2026-11-22）：删掉的结构不能恢复，后台要能看出「谁在哪部剧上删过几套」。
+    ("POST", "/api/projects/{id}/plans-delete"): "plan.delete",
     ("PUT", "/api/projects/{id}/plan-hook"): "plan.hook",
     ("PUT", "/api/projects/{id}/plan-fx"): "plan.fx",
     ("PUT", "/api/projects/{id}/fx-default"): "fx.default",
