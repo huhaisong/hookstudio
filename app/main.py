@@ -316,6 +316,9 @@ class ConfigBody(BaseModel):
     max_concurrent: int | None = None
     # 台词整理前先去背景音（本机偏好，任何登录用户都能改，同 hw_encode）。
     asr_denoise: bool | None = None
+    # 音频适配（2026-11-22）：出片收尾对整条音轨做保时长微变调+频谱微倾。
+    # 本机偏好，任何登录用户都能改（同 hw_encode）。默认关。
+    audio_armor: bool | None = None
     # 一键全自动上次的参数（记住上次用）：整套 dict 存进 config.autopipe_cfg。
     autopipe_cfg: dict | None = None
 
@@ -445,6 +448,8 @@ def get_config(request: Request):
         # 台词整理前的「去背景音」开关：模型随包带才显示，没带就不露这个选项
         "asr_denoise": bool(core.load_config().get("asr_denoise")),
         "asr_denoise_available": _asr_denoise_available(),
+        # 音频适配（2026-11-22）：设置页开关，默认关
+        "audio_armor": bool(core.load_config().get("audio_armor")),
         "system": {"cpu": info["cpu"], "mem_gb": info["mem_gb"]},
         "paths": {"base": core.BASE, "data": core.DATA_DIR,
                   "models": core.MODELS, "prompts": core.PROMPTS,
@@ -509,6 +514,9 @@ def put_config(body: ConfigBody, request: Request):
     # 去背景音：本机偏好（同 hw_encode），任何登录用户都能改。
     if body.asr_denoise is not None:
         patch["asr_denoise"] = bool(body.asr_denoise)
+    # 音频适配：同上，本机偏好（2026-11-22）
+    if body.audio_armor is not None:
+        patch["audio_armor"] = bool(body.audio_armor)
     # 一键全自动参数记忆：本机偏好，任何登录用户都能改（同 hw_encode）。
     if body.autopipe_cfg is not None:
         if not isinstance(body.autopipe_cfg, dict):

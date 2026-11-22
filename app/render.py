@@ -995,6 +995,33 @@ def _sei_args() -> list[str]:
     return ["-bsf:v", f"h264_metadata=sei_user_data={_SEI_UUID}+{tag}"]
 
 
+# ── 音频适配（2026-11-22，独立开关默认关）─────────────────────────────────
+# 开 = 出片收尾对整条音轨做「保时长纯变调 + 频谱微倾」：asetrate 把采样率
+# 抬到 k×48000（音调 ×k、时长 ÷k），atempo=1/k 把时长拉回来（音调不动），
+# 两步互为倒数 → **时长严格不变**，音画同步不受影响；末尾 aresample 回 48k
+# 交给 aac。再叠 bass/treble 一对反向增益做频谱微倾。每套随机抽 k 和倾角，
+# 挂 fp_seed 同一颗种子（重跑可复现）。
+# 为什么幅度压在 ±1.5%：台词是本工具的核心，零界敢开 ±6% 是因为它不保台词
+# 自然度；±1.5% 在人耳的「同一个人说话」判断之内。
+# 为什么放在最终封装而不是 _audio_piece 逐段做：① 一个插入点同时覆盖帧数/
+# 非帧数两条渲染分支；② 整套一个音高才像「同一版成片」，逐段换调反而像故障。
+# BGM 混音（_mix_bgm）在这之后，不在变调范围——原声轨是比对对象，曲库音乐不是。
+def _audio_armor_on() -> bool:
+    try:
+        return bool((core.load_config() or {}).get("audio_armor"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _audio_armor_chain(pitch_k: float, tilt_db: float) -> list[str]:
+    """音频适配的 -af 片段（loudnorm 之前）。k≈1 时返回空 = 链路与现状一致。"""
+    if abs(pitch_k - 1.0) < 5e-4:
+        return []
+    return [f"asetrate={48000 * pitch_k:.2f}", f"atempo={1.0 / pitch_k:.6f}",
+            "aresample=48000",
+            f"bass=g={tilt_db:+.2f}", f"treble=g={-tilt_db:+.2f}"]
+
+
 def _run_v(build, on_frame=None) -> None:
     """跑一条带视频编码的命令。硬件编码器中途翻车（驱动重置/显存不够/RDP
     会话把 GPU 收走）时整套退回软编重试一次并永久关闭硬件——一张卡坏掉
@@ -2498,7 +2525,13 @@ def _audio_piece(src: str, start: float, dur: float, dst: str,
     af: list[str] = []
     if abs(speed - 1.0) > 5e-4:
         af.append(f"atempo={speed:.6f}")
-    af += ["apad", f"atrim=0:{out_dur:.4f}", "asetpts=PTS-STARTPTS"]
+    # 先 atrim 到计划时长、再 apad=whole_dur 兜底：AAC 源带编码器垫帧，
+    # 0 起点的段解出来会比请求的短 ~20ms（1024 采样粒度），旧写法 apad 在
+    # atrim 之前补不上这段——实测第一段音轨短 21ms，是「开头音画差半帧」
+    # 的根（2026-11-22 armor 自测抓出）。whole_dur 把输出钉到与视频计划
+    # 完全一致的时长，长补短切双向都精确。
+    af += [f"atrim=0:{out_dur:.4f}", "asetpts=PTS-STARTPTS",
+           f"apad=whole_dur={out_dur:.4f}"]
     if abs(gain_db) > 0.05:
         af.append(f"volume={gain_db:.2f}dB")
     # 段间淡入淡出沿用切段的 60/120ms：连续音轨上是硬切，不加会「咔」一声。
@@ -2677,6 +2710,14 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
     # 行为与老版完全一致；开了才抽 28.6–29.9。卡、切段、变速计划、进度帧数
     # 估算全部用这一个值——concat copy 对帧率一致性有硬要求，差一处就被拒。
     fps_out = float(fpv.get("fps_out") or FPS)
+    # 音频适配（2026-11-22，独立开关默认关）：每套抽一个音高系数与频谱倾角。
+    # 挂 fp_seed 同一颗种子：重跑同一套结果一致，换一批就换一组。
+    armor_k, armor_tilt = 1.0, 0.0
+    if _audio_armor_on():
+        _ar = random.Random(f"{fp_seed or grade_seed or pid}|armor")
+        armor_k = _ar.uniform(0.985, 1.015)
+        armor_tilt = _ar.choice((-1.0, 1.0)) * _ar.uniform(0.8, 1.5)
+    armor_af = _audio_armor_chain(armor_k, armor_tilt)
     by_index = {ep["index"]: ep for ep in p["episodes"]}
     # BGM 文件提前体检（2026-11-05）：不存在的、ffprobe 读不出时长的（不是音频/
     # 已损坏），都别等切完二十段才炸。音符必须在这里就能播，后面才谈得上混。
@@ -2938,7 +2979,9 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                   "-i", vid, "-i", aud,
                   "-map", "0:v:0", "-map", "1:a:0",
                   "-c:v", "copy",
-                  "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-ar", "48000", "-ac", "2",
+                  # 音频适配排在 loudnorm 之前：先变调/倾谱，再统一响度
+                  "-af", ",".join([*armor_af, "loudnorm=I=-16:TP=-1.5:LRA=11"]),
+                  "-ar", "48000", "-ac", "2",
                   "-c:a", "aac", "-b:a", "192k",
                   # 指纹：把编码器版本、原始创建时间这类容器元数据一起清掉，
                   # 不让成片带着"同一台机器同一套参数"的痕迹
@@ -2955,7 +2998,9 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                   "-fflags", "+genpts",
                   "-f", "concat", "-safe", "0", "-i", listfile,
                   "-c:v", "copy",
-                  "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-ar", "48000", "-ac", "2",
+                  # 音频适配排在 loudnorm 之前（同帧数路径）
+                  "-af", ",".join([*armor_af, "loudnorm=I=-16:TP=-1.5:LRA=11"]),
+                  "-ar", "48000", "-ac", "2",
                   "-c:a", "aac", "-b:a", "192k",
                   # 指纹：把编码器版本、原始创建时间这类容器元数据一起清掉，
                   # 不让成片带着"同一台机器同一套参数"的痕迹

@@ -5375,6 +5375,8 @@ async function openSettings() {
     `本机：${s.cpu} 核 CPU · ${s.mem_gb ? s.mem_gb + " GB 内存" : "内存未知"}`;
   $("#in-outdir").value = c.paths.output || "";
   $("#in-hwenc").value = c.hw_encode === "off" ? "off" : "auto";
+  // 音频适配（2026-11-22）：默认关，开关挂在设置页「出片速度」下面
+  if ($("#in-audioarmor")) $("#in-audioarmor").checked = !!c.audio_armor;
   // 当前编码器（2026-11-22）：打开设置时查一次状态，失败静默——提示是锦上添花，
   // 不能挡住设置弹窗。None=还没测过显卡，""=CPU 软编，其余是人话标签。
   api("/api/status").then((st) => {
@@ -5531,6 +5533,11 @@ $("#btn-save-settings").addEventListener("click", async () => {
   // 本机渲染偏好：登录用户可改（后端同 output_dir 权限）
   const hw = $("#in-hwenc") ? $("#in-hwenc").value : "auto";
   if (SETTINGS && hw !== (SETTINGS.hw_encode || "auto")) body.hw_encode = hw;
+  // 音频适配（2026-11-22）：同属本机渲染偏好
+  if (SETTINGS && $("#in-audioarmor")) {
+    const want = $("#in-audioarmor").checked;
+    if (want !== !!SETTINGS.audio_armor) body.audio_armor = want;
+  }
   // 同时生成上限：与后端共用一份设置，第 2 步的预计耗时也会跟着变
   if (SETTINGS && $("#in-conc")) {
     const mc = Number($("#in-conc").value);
@@ -5552,6 +5559,7 @@ $("#btn-save-settings").addEventListener("click", async () => {
       // 预计耗时按这个上限算，别等下次打开设置才更新
       if (body.max_concurrent) SETTINGS.max_concurrent = body.max_concurrent;
       if (body.asr_denoise !== undefined) SETTINGS.asr_denoise = body.asr_denoise;
+      if (body.audio_armor !== undefined) SETTINGS.audio_armor = body.audio_armor;
     }
     $("#modal-settings").classList.add("hidden");
     toast("已保存");
