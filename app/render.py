@@ -53,13 +53,17 @@ ZOOM = 1.03
 #   spm     横向变形的绝对浮动（±，如 0.008 = ±0.8%）
 #   tpm     质感三项的乘性浮动（±，如 0.28 = ±28%）
 FP_DEFAULT = "std"
+# 新增三键（2026-11-22，见下面「指纹新维度」注释）：
+#   cn    色度噪声强度（U/V 平面噪点，0 = 关）
+#   lens  镜头畸变幅度（±，0 = 关）
+#   eqw   动态调色摆动系数（0 = 关，>0 乘在摆幅上）
 FP_LEVELS = {
     "soft":   {"zoom": (1.012, 1.032), "rot": 0.00, "shift": 0.00, "gain": 0.0,
-               "spm": 0.003, "tpm": 0.10},
+               "spm": 0.003, "tpm": 0.10, "cn": 0, "lens": 0.0, "eqw": 0.0},
     "std":    {"zoom": (1.008, 1.056), "rot": 0.30, "shift": 0.55, "gain": 0.5,
-               "spm": 0.008, "tpm": 0.28},
+               "spm": 0.008, "tpm": 0.28, "cn": 6, "lens": 0.0012, "eqw": 1.0},
     "strong": {"zoom": (1.004, 1.078), "rot": 0.80, "shift": 0.85, "gain": 1.0,
-               "spm": 0.014, "tpm": 0.45},
+               "spm": 0.014, "tpm": 0.45, "cn": 10, "lens": 0.002, "eqw": 1.4},
 }
 FP_KEYS = list(FP_LEVELS)
 
@@ -76,6 +80,30 @@ FP_KEYS = list(FP_LEVELS)
 # 振幅按档位给，最大值压在 1.2%：超过 1.5% 台词开始"赶"，平台也容易判「加速素材」。
 FP_SPEED = {"soft": 0.003, "std": 0.007, "strong": 0.012}
 MIN_FRAMES = 2          # 一段至少留 2 帧，0 帧的段会让 concat 直接失败
+
+# ── 指纹新维度（2026-11-22，借鉴零界 1.5.0 拆解，命名走合规口径）──────────
+# 原有维度都压在「单张画面的几何/质感」上，这三条补的是另外三个比对面：
+#
+# ① 帧率适配（fps_out）：整批固定 30fps 时，输出流的帧率跟素材完全一致，
+#    按时间抽帧比对的时间轴一模一样。std/strong 档每套在 FPS_ADAPT 区间里
+#    抽一个，fps 滤镜只重排时间线，时长守恒、帧数计划照旧（speed_plan 直接
+#    吃这个 fps）。soft 档不动（保持 30）。不敢抽得更散：低于 28 会被部分
+#    平台判「低帧率素材」压画质。
+# ② 色度噪声（cn）：只动 U/V 两个色度平面，亮度不动——肉眼几乎无感，但
+#    逐帧哈希全变。c1/c2 两个 seed 都必须写死：少写一个 ffmpeg 用随机值，
+#    重跑不可复现（dedup_selftest 的复现断言会抓住）。
+# ③ 画质微调（lens + 锐化）：±0.2% 级镜头畸变 + 两档轻锐化随机选一。作用
+#    不是扰动本身，而是让成片「看起来像正常调色导出」而不是「明显加了滤镜」。
+# ④ 动态调色（eqw）：调色开着的套，eq 参数不再全程恒定，而是随时间正弦慢摆
+#    （幅度 ±2% 内、周期 7–18 秒）。恒定参数是一条全局变换，比对面一下就
+#    配准；慢摆让它配不上。没开调色的套不加——不能把用户关掉的东西偷偷
+#    开回来，与 fp_grade「只抖已开项」同一原则。
+#
+# 为什么不学零界的「抽帧去重」：它丢 1–3% 帧再补偿时长，效果等价于我们的
+# 逐段微变速（FP_SPEED），而 concat 要求每段帧数**精确**——select 丢帧给不出
+# 精确帧数，会把整套路「整数帧 + 总量归一」守恒体系打穿，收益又只有零头，
+# 不值得（2026-11-22 评估结论）。
+FPS_ADAPT = (28.6, 29.9)
 
 # ── 全自动随机（2026-11-17）────────────────────────────────────────────────
 # 用户要的是「一张卡全随机、不用逐项设」：放大/变形每段各抽一个无感级微抖，
@@ -140,12 +168,17 @@ FIRST_FLIP_SEC = 0.3
 FIRST_FLIP_FRAMES = max(1, int(round(FIRST_FLIP_SEC * FPS)))
 
 
-def first_flip_filter(direction: str) -> str:
-    """开头镜像用的滤镜串；没开 / 方向不认就返回空串（不能凭空加滤镜）。"""
+def first_flip_filter(direction: str, fps: float = FPS) -> str:
+    """开头镜像用的滤镜串；没开 / 方向不认就返回空串（不能凭空加滤镜）。
+
+    fps（2026-11-22 帧率适配）：镜像的帧数窗口按本套输出帧率换算，不再吃
+    模块常量——fps 滤镜换成 28.x 后 n 的节奏跟着变，窗口还按 30 算就会多翻
+    或少翻几帧。"""
     d = str(direction or "").strip().lower()
     if d not in ("h", "v"):
         return ""
-    return f"{'hflip' if d == 'h' else 'vflip'}=enable='lt(n,{FIRST_FLIP_FRAMES})'"
+    n_frames = max(1, int(round(FIRST_FLIP_SEC * (fps or FPS))))
+    return f"{'hflip' if d == 'h' else 'vflip'}=enable='lt(n,{n_frames})'"
 
 # ── 去掉原片字幕（2026-11-11，流程最前面单独一步，不并进出片设置）──────
 # 由 nosub.py 把整批素材预先编码成独立视频；出片时只挑用哪份（source_path），
@@ -367,8 +400,13 @@ def _esc_lut_path(path: str) -> str:
             .replace("'", r"\\\'"))
 
 
-def _grade_filters(g: dict | None) -> list[str]:
+def _grade_filters(g: dict | None, wobble: dict | None = None) -> list[str]:
     """把「一档调色 + 强度」翻成 ffmpeg 滤镜列表（顺序：先色相曲线，再饱和度）。
+
+    wobble（2026-11-22 动态调色）：给了就在 eq 上叠随时间正弦慢摆——恒定参数
+    是一条全局变换，按帧比对面一下就配准；慢摆（周期 7–18 秒、幅度 ±2% 内）
+    让它配不上。只作用于预设调色的 eq：LUT 是用户自己带的效果不碰，没开调色
+    也不凭空加 eq（把用户关掉的东西开回来 = 改了他的观感）。
 
     返回空列表 = 原片直出。LUT 优先于预设：用户自己带来的 .cube 是他想要的效果，
     再叠一层预设只会互相打架。
@@ -392,7 +430,13 @@ def _grade_filters(g: dict | None) -> list[str]:
                    f":b='0/0 0.5/{0.5 + b:.4f} 1/1'")
     sat, con = preset.get("sat", 0) * t, preset.get("con", 0) * t
     if abs(sat) > 0.001 or abs(con) > 0.001:
-        out.append(f"eq=saturation={1 + sat:.4f}:contrast={1 + con:.4f}")
+        if wobble:
+            # 摆幅压在 ±2% 内：sin(t*ω) 全程摆动，但 eq 的基准还是用户选的档
+            out.append("eq="
+                       f"saturation='{1 + sat:.4f}+{wobble['sat']:.4f}*sin(t*{wobble['f_sat']:.3f}+{wobble['p_sat']:.2f})'"
+                       f":contrast='{1 + con:.4f}+{wobble['con']:.4f}*sin(t*{wobble['f_con']:.3f}+{wobble['p_con']:.2f})'")
+        else:
+            out.append(f"eq=saturation={1 + sat:.4f}:contrast={1 + con:.4f}")
     grain = preset.get("grain", 0) * t
     if grain >= 1:
         # 胶片档自带的细颗粒；单独勾「颗粒」时会再叠一层（两层不冲突，都是噪点）
@@ -526,6 +570,14 @@ def fp_spec(level: str, seed: str, pos: float | None = None) -> dict:
         "k_glow": 1.0 + r.uniform(-1.0, 1.0) * lv["tpm"] * 0.6,
         "k_grain": 1.0 + r.uniform(-1.0, 1.0) * lv["tpm"],
         "k_vignette": 1.0 + r.uniform(-1.0, 1.0) * lv["tpm"] * 0.8,
+        # ── 指纹新维度（2026-11-22）：全部挂同一颗种子，soft 档一律回退到「不加」
+        "fps_out": FPS if not lv.get("cn") else round(r.uniform(*FPS_ADAPT), 3),
+        "cn_s": float(lv.get("cn") or 0),
+        "cn_seed": r.randrange(1, 2 ** 31),
+        "lens_k1": r.uniform(-1.0, 1.0) * float(lv.get("lens") or 0.0),
+        "lens_k2": r.uniform(-1.0, 1.0) * float(lv.get("lens") or 0.0) * 0.6,
+        "sharp": r.choice(("3", "5")) if lv.get("lens") else "",
+        "k_eqw": float(lv.get("eqw") or 0.0),
     }
 
 
@@ -567,6 +619,17 @@ def fp_grade(g: dict, fp: dict | None, seg_index: int | None = None,
                 continue
             if v > 0.004:      # 用户关掉的项不抖，0 还是 0
                 g[k] = max(0.0, min(1.0, v * (1.0 + jr.uniform(-0.10, 0.10))))
+    # 动态调色摆动参数（2026-11-22）：只生成参数，_grade_filters 在「调色预设
+    # 真的产生了 eq」的分支才会用——这里不判断是否开调色，保持本函数只管
+    # 指纹参数的分工。逐段抽频率/相位，段间波形不同但摆幅一致（±2% 内无感）。
+    k_eqw = float(fp.get("k_eqw") or 0.0)
+    if k_eqw > 0.01:
+        wr = random.Random(f"{seed}|eqw|{int(seg_index) if seg_index is not None else 'all'}")
+        g["eq_wobble"] = {
+            "sat": 0.020 * k_eqw, "con": 0.015 * k_eqw,
+            "f_sat": wr.uniform(0.35, 0.90), "f_con": wr.uniform(0.25, 0.80),
+            "p_sat": wr.uniform(0.0, 6.283), "p_con": wr.uniform(0.0, 6.283),
+        }
     return g
 
 
@@ -908,6 +971,28 @@ def _venc_args() -> list[str]:
     if det and not _HW["off"]:
         return ["-c:v", det["name"], *det["args"], "-pix_fmt", det["pix"]]
     return list(_SW_ARGS)
+
+
+# ── 流级标记（2026-11-22，借鉴零界的码流 SEI 注入；默认关）────────────────
+# H.264 码流里可以带一条自定义 SEI user data（bsf 与编码器无关，NVENC/QSV/
+# AMF 软编都能挂）。作用：给成片一个**不影响画面**的流级差异维度。默认关，
+# 只对懂配置的用户开放（data/config.json 里加 "sei_tag"）。
+# 为什么只在最终封装挂一次：切段每一趟都挂的话 bsf 会在 concat copy 时原样
+# 保留，没必要重复；封装是唯一收口，两条渲染分支（有无帧数计划）都汇到这。
+_SEI_UUID = "0f5a3c8e2b7d4a196e6c4d2f8b1a3c5d"   # 固定标识（16 字节 hex），不可改
+
+
+def _sei_args() -> list[str]:
+    """按配置返回 H.264 SEI user data 参数；没配或配置不合法返回空（= 不挂）。"""
+    try:
+        tag = str((core.load_config() or {}).get("sei_tag") or "").strip()
+    except Exception:  # noqa: BLE001
+        return []
+    # 只许安全字符、限 32 字节：SEI payload 会原样进码流，混入引号/空格
+    # 可能产生畸形流；超长的也没意义。
+    if not tag or len(tag.encode("utf-8")) > 32 or not re.fullmatch(r"[\w\-.]+", tag):
+        return []
+    return ["-bsf:v", f"h264_metadata=sei_user_data={_SEI_UUID}+{tag}"]
 
 
 def _run_v(build, on_frame=None) -> None:
@@ -1687,7 +1772,8 @@ def _cut(src: str, start: float, end: float, dst: str, title: str | None = None,
          grade: dict | None = None, cap: dict | None = None,
          clean: dict | None = None, first_flip: str = "",
          fp: dict | None = None, frames: int | None = None,
-         out_dur: float | None = None, on_frame=None) -> None:
+         out_dur: float | None = None, on_frame=None,
+         fps: float = FPS) -> None:
     # 去重缩放（2026-11-04 用户要求）：整幅放大 3% 再居中裁回 720x1280，
     # 画面指纹变一点、边缘一圈（含素材自带黑边）被切掉，平台比对原片时对不上。
     # 实现上是「把目标尺寸放大再 crop」，不是「缩到 720 再放大」——后者要重采样
@@ -1762,13 +1848,35 @@ def _cut(src: str, start: float, end: float, dst: str, title: str | None = None,
         # 横向拉伸再裁回：纵向不动，人物变瘦/变胖。1.06 ≈ 瘦 6%，再多脸会变形。
         pre.append(f"scale={_even(W * stretch)}:{H}")
         pre.append(f"crop={W}:{H}")
-    pre.append(f"fps={FPS}")
+    # 画质微调（2026-11-22 指纹新维度）：±0.2% 级镜头畸变 + 轻锐化。放在几何
+    # 定形之后、fps 之前——畸变基于最终构图算才准；幅度压在「像正常调色导出」
+    # 的量级，肉眼读不出「加过滤镜」，但像素指纹全变。
+    _k1 = float(fp.get("lens_k1") or 0.0)
+    if abs(_k1) > 1e-5:
+        pre.append(f"lenscorrection=k1={_k1:.5f}:k2={float(fp.get('lens_k2') or 0.0):.5f}")
+    _sharp = str(fp.get("sharp") or "")
+    if _sharp == "3":
+        pre.append("unsharp=3:3:0.4:3:3:0.4")
+    elif _sharp == "5":
+        pre.append("unsharp=5:5:0.6:5:5:0.6")
+    # 帧率适配（2026-11-22）：每套一个 fps（soft/未开指纹 = 30 原样）。fps 滤镜
+    # 只重排时间线，时长守恒；帧数计划（speed_plan）吃的同一个值，两边必然一致。
+    pre.append(f"fps={fps:.3f}")
     dur = max(0.5, end - start)
     if speed and abs(speed - 1.0) > 0.001:
         # 变速：setpts 压时间轴 + atempo 变声速（音调不变），音画同步、口型对得上
         pre.append(f"setpts=PTS/{speed:.4f}")
-    pre.extend(_grade_filters(g))
+    pre.extend(_grade_filters(g, g.get("eq_wobble")))
     pre.extend(_fx_filters(g))
+    # 色度噪声（2026-11-22 指纹新维度）：只动 U/V 平面，亮度不动——肉眼几乎
+    # 无感（色调轻微闪烁），逐帧哈希全变。先 format=yuv420p 把平面语义钉死
+    # （gbrp 的 c1/c2 是 G/B 平面，语义就错了），两个 seed 都写死保证重跑可复现。
+    _cn = float(fp.get("cn_s") or 0.0)
+    if _cn > 0.4:
+        _cseed = int(fp.get("cn_seed") or 1)
+        pre.append(f"format=yuv420p,"
+                   f"noise=c1s={int(round(_cn))}:c1f=t+u:c2s={int(round(_cn))}:c2f=t+u"
+                   f":c1_seed={_cseed}:c2_seed={_cseed * 2654435761 % (2 ** 31)}")
     # 帧数预算（2026-11-17）：调用方给了 frames/out_dur 就以它为准。
     # 变速后的输出时长必须落在整数帧上，否则每段差半帧，二十段拼下来音画不同步。
     if frames:
@@ -1823,7 +1931,7 @@ def _cut(src: str, start: float, end: float, dst: str, title: str | None = None,
     # 它是 post 的普通一项，所以 -vf 单链 / 现场抹字幕 / 光晕 gbrp 三条路径
     # 都会自动带上，不需要各自再改一遍滤镜图。
     if first_flip:
-        flt = first_flip_filter(first_flip)
+        flt = first_flip_filter(first_flip, fps)
         if flt:
             post.append(flt)
     if fade_in:
@@ -1971,7 +2079,8 @@ def _wrap_cn(text: str, per_line: int) -> list[str]:
 
 
 def _hook_card(text: str, dst: str, sec: float = HOOK_SEC,
-               bg_src: str | None = None, bg_ts: float = 1.0) -> bool:
+               bg_src: str | None = None, bg_ts: float = 1.0,
+               fps: float = FPS) -> bool:
     """生成开场钩子卡。返回是否真的生成了（没字体/没文案就跳过）。
 
     v2（2026-11-05）：从「纯黑底静字」升级为
@@ -2021,18 +2130,18 @@ def _hook_card(text: str, dst: str, sec: float = HOOK_SEC,
 
     # ── 输入：有底图用 loop 图片，没有用 lavfi 黑场 ──
     if bg_ok:
-        inputs = ["-loop", "1", "-framerate", str(FPS), "-t", f"{sec:.3f}", "-i", frame]
+        inputs = ["-loop", "1", "-framerate", f"{fps:.3f}", "-t", f"{sec:.3f}", "-i", frame]
         # 放大到 900x1600 再推近：zoompan 在比输出大的底图上 crop 推镜不露边。
         # 线性推 5%，肉眼是缓推、不晃。模糊压暗去色——背景只做氛围暗示。
-        frames = max(1, int(round(sec * FPS)))
+        frames = max(1, int(round(sec * fps)))
         vf = (
             "scale=900:1600:force_original_aspect_ratio=increase,crop=900:1600,"
             "gblur=sigma=20,eq=brightness=-0.17:saturation=0.72,"
             f"zoompan=z='min(1+0.05*in/{frames},1.05)'"
-            f":x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':d=1:s={W}x{H}:fps={FPS}"
+            f":x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':d=1:s={W}x{H}:fps={fps:.3f}"
         )
     else:
-        inputs = ["-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r={FPS}:d={sec:.3f}"]
+        inputs = ["-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r={fps:.3f}:d={sec:.3f}"]
         vf = ""
 
     # ── 文字 ──
@@ -2143,13 +2252,16 @@ def split_edl_at_cuts(p: dict, edl: list[dict], src_ver: str,
     return out
 
 
-def _trans_card(prev_src: str, cut_ts: float, dst: str, sec: float = TRANS_SEC) -> None:
+def _trans_card(prev_src: str, cut_ts: float, dst: str, sec: float = TRANS_SEC,
+                fps: float = FPS) -> None:
     """生成一张段间转场空境卡（无文字），编码参数与 _cut 完全一致供 concat copy。
 
     prev_src：前一段的源视频文件；cut_ts：切点绝对秒（=前一段的 end）。
     背景取**切点前一点**的一帧（画面还在前一段里），放大裁满 → 虚化压暗 →
     缓推近 → 头尾淡入淡出。取帧失败退回纯黑底——一张 0.7s 的卡不值得让
     整套片子失败（跟钩子卡同一个容错原则）。
+    fps：本套的输出帧率（2026-11-22 帧率适配）——卡和正片必须同一帧率，
+    concat copy 才不会拒绝。
     """
     sec = min(1.5, max(0.4, float(sec)))
     frame = os.path.splitext(dst)[0] + ".bg.jpg"
@@ -2165,16 +2277,16 @@ def _trans_card(prev_src: str, cut_ts: float, dst: str, sec: float = TRANS_SEC) 
         except Exception:  # noqa: BLE001
             bg_ok = False
     if bg_ok:
-        inputs = ["-loop", "1", "-framerate", str(FPS), "-t", f"{sec:.3f}", "-i", frame]
-        frames = max(1, int(round(sec * FPS)))
+        inputs = ["-loop", "1", "-framerate", f"{fps:.3f}", "-t", f"{sec:.3f}", "-i", frame]
+        frames = max(1, int(round(sec * fps)))
         vf = (
             "scale=900:1600:force_original_aspect_ratio=increase,crop=900:1600,"
             f"gblur=sigma={TRANS_BLUR},eq=brightness=-0.12:saturation=0.70,"
             f"zoompan=z='min(1+{TRANS_ZOOM}*in/{frames},1+{TRANS_ZOOM})'"
-            f":x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':d=1:s={W}x{H}:fps={FPS}"
+            f":x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':d=1:s={W}x{H}:fps={fps:.3f}"
         )
     else:
-        inputs = ["-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r={FPS}:d={sec:.3f}"]
+        inputs = ["-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r={fps:.3f}:d={sec:.3f}"]
         vf = ""
     fade_st = max(0.0, sec - TRANS_FADE)
     vf += ("," if vf else "") + f"fade=t=in:st=0:d={TRANS_FADE}"
@@ -2561,6 +2673,10 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
     # 不抽——放大是这些参数的载体，不放大就没有可裁的余量，硬加旋转会露黑角。
     fpv = (fp_spec(fp_level, (fp_seed or grade_seed or pid), fp_pos)
            if zoom > 1.001 else {})
+    # 帧率适配（2026-11-22）：本套输出帧率。没开指纹（没放大）= 30 原样，
+    # 行为与老版完全一致；开了才抽 28.6–29.9。卡、切段、变速计划、进度帧数
+    # 估算全部用这一个值——concat copy 对帧率一致性有硬要求，差一处就被拒。
+    fps_out = float(fpv.get("fps_out") or FPS)
     by_index = {ep["index"]: ep for ep in p["episodes"]}
     # BGM 文件提前体检（2026-11-05）：不存在的、ffprobe 读不出时长的（不是音频/
     # 已损坏），都别等切完二十段才炸。音符必须在这里就能播，后面才谈得上混。
@@ -2628,7 +2744,7 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                 _bases.append(min(1.5, max(0.5, sp0)))
             seg_plans = speed_plan(
                 [float(s["end"]) - float(s["start"]) for s in edl],
-                _bases, FPS, fp_seed or grade_seed, fp_level)
+                _bases, fps_out, fp_seed or grade_seed, fp_level)
 
         def cut_all() -> None:
             """钩子卡 + 全部切段。抽成函数是为了编码一致性兜底：硬件编码器
@@ -2663,7 +2779,7 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                         # 取段内靠前但不顶头的一帧：开头一帧常是黑场/转场
                         bg_ts = float(edl[0]["start"]) + min(1.0, seg0 / 3)
                 try:
-                    if _hook_card(hook, card, hook_sec, bg_src, bg_ts):
+                    if _hook_card(hook, card, hook_sec, bg_src, bg_ts, fps=fps_out):
                         parts.append(card)
                 except Exception:  # noqa: BLE001
                     pass
@@ -2687,7 +2803,7 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                         progress(i / total * 88, "生成段间转场")
                     tcard = os.path.join(work, f"t{i:03d}.mp4")
                     try:
-                        _trans_card(prev_src, prev_end, tcard, trans_sec)
+                        _trans_card(prev_src, prev_end, tcard, trans_sec, fps=fps_out)
                         parts.append(tcard)
                         trans_before[i] = True
                         at += trans_sec     # 转场占成片时长，调色分区要算进去
@@ -2718,7 +2834,7 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                 # 段与段之间留一点边界（本段最多到 (i+1)/total），不越到下一段的格子。
                 # AI 出片不传 on_frame（is_direct=False），整条逻辑原样不动。
                 seg_total = (plan["frames"] if plan else None) or \
-                    max(1, int((float(seg["end"]) - float(seg["start"])) * FPS / max(sp, 0.01)))
+                    max(1, int((float(seg["end"]) - float(seg["start"])) * fps_out / max(sp, 0.01)))
                 on_frame = None
                 if progress and is_direct:
                     def _frame(n, _i=i, _t=seg_total, _tot=total):
@@ -2770,7 +2886,7 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                      first_flip=first_flip if i == 0 else "", fp=seg_fp,
                      frames=plan["frames"] if plan else None,
                      out_dur=plan["out_dur"] if plan else None,
-                     on_frame=on_frame)
+                     on_frame=on_frame, fps=fps_out)
                 parts.append(dst)
                 at += (plan["out_dur"] if plan else
                        max(0.5, float(seg["end"]) - float(seg["start"])) / (sp or 1.0))
@@ -2827,6 +2943,7 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                   # 指纹：把编码器版本、原始创建时间这类容器元数据一起清掉，
                   # 不让成片带着"同一台机器同一套参数"的痕迹
                   "-map_metadata", "-1",
+                  *_sei_args(),
                   "-movflags", "+faststart", "-shortest", out_tmp])
         else:
             # 没开画面放大 = 没有帧数计划，保持原路子：分段自带音轨直接拼。
@@ -2843,6 +2960,7 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                   # 指纹：把编码器版本、原始创建时间这类容器元数据一起清掉，
                   # 不让成片带着"同一台机器同一套参数"的痕迹
                   "-map_metadata", "-1",
+                  *_sei_args(),
                   "-movflags", "+faststart", out_tmp])
         # 去掉原片背景音乐（2026-11-18 用户定）：只处理**成片这一条音轨**，
         # 排在封装完成之后、混 BGM 之前——两条渲染分支（有无帧数计划）最后都汇到

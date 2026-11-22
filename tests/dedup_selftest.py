@@ -126,6 +126,37 @@ plan3 = render.speed_plan(durs, bases, 30, "seed-b", "std")
 check("变速：换种子会变", [p["frames"] for p in plan] != [p["frames"] for p in plan3])
 check("变速：关档（空输入）不炸", render.speed_plan([], None) == [])
 
+# ── 4.5 指纹新维度（2026-11-22）：帧率适配 / 色度噪声 / 画质微调 / 动态调色 ──
+soft = render.fp_spec("soft", "lv-soft")
+check("新维度：soft 档全部回退（帧率 30、色噪/畸变/摆动关）",
+      soft["fps_out"] == 30 and soft["cn_s"] == 0 and soft["k_eqw"] == 0
+      and soft["sharp"] == "" and abs(soft["lens_k1"]) < 1e-9,
+      f"fps_out={soft['fps_out']} cn={soft['cn_s']} lens={soft['lens_k1']:.5f}")
+std1 = render.fp_spec("std", "lv-std")
+std2 = render.fp_spec("std", "lv-std")
+check("新维度：std 帧率落在适配区间且同种子可复现",
+      28.6 <= std1["fps_out"] <= 29.9 and std1["fps_out"] == std2["fps_out"],
+      f"fps_out={std1['fps_out']}")
+std3 = render.fp_spec("std", "lv-std-b")
+check("新维度：换种子帧率会变（抽到同一值的概率 <0.2%）",
+      std1["fps_out"] != std3["fps_out"],
+      f"{std1['fps_out']} vs {std3['fps_out']}")
+check("新维度：色噪/畸变键齐全且畸变在档位幅度内",
+      std1["cn_seed"] > 0 and abs(std1["lens_k1"]) <= 0.0012 + 1e-9
+      and abs(std1["lens_k2"]) <= 0.0012 * 0.6 + 1e-9
+      and std1["sharp"] in ("3", "5") and std1["k_eqw"] == 1.0,
+      f"cn_s={std1['cn_s']} lens_k1={std1['lens_k1']:.5f} sharp={std1['sharp']}")
+# 动态调色只给参数，_grade_filters 在 eq 分支才用：关调色不产生 eq，开着才有摆动
+g_off = render._grade_filters({"grade": "", "int": 0.65}, {"sat": 0.01, "con": 0.01})
+check("动态调色：没开调色不出 eq", not g_off)
+g_dyn = render._grade_filters({"grade": "warm", "int": 0.65},
+                              {"sat": 0.02, "con": 0.015, "f_sat": 0.5, "f_con": 0.4,
+                               "p_sat": 1.0, "p_con": 2.0})
+g_sta = render._grade_filters({"grade": "warm", "int": 0.65}, None)
+check("动态调色：开着才有摆动表达式且基准一致",
+      any("sin(t*" in f for f in g_dyn) and not any("sin(t*" in f for f in g_sta),
+      f"dyn={g_dyn[-1] if g_dyn else '?'}")
+
 # ── 5. 复用台账 ──────────────────────────────────────────────────────────
 seg = {"ep": 3, "start": 12.34, "end": 30.0, "rating": 8}
 check("台账：键按 0.1s 取整", reuse.key_of(seg) == "3:12.3-30.0", reuse.key_of(seg))
@@ -262,6 +293,23 @@ if ok:
     check("切段：分段不带音轨", probe_dur(dst) <= 5.05,
           f"container={probe_dur(dst):.3f}s")
 
+    # 帧率适配真渲：fp 只给 fps_out（不放大 = 不抽指纹），输出帧率必须跟着变、
+    # 时长仍由 frames/fps 精确钉死——卡和正片 concat 靠的就是这个一致性。
+    fps_test = 28.7
+    dst_fps = os.path.join(tmp, "cut287.mp4")
+    render._cut(src, 0.0, 8.0, dst_fps, speed=1.0, zoom=1.0, grade={}, fp={},
+                frames=143, out_dur=143 / fps_test, fps=fps_test)
+    fr = probe(dst_fps, "stream=r_frame_rate")
+    got_fps = 0.0
+    if fr and "/" in fr[0]:
+        num, den = fr[0].split("/")
+        got_fps = float(num) / float(den)
+    check("切段：帧率适配生效（r_frame_rate ≈ 28.7）",
+          abs(got_fps - fps_test) <= 0.01, f"r_frame_rate={fr[0] if fr else '?'}")
+    check("切段：换帧率后时长仍精确（143/28.7s）",
+          abs(probe_dur(dst_fps, "v:0") - 143 / fps_test) <= 0.05,
+          f"{probe_dur(dst_fps, 'v:0'):.3f}s")
+
 # ── 9. 端到端：render_edl 的帧预算 + 连续音轨 ───────────────────────────
 # 用同一份 8 秒素材切 3 段（中间一段走缓冲加速），确认成片帧数/时长与计划一致，
 # 且音轨不因分段 AAC 填充而变长——这正是「越往后越不同步」的根。
@@ -271,9 +319,21 @@ edl3 = [{"ep": 1, "start": 0.0, "end": 2.5},
         {"ep": 1, "start": 2.5, "end": 5.0},
         {"ep": 1, "start": 5.0, "end": 8.0}]
 bases3 = [1.0, 1.15, 1.0]
-plan3 = render.speed_plan([2.5, 2.5, 3.0], bases3, 30, "e2e", "std")
+# 帧率适配（2026-11-22）：render_edl 用 fp_spec 抽的本套帧率算帧数计划，
+# 期望值必须用同一个 fps_out 算——render_edl 不会再用 30。
+fps_e2e = float(render.fp_spec("std", "e2e", 0.2).get("fps_out") or 30)
+plan3 = render.speed_plan([2.5, 2.5, 3.0], bases3, fps_e2e, "e2e", "std")
 want_f3 = sum(p["frames"] for p in plan3)
 want_d3 = sum(p["out_dur"] for p in plan3)
+# 段间转场卡（2026-11-18 默认开）：i>0 每段前插一张 0.7s 空境，帧数/时长都
+# 要算进期望——这条自测在卡上线那天起就没算卡（9a8374d），基线上一直挂着
+# 「got=272 want=230」的假失败，2026-11-22 顺手修正。
+# 卡的帧数 = -framerate×-t 的输入取整（0.7s@29.439 → 20 帧），和 zoompan 里
+# round 出来的 21 差一帧，所以按「每卡 ±1 帧」断言；时长不受影响。
+card_n = len(edl3) - 1          # 每个非首段前一张
+card_lo = card_n * int(render.TRANS_SEC * fps_e2e)
+card_hi = card_n * (int(render.TRANS_SEC * fps_e2e) + 1)
+card_sec = card_n * render.TRANS_SEC
 e2e = os.path.join(tmp, "e2e.mp4")
 try:
     render.render_edl(
@@ -283,11 +343,12 @@ try:
     got_f3 = probe(e2e, "stream=nb_read_frames")
     got_d3 = probe_dur(e2e)
     aud_d3 = probe_dur(e2e, "a:0")
-    check("端到端：总帧数与计划一致",
-          got_f3 and int(got_f3[0]) == want_f3,
-          f"got={got_f3[0] if got_f3 else '?'} want={want_f3}")
-    check("端到端：总时长与计划一致", abs(got_d3 - want_d3) <= 1.5 / 30,
-          f"{got_d3:.3f}s want {want_d3:.3f}s")
+    check("端到端：总帧数与计划一致（含转场卡，每卡 ±1 帧）",
+          got_f3 and want_f3 + card_lo <= int(got_f3[0]) <= want_f3 + card_hi,
+          f"got={got_f3[0] if got_f3 else '?'} want={want_f3}+[{card_lo},{card_hi}]")
+    check("端到端：总时长与计划一致（含转场卡）",
+          abs(got_d3 - (want_d3 + card_sec)) <= 1.5 / fps_e2e,
+          f"{got_d3:.3f}s want {want_d3 + card_sec:.3f}s (fps_out={fps_e2e})")
     check("端到端：音轨与视频等长（不累积填充）",
           abs(aud_d3 - got_d3) <= 0.05, f"audio={aud_d3:.3f}s video={got_d3:.3f}s")
 except Exception as exc:  # noqa: BLE001
