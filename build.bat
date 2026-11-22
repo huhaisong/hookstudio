@@ -38,9 +38,11 @@ rem 案例（转写一跑就 0xC0000005），体积只省几十 MB，不值得�
   --exclude-module tkinter
 if errorlevel 1 goto fail
 
-echo [3/5] 组装可外部修改的资源（web / prompts / models / bin）
+echo [3/5] 组装可外部修改的资源（web / bin / models）
+rem prompts 不再拷进产物：10 份提示词已按原字节内置进 app/_builtin_prompts.py。
+rem 留明文在产物里 = 解压即读，藏了内置表也没意义（2026-11-22 防破解第一批）。
+rem 开发期要调提示词：设 HOOK_DEV_PROMPTS=1 读源码目录的 prompts/，与打包产物无关。
 robocopy "web"     "%OUTDIR%\web"     /MIR /NFL /NDL /NJH /NJS /NP >nul
-robocopy "prompts" "%OUTDIR%\prompts" /MIR /NFL /NDL /NJH /NJS /NP >nul
 robocopy "bin"     "%OUTDIR%\bin"     /MIR /NFL /NDL /NJH /NJS /NP >nul
 rem 只带 small，base 永不进包（省约 140MB）
 robocopy "models"  "%OUTDIR%\models"  /MIR /XD "%CD%\models\base" /NFL /NDL /NJH /NJS /NP >nul

@@ -28,11 +28,16 @@ from . import core
 
 VERSION = "0.1.27"
 
-# 参与指纹的目录（相对 core.BASE）。web 是前端资源，app 是后端代码，
-# prompts 是提示词——提示词改一个字，AI 的输出结构就可能变，前端要重新拉一次。
+# 参与指纹的目录（相对 core.BASE）。web 是前端资源，app 是后端代码。
+# prompts 已从发布产物移除（10 份提示词按原字节内置进 app/_builtin_prompts.py），
+# 不再参与指纹：发布态根本没这个目录，留着只会让「有人往解压目录塞 prompts/
+# 就触发前端锁屏」这种怪事发生。
 _ROOTS = (("app", os.path.join(core.BASE, "app")),
-          ("web", core.WEB),
-          ("prompts", core.PROMPTS))
+          ("web", core.WEB))
+
+# 内置提示词表以下划线开头，会被 _walk 的 startswith("_") 跳过，必须单独纳入，
+# 否则改了提示词指纹却不变（前端拿旧缓存、生成链路用新词，最难查的那种不一致）。
+_BUILTIN_PROMPTS = os.path.join(core.BASE, "app", "_builtin_prompts.py")
 
 _SKIP_EXT = (".pyc", ".pyo", ".log", ".tmp")
 _SKIP_NAME = ("__pycache__",)
@@ -69,6 +74,11 @@ def _compute() -> str:
             continue
         for rel, size, mtime in _walk(root):
             h.update(f"{tag}/{rel}|{size}|{mtime}\n".encode())
+    try:
+        st = os.stat(_BUILTIN_PROMPTS)
+        h.update(f"app/_builtin_prompts.py|{st.st_size}|{st.st_mtime_ns}\n".encode())
+    except OSError:
+        pass  # 开发早期还没生成内置表时别让指纹算不出来
     return h.hexdigest()[:10]
 
 

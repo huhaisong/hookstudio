@@ -34,8 +34,8 @@ def main() -> None:
         '"""内置提示词常量表（生成物，勿手工编辑）。',
         "",
         "由 gen_builtin_prompts.py 从 prompts/*.txt 按原字节生成。",
-        "每个值是 bytes，读取处（analyze._default_prompt）负责 decode + 换行归一化 + strip，
-口径与旧的文本模式 open(..., encoding="utf-8") 完全一致。",
+        '每个值是 bytes，读取处（analyze._default_prompt）负责 decode + 换行归一化 + strip，',
+        '口径与旧的文本模式 open(..., encoding="utf-8") 完全一致。',
         '"""',
         "",
         "BUILTIN: dict[str, bytes] = {",
