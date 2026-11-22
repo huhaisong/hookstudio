@@ -42,3 +42,7 @@ pyarmor.bug.log
 
 # 配乐素材：11 首约 57MB，本地放好即可，条目见 bgm/library.json
 bgm/audio/
+
+# 打包产物：安装器 exe（约 615MB）+ PyInstaller 中间产物，不入库
+dist8/
+build3/
