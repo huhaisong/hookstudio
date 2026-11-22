@@ -847,6 +847,27 @@ def _hw_cache_save(det: dict) -> None:
         pass  # 缓存写不进去就每次重测，功能不受影响
 
 
+# 状态页透出用的人话标签（2026-11-22）：键是 _HW_PARAMS 的编码器名
+_HW_LABELS = {"h264_nvenc": "N 卡 NVENC", "h264_qsv": "Intel 核显 QSV", "h264_amf": "AMD AMF"}
+
+
+def hw_encoder_label() -> str | None:
+    """当前出片实际用的编码器（给人看的标签）：None=尚未探测、""=CPU 软编、
+    否则是「N 卡 NVENC」这类标签。
+
+    **只读落盘缓存，绝不触发基准探测**——探测要真编好几秒片子，挂在
+    /api/status 会把一个轻量轮询接口拖成重接口。没测过/缓存过期/中途失效
+    都返回 None，前端显示「尚未探测」。
+    """
+    if _hw_mode() == "off":
+        return ""
+    det = _hw_cache_load()
+    if not det:
+        return None
+    name = str(det.get("name") or "")
+    return _HW_LABELS.get(name) or (name or "")
+
+
 def _hw_cache_clear() -> None:
     try:
         os.remove(_HW_CACHE_FILE)
@@ -2181,23 +2202,30 @@ def _run_failure(err: str) -> None:
     raise RuntimeError("视频处理没成功，请重试")
 
 
+# 渲染卡死看门狗（2026-11-22，借鉴竞品的 stall watchdog 思路）：ffmpeg 假死时
+# （显卡驱动重置、滤镜死循环、盘抖动）进程不死、也不再吐任何进度，过去只能等
+# 用户自己点「中止」，批量出片一夜全卡在这种进程上。解法是把 -progress 输出当
+# 心跳——frame/out_time/total_size 任一变化都算活着；超过阈值没有心跳就杀进程，
+# 主循环随即收尾报人话。阈值 240 秒：慢盘 4K、收尾 faststart 封装（只重写 moov，
+# 进度会安静几十秒）都算正常安静期，再短有误杀风险。HS_RENDER_STALL_SEC 可调，
+# 0 = 关闭（排查误杀时的逃生口）。只杀 ffmpeg 本体不追进程树：ffmpeg 单体进程
+# 不派生别的进程，kill 足够。
+STALL_SEC = int(os.environ.get("HS_RENDER_STALL_SEC") or 240)
+
+
 def _run(cmd: list[str], on_frame=None) -> None:
-    # 走可中断版：出片中途点「中止」，这条 ffmpeg 会被直接杀掉，
-    # 不用等几十秒甚至几分钟的编码跑完。返回值与 subprocess.run 一致。
-    if on_frame is None:
-        r = core.run_cancelable(cmd, text=True)
-        if r.returncode != 0:
-            _run_failure(r.stderr or "")
-        return
-    # 带逐帧进度：给 ffmpeg 挂 -progress，边编码边把 frame=N 回报出去。
-    # 只有「选视频直接出片」这种一条长命令的路径会传 on_frame；AI 出片不传，
-    # 行为与从前完全一致（两条路径隔离，2026-11-18 用户强调）。
+    # 统一一条路（2026-11-22）：不管要不要回报进度，都挂 -progress——它的输出
+    # 除了给「选视频直接出片」逐帧回报，更是全路径共用的卡死心跳（见 STALL_SEC）。
+    # AI 出片不传 on_frame 时 progress 行只喂看门狗、不回报进度，「AI 出片不逐帧
+    # 上报」的行为不变（2026-11-18 说的两条路径隔离指的是回报，不是心跳）。
     cmd = list(cmd)
     cmd[1:1] = ["-progress", "pipe:1", "-nostats"]   # -progress 是全局选项，紧跟 ffmpeg
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, bufsize=1, stdin=subprocess.DEVNULL)
+                            text=True, errors="replace", bufsize=1,
+                            stdin=subprocess.DEVNULL, **core.POPEN_HIDE)
     core.register_proc(proc)
     err_buf: list[str] = []
+    stall = {"killed": False}
 
     def drain_err() -> None:
         try:
@@ -2207,13 +2235,37 @@ def _run(cmd: list[str], on_frame=None) -> None:
 
     te = threading.Thread(target=drain_err, daemon=True)
     te.start()
+
+    last = {"t": time.monotonic()}
+
+    def beat() -> None:
+        last["t"] = time.monotonic()
+
+    if STALL_SEC > 0:
+        def watchdog() -> None:
+            # 只看心跳时间戳，不碰管道——排空全在主循环/err 线程手里，别来抢。
+            while proc.poll() is None:
+                if time.monotonic() - last["t"] > STALL_SEC:
+                    stall["killed"] = True
+                    try:
+                        proc.kill()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return
+                time.sleep(5)
+
+        threading.Thread(target=watchdog, daemon=True).start()
+
     try:
         assert proc.stdout is not None
         for line in proc.stdout:            # 逐行读 -progress，不攒到结束
-            if not line.startswith("frame="):
+            key, _, val = line.partition("=")
+            if key in ("frame", "out_time_us", "out_time_ms", "total_size"):
+                beat()
+            if key != "frame" or on_frame is None:
                 continue
             try:
-                n = int(line.split("=", 1)[1].strip())
+                n = int(val.strip())
             except (ValueError, IndexError):
                 continue
             if n > 0:
@@ -2225,9 +2277,21 @@ def _run(cmd: list[str], on_frame=None) -> None:
         te.join(timeout=5)
         core.check_cancel()                 # 跑完到返回之间也可能刚好被中止
         if code != 0:
+            if stall["killed"]:
+                raise RuntimeError(
+                    f"渲染卡死了：ffmpeg 超过 {STALL_SEC} 秒没有任何进展，已自动终止。"
+                    "直接重试一次通常能过；反复出现请带日志反馈。")
             _run_failure("".join(err_buf))
     finally:
         core.unregister_proc(proc)
+        # 异常退出（解码错误、中止等）时进程可能还活着，收尾补杀——
+        # 与 core.run_cancelable 的 finally 同款兜底。
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _estimate_mb(edl: list[dict]) -> float:
@@ -2269,7 +2333,7 @@ def bgm_gain_db(path: str, target: float = BGM_TARGET_LUFS) -> float:
             [core.ff("ffmpeg"), "-nostdin", "-hide_banner", "-i", path,
              "-af", "loudnorm=print_format=json", "-f", "null", "-"],
             capture_output=True, text=True, timeout=180,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            creationflags=core.POPEN_HIDE.get("creationflags", 0))
         m = re.search(r'"input_i"\s*:\s*"(-?[\d.]+|-?inf)"', pr.stderr or "")
         if m:
             val = m.group(1)
@@ -2424,6 +2488,32 @@ def _ffmpeg_can_write(directory: str) -> bool:
             pass
     _FF_WRITABLE_CACHE[key] = ok
     return ok
+
+
+def _stream_durations(path: str) -> tuple[float, float]:
+    """成片画面/声音各自的时长（秒）。探测失败返回 (0, 0)。
+
+    校验是提示不是闸门（audiofp 同款取舍）：探测不到就闭嘴，绝不因为它卡交付。
+    """
+    try:
+        out = subprocess.run(
+            [core.ff("ffprobe"), "-v", "error", "-show_entries",
+             "stream=codec_type,duration", "-of", "json", path],
+            capture_output=True, text=True, timeout=60, **core.POPEN_HIDE).stdout
+        info = json.loads(out or "{}")
+    except Exception:  # noqa: BLE001
+        return 0.0, 0.0
+    v = a = 0.0
+    for st in info.get("streams") or []:
+        try:
+            d = float(st.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        if st.get("codec_type") == "video" and not v:
+            v = d
+        elif st.get("codec_type") == "audio" and not a:
+            a = d
+    return v, a
 
 
 def render_edl(p: dict, edl: list[dict], name: str, progress=None,
@@ -2830,6 +2920,25 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
         raise
 
     info = core.ffprobe(out)
+    # 音画漂移校验（2026-11-22，借鉴竞品的 AV 诊断思路）：切段/拼接/混音任何一环
+    # 出岔子，最终都表现为「画面和声音长度对不上」。这里只测成片两条流的真实时长
+    # 并告警，绝不失败——音画不同步是二创成片的高频差评点，宁可留一句话，也别让
+    # 用户整批出完才发现。阈值：相差超过 1 秒且超过较短一条的 2% 才报，滤掉
+    # 封装层的秒级抖动；注意 AAC 填充/帧对齐天然有零点几秒出入，1 秒下限就是给它的。
+    v_dur, a_dur = _stream_durations(out)
+    if v_dur > 0 and a_dur > 0:
+        drift = abs(v_dur - a_dur)
+        if drift > max(1.0, min(v_dur, a_dur) * 0.02):
+            note = (f"成片音画可能不同步：画面 {v_dur:.2f}s / 声音 {a_dur:.2f}s，"
+                    f"相差 {drift:.2f} 秒，建议试看结尾确认")
+            print(f"[render] {note}", flush=True)
+            info["av_note"] = note
+            info["av_drift"] = round(drift, 2)
+            if progress:
+                try:
+                    progress(100, note)
+                except Exception:  # noqa: BLE001 —— 告警绝不挡交付
+                    pass
     # 中转盘渲染：成片先落在可写盘，这里由 Python 复制回用户指定的目标盘。
     # 复制用 shutil（Python 进程写 F 盘正常，只有 ffmpeg.exe 被拦），带 .part 临时名
     # 再原子改名，避免中途失败留下半截成片。返回给调用方的 name 不变，成片列表照常指向
@@ -2877,5 +2986,11 @@ def run(pid: str) -> None:
     p["output_duration"] = info["duration"]
     p["output_size"] = info["size"]
     p["stage"] = "rendered"
+    # 音画漂移告警落项目（2026-11-22）：任务消息马上会被清掉，日志只在黑窗里，
+    # 存进 project.json 用户回来还能看到这条提醒。没有告警就不写字段。
+    keys = ["output", "output_duration", "output_size", "stage"]
+    if info.get("av_note"):
+        p["output_av_note"] = info["av_note"]
+        keys.append("output_av_note")
     core.set_task(pid, None)
-    core.save_merge(p, ["output", "output_duration", "output_size", "stage"])
+    core.save_merge(p, keys)
