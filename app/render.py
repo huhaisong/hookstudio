@@ -2490,32 +2490,6 @@ def _ffmpeg_can_write(directory: str) -> bool:
     return ok
 
 
-def _stream_durations(path: str) -> tuple[float, float]:
-    """成片画面/声音各自的时长（秒）。探测失败返回 (0, 0)。
-
-    校验是提示不是闸门（audiofp 同款取舍）：探测不到就闭嘴，绝不因为它卡交付。
-    """
-    try:
-        out = subprocess.run(
-            [core.ff("ffprobe"), "-v", "error", "-show_entries",
-             "stream=codec_type,duration", "-of", "json", path],
-            capture_output=True, text=True, timeout=60, **core.POPEN_HIDE).stdout
-        info = json.loads(out or "{}")
-    except Exception:  # noqa: BLE001
-        return 0.0, 0.0
-    v = a = 0.0
-    for st in info.get("streams") or []:
-        try:
-            d = float(st.get("duration") or 0)
-        except (TypeError, ValueError):
-            continue
-        if st.get("codec_type") == "video" and not v:
-            v = d
-        elif st.get("codec_type") == "audio" and not a:
-            a = d
-    return v, a
-
-
 def render_edl(p: dict, edl: list[dict], name: str, progress=None,
                cleanup: bool = True, out_dir: str | None = None,
                title_of=None, speed_of=None, hook: str | None = None,
@@ -2925,7 +2899,7 @@ def render_edl(p: dict, edl: list[dict], name: str, progress=None,
     # 并告警，绝不失败——音画不同步是二创成片的高频差评点，宁可留一句话，也别让
     # 用户整批出完才发现。阈值：相差超过 1 秒且超过较短一条的 2% 才报，滤掉
     # 封装层的秒级抖动；注意 AAC 填充/帧对齐天然有零点几秒出入，1 秒下限就是给它的。
-    v_dur, a_dur = _stream_durations(out)
+    v_dur, a_dur = core.stream_durations(out)
     if v_dur > 0 and a_dur > 0:
         drift = abs(v_dur - a_dur)
         if drift > max(1.0, min(v_dur, a_dur) * 0.02):

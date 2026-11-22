@@ -225,8 +225,21 @@ def _separate(wav: str, keep_ambient_db: float, on_progress) -> str:
         tmp = dst + ".part.wav"
         p = subprocess.Popen([core.ff("ffmpeg"), "-v", "error", "-y", "-f", "f32le",
                               "-ar", str(SR), "-ac", "2", "-i", "-",
-                              "-c:a", "pcm_s16le", tmp], stdin=subprocess.PIPE)
-        p.communicate(np.clip(out.T, -1.0, 1.0).astype(np.float32).tobytes())
+                              "-c:a", "pcm_s16le", tmp], stdin=subprocess.PIPE,
+                             **core.POPEN_HIDE)
+        # 登记子进程（2026-11-22 补中止盲区）：这是全仓最后一个没挂 register_proc
+        # 的 Popen——以前点「中止」杀不到它，分离收尾这一步会挂着跑完才退。
+        # register_proc 不带参数，自动挂到当前任务名下，中止时 core 统一击杀。
+        core.register_proc(p)
+        try:
+            p.communicate(np.clip(out.T, -1.0, 1.0).astype(np.float32).tobytes())
+        except OSError:
+            # 被中止杀掉时 stdin 写入会炸 BrokenPipe：先查中止（是就把
+            # TaskCancelled 抛上去，中止语义永远优先），真不是才算失败。
+            core.check_cancel()
+            raise RuntimeError("写出分离结果失败")
+        finally:
+            core.unregister_proc(p)
         if p.returncode != 0 or not os.path.isfile(tmp):
             raise RuntimeError("写出分离结果失败")
         os.replace(tmp, dst)
@@ -240,26 +253,37 @@ def _separate(wav: str, keep_ambient_db: float, on_progress) -> str:
 
 
 def extract_audio(video: str, dst: str) -> str:
-    """从成片里抽一条 44.1k 立体声 wav（分离只认这个规格）。"""
-    r = subprocess.run([core.ff("ffmpeg"), "-v", "error", "-y", "-i", video,
-                        "-vn", "-ac", "2", "-ar", str(SR), "-c:a", "pcm_s16le", dst],
-                       capture_output=True)
+    """从成片里抽一条 44.1k 立体声 wav（分离只认这个规格）。
+
+    timeout=120（2026-11-22 补）：坏盘/坏索引会让 ffmpeg 卡在读入上，
+    没有超时就整个出片任务挂在「去掉原片背景音乐」这一步。"""
+    try:
+        r = subprocess.run([core.ff("ffmpeg"), "-v", "error", "-y", "-i", video,
+                            "-vn", "-ac", "2", "-ar", str(SR), "-c:a", "pcm_s16le", dst],
+                           capture_output=True, timeout=120, **core.POPEN_HIDE)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("抽成片音轨卡了 120 秒没完成，已终止")
     if r.returncode != 0 or not os.path.isfile(dst):
         raise RuntimeError("抽取成片音轨失败：%s" % r.stderr.decode("utf-8", "ignore")[:200])
     return dst
 
 
 def replace_audio(video: str, wav: str, dst: str) -> str:
-    """视频流 copy，只换音频并重新归一到 -16 LUFS（分离后电平会掉）。"""
-    r = subprocess.run([core.ff("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
-                        "-y", "-fflags", "+genpts",
-                        "-i", video, "-i", wav,
-                        "-map", "0:v:0", "-map", "1:a:0",
-                        "-c:v", "copy",
-                        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-                        "-ar", "48000", "-ac", "2", "-c:a", "aac", "-b:a", "192k",
-                        "-map_metadata", "-1", "-movflags", "+faststart", "-shortest", dst],
-                       capture_output=True)
+    """视频流 copy，只换音频并重新归一到 -16 LUFS（分离后电平会掉）。
+
+    timeout=120（2026-11-22 补，理由同 extract_audio）。"""
+    try:
+        r = subprocess.run([core.ff("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
+                            "-y", "-fflags", "+genpts",
+                            "-i", video, "-i", wav,
+                            "-map", "0:v:0", "-map", "1:a:0",
+                            "-c:v", "copy",
+                            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                            "-ar", "48000", "-ac", "2", "-c:a", "aac", "-b:a", "192k",
+                            "-map_metadata", "-1", "-movflags", "+faststart", "-shortest", dst],
+                           capture_output=True, timeout=120, **core.POPEN_HIDE)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("替换音轨卡了 120 秒没完成，已终止")
     if r.returncode != 0 or not os.path.isfile(dst):
         raise RuntimeError("替换音轨失败：%s" % r.stderr.decode("utf-8", "ignore")[:200])
     return dst

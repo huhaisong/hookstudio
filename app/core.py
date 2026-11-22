@@ -775,6 +775,40 @@ def natural_key(name: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
 
 
+# ffprobe 短命令统一排队（2026-11-22）：批量出片 3 路并发时多处 ffprobe 会同时
+# 起进程，锁把它们串行——每条都是亚秒级短命令，排队开销远小于同时抢 CPU/IO
+# 的抖动。锁只包「发起→拿到输出」，解析放在锁外，别让坏输入占用队列。
+_FFPROBE_LOCK = threading.Lock()
+
+
+def stream_durations(path: str) -> tuple[float, float]:
+    """成片画面/声音各自的时长（秒），探测失败返回 (0, 0)。
+
+    给音画漂移校验用（render.render_edl 收尾）。校验是提示不是闸门
+    （audiofp 同款取舍）：探测不到就闭嘴，绝不让它卡交付。
+    """
+    with _FFPROBE_LOCK:
+        try:
+            out = subprocess.run(
+                [ff("ffprobe"), "-v", "error", "-show_entries",
+                 "stream=codec_type,duration", "-of", "json", path],
+                capture_output=True, text=True, timeout=60, **POPEN_HIDE).stdout
+            info = json.loads(out or "{}")
+        except Exception:
+            return 0.0, 0.0
+    v = a = 0.0
+    for st in info.get("streams") or []:
+        try:
+            d = float(st.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        if st.get("codec_type") == "video" and not v:
+            v = d
+        elif st.get("codec_type") == "audio" and not a:
+            a = d
+    return v, a
+
+
 def win_path(local_path: str) -> str:
     """界面上展示用的路径：本机原生跑时已经是真实路径，只需统一分隔符。"""
     if os.name == "nt":
