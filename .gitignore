@@ -33,5 +33,12 @@ _hlkit*/
 _backup*
 _extract_hl.py
 
+# 前端工具链（terser 等，npm install 装出来，不入库）
+node_modules/
+package-lock.json
+
+# pyarmor 试用报错日志
+pyarmor.bug.log
+
 # 配乐素材：11 首约 57MB，本地放好即可，条目见 bgm/library.json
 bgm/audio/

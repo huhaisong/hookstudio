@@ -42,8 +42,18 @@ echo [3/5] 组装可外部修改的资源（web / bin / models）
 rem prompts 不再拷进产物：10 份提示词已按原字节内置进 app/_builtin_prompts.py。
 rem 留明文在产物里 = 解压即读，藏了内置表也没意义（2026-11-22 防破解第一批）。
 rem 开发期要调提示词：设 HOOK_DEV_PROMPTS=1 读源码目录的 prompts/，与打包产物无关。
-robocopy "web"     "%OUTDIR%\web"     /MIR /NFL /NDL /NJH /NJS /NP >nul
 robocopy "bin"     "%OUTDIR%\bin"     /MIR /NFL /NDL /NJH /NJS /NP >nul
+rem web 先原样拷，再就地把 app.js / publish.js 用 terser 压缩（只 compress 不 mangle：
+rem mangle 会改变量名、打坏 data-* 选择器和中文模板字符串；compress 不动这些，实测过）。
+rem 源文件 web/ 保持明文不动，只压缩产物里的副本，开发期调试不受影响。
+robocopy "web"     "%OUTDIR%\web"     /MIR /NFL /NDL /NJH /NJS /NP >nul
+if exist "node_modules\.bin\terser.cmd" (
+  echo   压缩前端 JS（只 compress）...
+  call "node_modules\.bin\terser.cmd" "%OUTDIR%\web\app.js" -c -o "%OUTDIR%\web\app.js" >nul 2>&1
+  call "node_modules\.bin\terser.cmd" "%OUTDIR%\web\publish.js" -c -o "%OUTDIR%\web\publish.js" >nul 2>&1
+) else (
+  echo   [警告] 没找到 terser，前端 JS 保持未压缩（不影响功能）
+)
 rem 只带 small，base 永不进包（省约 140MB）
 robocopy "models"  "%OUTDIR%\models"  /MIR /XD "%CD%\models\base" /NFL /NDL /NJH /NJS /NP >nul
 
