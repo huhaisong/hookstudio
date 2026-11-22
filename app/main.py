@@ -319,6 +319,8 @@ class ConfigBody(BaseModel):
     # 音频适配（2026-11-22）：出片收尾对整条音轨做保时长微变调+频谱微倾。
     # 本机偏好，任何登录用户都能改（同 hw_encode）。默认关。
     audio_armor: bool | None = None
+    # 编码停滞熔断阈值（秒，0 = 关）：设置页 60–600。本机偏好。
+    stall_sec: int | None = None
     # 一键全自动上次的参数（记住上次用）：整套 dict 存进 config.autopipe_cfg。
     autopipe_cfg: dict | None = None
 
@@ -450,6 +452,8 @@ def get_config(request: Request):
         "asr_denoise_available": _asr_denoise_available(),
         # 音频适配（2026-11-22）：设置页开关，默认关
         "audio_armor": bool(core.load_config().get("audio_armor")),
+        # 编码停滞熔断（秒，0=关）：设置页下拉 60–600
+        "stall_sec": int(core.stall_sec()),
         "system": {"cpu": info["cpu"], "mem_gb": info["mem_gb"]},
         "paths": {"base": core.BASE, "data": core.DATA_DIR,
                   "models": core.MODELS, "prompts": core.PROMPTS,
@@ -517,6 +521,12 @@ def put_config(body: ConfigBody, request: Request):
     # 音频适配：同上，本机偏好（2026-11-22）
     if body.audio_armor is not None:
         patch["audio_armor"] = bool(body.audio_armor)
+    # 编码停滞熔断：0=关，合法区间 0/60–600（与设置页下拉一致）
+    if body.stall_sec is not None:
+        v = int(body.stall_sec)
+        if v != 0 and not (60 <= v <= 600):
+            raise HTTPException(400, "停滞熔断只能选 1–10 分钟，或关闭")
+        patch["stall_sec"] = v
     # 一键全自动参数记忆：本机偏好，任何登录用户都能改（同 hw_encode）。
     if body.autopipe_cfg is not None:
         if not isinstance(body.autopipe_cfg, dict):
@@ -555,6 +565,62 @@ def put_config(body: ConfigBody, request: Request):
             "whisper_tier": core.whisper_tier(),
             "output_dir": core.output_dir(),
             "output_free_gb": core.free_gb(core.output_dir())}
+
+
+# ── 出片预设导入/导出（2026-11-22 D5）────────────────────────────────────
+# 工作室里几个人用同一套出片风格：导出一份 JSON、换机器导入即可，不用逐项对
+# 设置。白名单键来自 DEFAULT_CONFIG 的「本机渲染/行为偏好」，**凭证、密钥、
+# 路径、端口一律不入**——预设文件会被传来传去，带 Key 等于把钱包一起发出去。
+PRESET_KEYS = ("hw_encode", "audio_armor", "stall_sec", "max_concurrent",
+               "zh_t2s", "asr_denoise", "publish_auto", "merge_gap", "sei_tag")
+PRESET_VERSION = 1
+
+
+@app.get("/api/config/preset")
+def get_config_preset(request: Request):
+    auth.require(request)
+    cfg = core.load_config() or {}
+    return {"version": PRESET_VERSION,
+            "settings": {k: cfg.get(k, core.DEFAULT_CONFIG.get(k)) for k in PRESET_KEYS}}
+
+
+class PresetBody(BaseModel):
+    version: int | None = None
+    settings: dict | None = None
+
+
+@app.put("/api/config/preset")
+def put_config_preset(body: PresetBody, request: Request):
+    auth.require(request)
+    settings = body.settings
+    if body.version != PRESET_VERSION or not isinstance(settings, dict):
+        raise HTTPException(400, "预设文件版本不对或内容缺失——请确认是从同版本导出的")
+    patch: dict = {}
+    for k, v in settings.items():
+        if k not in PRESET_KEYS:
+            continue            # 白名单外的键直接忽略：老版本的预设不报错，只取认识的
+        want = core.DEFAULT_CONFIG.get(k)
+        try:
+            if isinstance(want, bool):
+                v = bool(v)
+            elif isinstance(want, int) and not isinstance(want, bool):
+                v = int(v)
+            elif isinstance(want, float):
+                v = float(v)
+            else:
+                v = str(v or "")
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"预设里 {k} 的值类型不对：{v!r}")
+        patch[k] = v
+    # 熔断阈值复用 PUT /api/config 的同一套校验口径（0 或 60–600）
+    if "stall_sec" in patch:
+        v = patch["stall_sec"]
+        if v != 0 and not (60 <= v <= 600):
+            raise HTTPException(400, "预设里 stall_sec 超出范围（只能 0 或 60–600）")
+    if "merge_gap" in patch:
+        patch["merge_gap"] = min(15.0, max(6.0, float(patch["merge_gap"])))
+    core.save_config(patch)
+    return {"ok": True, "applied": sorted(patch)}
 
 
 class LlmTestBody(BaseModel):

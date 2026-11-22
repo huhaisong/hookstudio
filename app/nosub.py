@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import threading
 import time
 
 from . import core, render
@@ -255,6 +256,7 @@ def _encode(src: str, dst: str, graph: str, duration: float,
     if used_hw:
         attempts.append((list(render._SW_ARGS), ["-c:a", "aac", "-b:a", "160k"]))
     last = ""
+    stalled_any = False
     for i, (va, aa) in enumerate(attempts):
         if i == 2:
             render._HW["off"] = True
@@ -264,16 +266,40 @@ def _encode(src: str, dst: str, graph: str, duration: float,
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True,
-                                    encoding="utf-8", errors="replace", bufsize=1)
+                                    encoding="utf-8", errors="replace", bufsize=1,
+                                    **core.POPEN_HIDE)
         except OSError as exc:
             last = str(exc)
             continue
         # 登记子进程：点「中止」时由 core 直接 kill，不必等这一集编码跑完
         core.register_proc(proc)
+        # 停滞看门狗（2026-11-22，与 render._run 同款思路）：-progress 的行就是
+        # 心跳，连续阈值秒一行都没有 = 假死（驱动重置/滤镜死循环/盘抖动）。
+        # 阈值走 core.stall_sec()（设置页/环境变量统一解析，R0.1），与渲染看门狗
+        # 改一处全局生效。杀掉后 attempts 链自动换方案重试（音频 copy→AAC→软编），
+        # 宁慢勿败；中止被 core 击杀时同样表现为「没新行」，check_cancel 的优先级不变。
+        _stall = core.stall_sec()
+        beat = {"t": time.monotonic()}
+        stalled = {"hit": False}
+        if _stall > 0:
+            def _watchdog() -> None:
+                while proc.poll() is None:
+                    if time.monotonic() - beat["t"] > _stall:
+                        stalled["hit"] = True
+                        try:
+                            proc.kill()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return
+                    time.sleep(5)
+
+            threading.Thread(target=_watchdog, daemon=True).start()
         try:
             for line in proc.stdout or []:
                 core.check_cancel()
                 line = line.strip()
+                if line:
+                    beat["t"] = time.monotonic()
                 if line.startswith("out_time_ms=") or line.startswith("out_time_us="):
                     try:
                         raw = float(line.split("=", 1)[1])
@@ -285,6 +311,9 @@ def _encode(src: str, dst: str, graph: str, duration: float,
                 elif line.startswith("ffmpeg") or "Error" in line or "error" in line:
                     last = (last + "\n" + line)[-600:]
             core.wait_cancelable(proc)
+            if stalled["hit"]:
+                stalled_any = True
+                last = (last + f"\n卡死自动终止：超过 {_stall} 秒没有任何进展")[-600:]
         except BaseException:
             # 管道被 kill 断掉时会抛各种读异常；只要正在中止，就统一翻成中止信号，
             # 别让上层把它当成「这一集编码失败」继续跑下一集。
@@ -301,6 +330,10 @@ def _encode(src: str, dst: str, graph: str, duration: float,
                 os.remove(part)
             except OSError:
                 pass
+    if stalled_any:
+        raise RuntimeError(
+            f"这一集反复卡死（超过 {core.stall_sec()} 秒没有任何进展），已自动终止；"
+            "直接重试通常能过，反复出现请带日志反馈")
     raise RuntimeError("这一集处理失败，请重试")
 
 

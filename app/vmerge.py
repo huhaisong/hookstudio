@@ -82,7 +82,8 @@ def _has_audio(path: str) -> bool:
     cmd = [core.ff("ffprobe"), "-v", "error", "-select_streams", "a",
            "-show_entries", "stream=index", "-of", "csv=p=0", path]
     try:
-        r = core.subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        r = core.subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                            **core.POPEN_HIDE)
         return bool(r.stdout.strip())
     except Exception:  # noqa: BLE001  探不出就当没有，静音兜底比报错友好
         return False

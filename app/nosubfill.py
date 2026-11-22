@@ -36,6 +36,8 @@
 
 import os
 import subprocess
+import threading
+import time
 
 import numpy as np
 
@@ -73,7 +75,7 @@ def _fps(path: str) -> float:
             [core.ff("ffprobe"), "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=avg_frame_rate,r_frame_rate",
              "-of", "default=nw=1", path],
-            capture_output=True, text=True, timeout=30).stdout
+            capture_output=True, text=True, timeout=30, **core.POPEN_HIDE).stdout
     except (OSError, subprocess.SubprocessError):
         return 30.0
     vals = {}
@@ -224,7 +226,7 @@ def encode(src: str, dst: str, cfg: dict, spans: list, sub_tail: str,
         [core.ff("ffmpeg"), "-nostdin", "-v", "error", "-i", src, "-an", "-sn", "-dn",
          "-vf", f"crop={bw}:{bh}:{x0}:{y0},format=rgb24",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-        stdout=subprocess.PIPE, stderr=derr)
+        stdout=subprocess.PIPE, stderr=derr, **core.POPEN_HIDE)
     core.register_proc(dec)       # 中止时由 core 直接杀掉整条管道
     enc = None
     sub = f"{sub_tail}," if sub_tail else ""
@@ -243,8 +245,44 @@ def encode(src: str, dst: str, cfg: dict, spans: list, sub_tail: str,
     try:
         enc = subprocess.Popen(base + vargs + ["-movflags", "+faststart", part],
                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                               stderr=errf)
+                               stderr=errf, **core.POPEN_HIDE)
         core.register_proc(enc)
+        # 管道看门狗（2026-11-22，render._run 同款思路的变体）：这条路是 rawvideo
+        # 管道，没有 -progress 行可当心跳，**产物文件涨没涨**就是唯一的心跳——
+        # dec 断粮（坏盘/坏索引卡在读入）或 enc 假死，part 都会停止增长，一条
+        # 观测兜住整条管道。读线程的 readinto/写线程的 write 没有超时可设，
+        # 唯一解法是从外面杀进程让它们立刻解除阻塞，所以超阈值就双杀。
+        # 收尾的 faststart 重排只动 moov（几秒），120 秒阈值不会被它误杀。
+        # 阈值走 core.stall_sec()（设置页/环境变量统一解析，R0.1）。
+        _stall = core.stall_sec()
+        stall = {"hit": False}
+        if _stall > 0:
+            def _watch_pipe() -> None:
+                last_sig = None
+                last_move = time.monotonic()
+                while dec.poll() is None or enc.poll() is None:
+                    sig = None
+                    try:
+                        if os.path.exists(part):
+                            st = os.stat(part)
+                            sig = (st.st_size, st.st_mtime_ns)
+                    except OSError:
+                        pass
+                    if sig != last_sig:
+                        last_sig = sig
+                        last_move = time.monotonic()
+                    elif time.monotonic() - last_move > _stall:
+                        stall["hit"] = True
+                        for pr in (dec, enc):
+                            try:
+                                if pr.poll() is None:
+                                    pr.kill()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        return
+                    time.sleep(2.0)
+
+            threading.Thread(target=_watch_pipe, daemon=True).start()
         nbytes = bw * bh * 3
         # 工作区 = 所有矩形的整体上下沿。带区其余部分（上下那两截镜像源）
         # 永远不需要改，直接透传。只算这几十行比整块带区快 3-4 倍——
@@ -363,6 +401,10 @@ def encode(src: str, dst: str, cfg: dict, spans: list, sub_tail: str,
         core.wait_cancelable(dec, 120)
         core.wait_cancelable(enc, 600)
         errf.close()
+        if stall["hit"]:
+            raise RuntimeError(
+                f"这一集处理卡死（超过 {core.stall_sec()} 秒没有任何进展），已自动终止；"
+                "直接重试通常能过，反复出现请带日志反馈")
         if dec.returncode not in (0, None):
             raise RuntimeError("读取这一集失败，请重试")
         if enc.returncode != 0 or not os.path.isfile(part) \

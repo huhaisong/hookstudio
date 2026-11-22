@@ -5377,6 +5377,11 @@ async function openSettings() {
   $("#in-hwenc").value = c.hw_encode === "off" ? "off" : "auto";
   // 音频适配（2026-11-22）：默认关，开关挂在设置页「出片速度」下面
   if ($("#in-audioarmor")) $("#in-audioarmor").checked = !!c.audio_armor;
+  // 编码停滞熔断（2026-11-22）：下拉值不在选项里（比如旧值 240 之外的数）就回退默认
+  if ($("#in-stall")) {
+    const v = String(c.stall_sec || 120);
+    $("#in-stall").value = ["0", "60", "120", "180", "240", "300", "600"].includes(v) ? v : "120";
+  }
   // 当前编码器（2026-11-22）：打开设置时查一次状态，失败静默——提示是锦上添花，
   // 不能挡住设置弹窗。None=还没测过显卡，""=CPU 软编，其余是人话标签。
   api("/api/status").then((st) => {
@@ -5513,6 +5518,45 @@ $("#btn-test-llm").addEventListener("click", async () => {
   }
 });
 
+// ── 出片预设导入/导出（2026-11-22 D5）────────────────────────────────────
+// 导出：GET 预设 JSON → 浏览器下载。导入：选文件 → 校验版本 → PUT 应用。
+// 白名单键由后端把关（凭证/路径绝不入预设），前端只做文件读取与提示。
+$("#btn-preset-export").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/config/preset");
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "hookstudio-出片预设.json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  } catch (e) {
+    toast("导出失败：" + (e.message || e));
+  }
+});
+$("#btn-preset-import").addEventListener("click", () => $("#in-preset-file").click());
+$("#in-preset-file").addEventListener("change", async (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = "";
+  if (!file) return;
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch (e) {
+    toast("这不是有效的预设文件（JSON 解析失败）");
+    return;
+  }
+  try {
+    const r = await api("/api/config/preset", { method: "PUT", body: JSON.stringify(data) });
+    toast(`预设已应用（${(r.applied || []).length} 项）`);
+    const st = await api("/api/config");
+    SETTINGS = { ...SETTINGS, ...st };
+    openSettings();          // 重新回填，让用户看到导入后的值
+  } catch (e) {
+    toast("导入失败：" + (e.message || e));
+  }
+});
+
 $("#btn-save-settings").addEventListener("click", async () => {
   const body = {};
   // 模型 / Key 是服务端凭证，只有管理员能改（后端也会 403 兜住）。
@@ -5538,6 +5582,11 @@ $("#btn-save-settings").addEventListener("click", async () => {
     const want = $("#in-audioarmor").checked;
     if (want !== !!SETTINGS.audio_armor) body.audio_armor = want;
   }
+  // 编码停滞熔断（2026-11-22）：秒数，0=关
+  if (SETTINGS && $("#in-stall")) {
+    const v = Number($("#in-stall").value);
+    if (v !== Number(SETTINGS.stall_sec || 120)) body.stall_sec = v;
+  }
   // 同时生成上限：与后端共用一份设置，第 2 步的预计耗时也会跟着变
   if (SETTINGS && $("#in-conc")) {
     const mc = Number($("#in-conc").value);
@@ -5560,6 +5609,7 @@ $("#btn-save-settings").addEventListener("click", async () => {
       if (body.max_concurrent) SETTINGS.max_concurrent = body.max_concurrent;
       if (body.asr_denoise !== undefined) SETTINGS.asr_denoise = body.asr_denoise;
       if (body.audio_armor !== undefined) SETTINGS.audio_armor = body.audio_armor;
+      if (body.stall_sec !== undefined) SETTINGS.stall_sec = body.stall_sec;
     }
     $("#modal-settings").classList.add("hidden");
     toast("已保存");

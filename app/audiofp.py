@@ -90,7 +90,8 @@ def _extract(path: str) -> tuple[np.ndarray, int] | None:
         cmd = [core.ff("ffmpeg"), "-v", "error", "-nostdin", "-i", path,
                "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"]
         raw = subprocess.run(cmd, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, timeout=120).stdout
+                             stderr=subprocess.DEVNULL, timeout=120,
+                             **core.POPEN_HIDE).stdout
         x = np.frombuffer(raw, dtype="<i2")
         if x.size < HOP * 8:
             return None
@@ -312,7 +313,8 @@ def _energy(path: str) -> np.ndarray | None:
         cmd = [core.ff("ffmpeg"), "-v", "error", "-nostdin", "-i", path,
                "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "pipe:1"]
         raw = subprocess.run(cmd, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, timeout=120).stdout
+                             stderr=subprocess.DEVNULL, timeout=120,
+                             **core.POPEN_HIDE).stdout
         x = np.frombuffer(raw, dtype="<i2").astype(np.float64) / 32768.0
         if x.size < E_WIN * 2:
             return None

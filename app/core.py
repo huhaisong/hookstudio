@@ -231,6 +231,11 @@ DEFAULT_CONFIG = {
     # 不同剧「一场戏」的长短不同：快节奏剧调小防碎片，慢节奏剧调大保连贯。
     # 不给界面入口，懂配置的用户手改这个文件。
     "merge_gap": 9.0,
+    # ── 编码停滞熔断（2026-11-22 R0.1，设置页可调）────────────────────────
+    # ffmpeg 连续这么多秒没有进度心跳就熔断重试。0 = 关（排查误杀的逃生口）。
+    # 环境变量 HS_RENDER_STALL_SEC 优先于这里（排查时不改文件）。
+    # 必须在这里声明：save_config 只认 DEFAULT_CONFIG 里已有的键（同上）。
+    "stall_sec": 120,
     # ── 同时生成上限（2026-11-08 用户要求做成可配置，默认仍是 3）──────────
     # 第 2 步「多组编排」和第 3 步「多条分镜」共用一个档位：两边都是同一个
     # 上游账号在接请求，分开调只会让「两组各 8 路」叠成 16 路。
@@ -825,6 +830,57 @@ def stream_durations(path: str) -> tuple[float, float]:
         elif st.get("codec_type") == "audio" and not a:
             a = d
     return v, a
+
+
+def probe_stream_duration(path: str, kind: str) -> float:
+    """单条流（"v"/"a"）的真实时长（秒），探测失败返回 0。
+
+    给段级漂移守卫用（render 的变速段渲完测一次）：只取一条流，比
+    stream_durations 少解析一半；超时 15s——段级守卫在渲染循环里，
+    卡死的探测必须快速放弃，不能把渲染线程拖住。锁与 stream_durations
+    共用一把（都是亚秒短命令，排队开销远小于并发抖动）。
+    """
+    sel = "v:0" if str(kind).lower().startswith("v") else "a:0"
+    with _FFPROBE_LOCK:
+        try:
+            out = subprocess.run(
+                [ff("ffprobe"), "-v", "error", "-select_streams", sel,
+                 "-show_entries", "stream=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=15, **POPEN_HIDE).stdout
+        except Exception:
+            return 0.0
+    try:
+        return float(out.strip().split()[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+# ── 编码停滞熔断阈值（2026-11-22 R0.1/R1-lite）────────────────────────────
+# 三处看门狗（render._run / nosub / nosubfill）共用一个阈值来源，按优先级：
+#   环境变量 HS_RENDER_STALL_SEC（排查逃生口，设 0 = 强制关）
+#   > 设置页 stall_sec（60–600，0 = 关）
+#   > 默认 120 秒。
+# 为什么是 120：段十几秒、进度安静几十秒都算正常安静期，2 分钟够宽裕；
+# 更长（旧值 240）只是让假死多挂两分钟，没有换来更低的误杀率。
+STALL_DEFAULT = 120
+_ENV_STALL = os.environ.get("HS_RENDER_STALL_SEC")
+
+
+def stall_sec() -> int:
+    """当前生效的停滞熔断阈值（秒），0 = 关闭看门狗。"""
+    if _ENV_STALL is not None:
+        try:
+            return max(0, min(3600, int(_ENV_STALL)))
+        except ValueError:
+            pass
+    try:
+        # 0 是合法值（= 关闭），不能用 `or 默认值` 吃掉——只认 None/空串为未配置
+        raw = (load_config() or {}).get("stall_sec")
+        v = int(float(STALL_DEFAULT if raw in (None, "") else raw))
+    except Exception:
+        return STALL_DEFAULT
+    return max(0, min(600, v))
 
 
 def win_path(local_path: str) -> str:

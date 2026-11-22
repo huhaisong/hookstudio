@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import threading
 import time
 
@@ -166,7 +167,12 @@ def _decode(path: str):
         core.ff("ffmpeg"), "-nostdin", "-v", "error", "-i", path,
         "-vn", "-ac", "1", "-ar", str(SR), "-f", "s16le", "-",
     ]
-    r = core.run_cancelable(cmd)
+    # timeout=600（2026-11-22 补）：整集解码正常只要几秒，坏盘/坏索引会让它
+    # 卡死在读入上，而 run_cancelable 不带超时就是无限等，转写任务整个挂住。
+    try:
+        r = core.run_cancelable(cmd, timeout=600)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("音频读取失败，请重试")
     if r.returncode != 0:
         msg = (r.stderr or b"").decode("utf-8", errors="ignore")[-300:]
         raise RuntimeError("音频读取失败，请重试")

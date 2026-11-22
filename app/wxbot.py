@@ -197,7 +197,7 @@ class Session:
                  "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
                  "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"],
                 capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=30).stdout or ""
+                errors="replace", timeout=30, **core.POPEN_HIDE).stdout or ""
         except Exception:  # noqa: BLE001  PowerShell 不可用就跳过这层保护
             return
         for line in out.splitlines():
@@ -207,7 +207,8 @@ class Session:
                 pid = line.split("\t")[0].strip()
                 if pid.isdigit():
                     subprocess.run(["cmd", "/c", f"taskkill /F /T /PID {pid}"],
-                                   capture_output=True, timeout=20)
+                                   capture_output=True, timeout=20,
+                                   **core.POPEN_HIDE)
 
     def _open(self):
         """（线程内）确保浏览器开着，返回 page。"""

@@ -843,6 +843,18 @@
           <input type="checkbox" id="in-audioarmor">
           <span class="hint">开 = 每套成片的音轨做无感级微调（±1.5% 内的音高与频谱倾向，每套随机、时长严格不变），多号分发时音轨特征互不相同。台词听感不变；BGM 是后混的，不受影响。</span>
         </label>
+        <label class="fld">编码停滞熔断
+          <select id="in-stall">
+            <option value="120">2 分钟（推荐）</option>
+            <option value="60">1 分钟</option>
+            <option value="180">3 分钟</option>
+            <option value="240">4 分钟</option>
+            <option value="300">5 分钟</option>
+            <option value="600">10 分钟</option>
+            <option value="0">关闭</option>
+          </select>
+          <span class="hint">渲染/抹字幕连续这么久没有进展就自动终止并重试一次，防止一次假死卡住整批。出问题设长一点或关掉再试。</span>
+        </label>
         <label class="fld">外观
           <div class="seg" id="seg-theme">
             <button type="button" data-theme-set="system">跟随系统</button>
@@ -938,6 +950,9 @@
     <div class="modal-foot">
       <button class="ghost" data-author>联系作者</button>
       <button class="ghost" id="btn-test-llm">测试连通</button>
+      <button class="ghost sm" id="btn-preset-export">导出预设</button>
+      <button class="ghost sm" id="btn-preset-import">导入预设</button>
+      <input type="file" id="in-preset-file" accept=".json,application/json" class="hidden">
       <button class="primary" id="btn-save-settings">保存</button>
     </div>
   </div>
