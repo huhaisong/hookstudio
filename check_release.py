@@ -9,6 +9,9 @@
   4. 版本号两处一致
   5. 无 .env / server.json / t2.sqlite 等敏感文件
   6. data/ 无运行残留（app.db / instance.lock / projects / output …）
+  7. 业务二进制（app 目录下 .pyc/.pyd）无源文件路径残留（2026-11-22 增：
+     零界 471 个函数被一晚全还原，源路径/私服地址全在明文里——它就栽在这）
+  8. 明文 URL 提示（不阻断）：白名单外的域名列出来给人工过目
 
 用法：
   python check_release.py <产物目录>          # 扫产物 + 版本号
@@ -116,6 +119,70 @@ def scan_dir(target: str) -> None:
             ok("data/ 里没有 config.json（build_post 还没跑？）")
     else:
         ok("无 data/ 目录")
+
+    # 业务二进制里的源文件路径残留：Cython 编译的 .pyd / PyInstaller 收录的 .pyc
+    # 会把编译时的源文件路径嵌进常量。绝对路径泄露的是开发机的目录布局与用户名；
+    # 竞品零界的核心引擎连「D:\工作区\去重\…」都带着，拆包的人顺着路径就把
+    # 作者的一切摸清了。只扫 app 目录下的产物——运行时库（pyarmor/标准库）本来
+    # 就带第三方构建机的路径，扫了全是噪音。
+    print("业务二进制源路径残留:")
+    rx_path = re.compile(rb"[A-Za-z]:\\[^\x00\r\n\"'<>]{2,110}")
+    rx_noise = re.compile(rb"python3\d|site-packages|pyarmor|Windows\\|Program Files"
+                          rb"|anaconda|\\Python3|Users\\runneradmin")
+    hits: list[str] = []
+    for dp, dns, fns in os.walk(target):
+        for fn in fns:
+            if not fn.lower().endswith((".pyc", ".pyd")):
+                continue
+            rel = os.path.relpath(os.path.join(dp, fn), target)
+            if (os.sep + "app" + os.sep) not in (os.sep + rel) \
+                    and not rel.startswith("app" + os.sep):
+                continue
+            try:
+                blob = open(os.path.join(dp, fn), "rb").read()
+            except OSError:
+                continue
+            for m in rx_path.finditer(blob):
+                s = m.group()
+                if rx_noise.search(s):
+                    continue
+                hits.append(f"{rel} → {s.decode('utf-8', 'replace')[:110]}")
+                break           # 一个文件报一处就够定位，别刷屏
+    if hits:
+        fail(f"业务二进制里嵌着源文件路径（{len(hits)} 个，等于把开发机布局发给用户）: "
+             + "；".join(hits[:5]))
+    ok(f"无源文件路径残留（扫描 app 产物 {sum(1 for dp, _, fns in os.walk(target) for fn in fns if fn.lower().endswith(('.pyc', '.pyd')))} 个 pyc/pyd）")
+
+    # 明文 URL 提示（⑧，不阻断）：web 资源与说明文本里白名单外的域名列出来
+    # 给人工过目——历史上真正出过事的不是技术泄露，是「不小心把内网地址写了进说明」。
+    print("明文 URL 提示（不阻断，人工过目）:")
+    rx_url = re.compile(rb"https?://[A-Za-z0-9._\-]+(?:\.[a-zA-Z]{2,})+(?:[/\w\-._?=&%]*)")
+    whitelist = ("hookstudio.cn", "github.com/huhaisong", "w3.org", "ffmpeg.org",
+                 "opensource.org", "alibabacloud.com", "aliyun.com", "deepseek.com",
+                 "python.org", "mozilla.org", "w3c.org")
+    found: dict[str, str] = {}
+    for dp, dns, fns in os.walk(target):
+        for fn in fns:
+            if not fn.lower().endswith((".js", ".html", ".json", ".txt", ".css", ".xml")):
+                continue
+            p = os.path.join(dp, fn)
+            try:
+                blob = open(p, "rb").read()
+            except OSError:
+                continue
+            if len(blob) > 30 * 1024 * 1024:      # 大文件（source map 等）跳过
+                continue
+            for m in rx_url.finditer(blob):
+                u = m.group().decode("utf-8", "replace")
+                if any(w in u.lower() for w in whitelist):
+                    continue
+                found.setdefault(u, os.path.relpath(p, target))
+    for u, rel in sorted(found.items()):
+        print(f"  [?] {u}   ({rel})")
+    if found:
+        print(f"  [OK?] {len(found)} 个白名单外 URL 已列出，请人工确认后再发布")
+    else:
+        ok("无白名单外明文 URL")
 
 
 def check_version() -> None:
